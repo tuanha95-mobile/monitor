@@ -676,7 +676,7 @@ services:
       - minio-data:/data
 
   dbmate-postgres:
-    image: ghcr.io/amacneil/dbmate:2.37.0
+    image: ghcr.io/amacneil/dbmate:2.38.2
     profiles:
       - migrate
     environment:
@@ -695,7 +695,7 @@ services:
     command: ["migrate"]
 
   dbmate-clickhouse:
-    image: ghcr.io/amacneil/dbmate:2.37.0
+    image: ghcr.io/amacneil/dbmate:2.38.2
     profiles:
       - migrate
     environment:
@@ -844,7 +844,7 @@ services:
       - 4317:4317
 
   iggy-web:
-    image: apache/iggy-web-ui:0.4.0
+    image: apache/iggy-web-ui:0.5.0
     profiles:
       - debug
     ports:
