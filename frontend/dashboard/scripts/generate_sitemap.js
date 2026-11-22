@@ -1,0 +1,189 @@
+const fs = require("fs");
+const path = require("path");
+const { parse: parseYaml } = require("yaml");
+
+const ROOT = path.resolve(__dirname, "..");
+const APP_DIR = path.join(ROOT, "app");
+const PUBLIC_DIR = path.join(ROOT, "public");
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://measure.sh";
+
+function walk(dir) {
+  const files = [];
+  for (const name of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, name.name);
+    if (name.isDirectory()) files.push(...walk(full));
+    else if (name.isFile() && name.name === "page.tsx") files.push(full);
+  }
+  return files;
+}
+
+/**
+ * The /docs route of a content/docs .mdx file: index.mdx maps to its
+ * directory, parenthesized folder-group segments don't affect the route.
+ */
+function docsRouteFromFile(contentDir, file) {
+  const rel = path.relative(contentDir, file).split(path.sep).join("/");
+  const segments = rel
+    .replace(/\.mdx$/, "")
+    .split("/")
+    .filter((segment) => !/^\(.*\)$/.test(segment));
+  if (segments[segments.length - 1] === "index") {
+    segments.pop();
+  }
+  return segments.length === 0 ? "/docs" : `/docs/${segments.join("/")}`;
+}
+
+/** Docs routes from the content/docs .mdx sources. */
+function getDocsRoutes() {
+  const contentDir = path.join(ROOT, "content", "docs");
+  const routes = [];
+
+  function walkDocs(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkDocs(full);
+      } else if (entry.isFile() && entry.name.endsWith(".mdx")) {
+        routes.push(docsRouteFromFile(contentDir, full));
+      }
+    }
+  }
+
+  walkDocs(contentDir);
+  return routes;
+}
+
+/** Parsed frontmatter of a blog .mdx file, or {} when it has none. */
+function blogFrontmatter(file) {
+  const raw = fs.readFileSync(file, "utf8");
+  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return {};
+  return parseYaml(match[1]) || {};
+}
+
+/**
+ * Blog post and tag routes from the content/blog .mdx sources. Posts are
+ * flat (no nested slugs); tag pages exist for every tag any post carries.
+ */
+function getBlogRoutes() {
+  const contentDir = path.join(ROOT, "content", "blog");
+  if (!fs.existsSync(contentDir)) return [];
+
+  const routes = [];
+  const tags = new Set();
+
+  for (const entry of fs.readdirSync(contentDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".mdx")) continue;
+    routes.push(`/blog/${entry.name.replace(/\.mdx$/, "")}`);
+    const data = blogFrontmatter(path.join(contentDir, entry.name));
+    for (const tag of Array.isArray(data.tags) ? data.tags : []) {
+      tags.add(tag);
+    }
+  }
+
+  for (const tag of tags) {
+    routes.push(`/blog/tags/${tag}`);
+  }
+  return routes;
+}
+
+function routeFromFile(file) {
+  const rel = path.relative(APP_DIR, path.dirname(file));
+  let route = "/" + rel.replace(/\\/g, "/");
+  if (route === "/.") route = "/";
+  // normalize root
+  route = route.replace(/\/\/$/, "");
+  if (route === "/.") route = "/";
+  return route === "/" ? "/" : route;
+}
+
+function isDynamic(route) {
+  return /\[.+?\]/.test(route);
+}
+
+// The generated OpenAPI operation pages under these prefixes are thin
+// near-duplicates (no description, body is a JSX component) and are
+// noindexed in next.config.mjs. Keep them out of the sitemap too. Trailing
+// slash keeps /docs/api itself, the reference entry point, in the sitemap.
+const EXCLUDED_PREFIXES = ["/auth/", "/docs/api/dashboard/", "/docs/api/sdk/"];
+
+function isExcluded(route) {
+  return EXCLUDED_PREFIXES.some((prefix) => route.startsWith(prefix));
+}
+
+function ensurePublicDir() {
+  if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+}
+
+function buildSitemap(urls) {
+  const now = new Date().toISOString();
+  const parts = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+  ];
+  for (const u of urls) {
+    parts.push("  <url>");
+    parts.push(`    <loc>${u}</loc>`);
+    parts.push(`    <lastmod>${now}</lastmod>`);
+    parts.push("  </url>");
+  }
+  parts.push("</urlset>");
+  return parts.join("\n");
+}
+
+function main() {
+  if (!fs.existsSync(APP_DIR)) {
+    console.error("app directory not found:", APP_DIR);
+    process.exit(1);
+  }
+
+  const files = walk(APP_DIR);
+
+  const routes = new Set();
+
+  for (const f of files) {
+    const route = routeFromFile(f);
+    if (isDynamic(route) || isExcluded(route)) {
+      continue;
+    }
+    routes.add(route === "/" ? "/" : route.replace(/\\/g, "/"));
+  }
+
+  for (const route of getDocsRoutes()) {
+    if (isExcluded(route)) continue;
+    routes.add(route);
+  }
+
+  for (const route of getBlogRoutes()) {
+    routes.add(route);
+  }
+
+  const urls = Array.from(routes)
+    .sort()
+    .map((r) => (r === "/" ? SITE_URL : `${SITE_URL}${r}`));
+
+  ensurePublicDir();
+  const xml = buildSitemap(urls);
+  const out = path.join(PUBLIC_DIR, "sitemap.xml");
+  fs.writeFileSync(out, xml, "utf8");
+  console.log("Wrote sitemap with", urls.length, "entries to", out);
+}
+
+if (require.main === module) main();
+
+module.exports = {
+  walk,
+  routeFromFile,
+  docsRouteFromFile,
+  isDynamic,
+  isExcluded,
+  getDocsRoutes,
+  getBlogRoutes,
+  buildSitemap,
+  ensurePublicDir,
+  main,
+  APP_DIR,
+  PUBLIC_DIR,
+  ROOT,
+  SITE_URL,
+};

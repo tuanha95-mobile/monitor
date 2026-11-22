@@ -1,0 +1,267 @@
+package sh.measure.android.storage
+
+import sh.measure.android.logger.LogLevel
+import sh.measure.android.logger.Logger
+import java.io.File
+import java.io.IOException
+
+internal interface FileStorage {
+    /**
+     * Writes serialized event data to a file.
+     *
+     * @return The path of the file if the write was successful, otherwise null.
+     */
+    fun writeEventData(eventId: String, serializedData: String): String?
+
+    /**
+     * Gets a file from the given path.
+     *
+     * @param path The path of the file to get.
+     * @return The file if it exists, otherwise null.
+     */
+    fun getFile(path: String): File?
+
+    /**
+     * Writes an attachment to a file, with the attachment id as the file name.
+     *
+     * @param attachmentId The attachment id to use as the file name.
+     */
+    fun writeAttachment(attachmentId: String, bytes: ByteArray): String?
+
+    /**
+     * Deletes events and their attachments.
+     *
+     * @param eventIds The list of event ids to delete.
+     */
+    fun deleteEventsIfExist(eventIds: List<String>)
+
+    /**
+     * Deletes an event and its attachments.
+     *
+     * @param eventId The event id to delete.
+     */
+    fun deleteEventIfExist(eventId: String)
+
+    /**
+     * Returns all files in the measure directory.
+     *
+     * @param limit The maximum number of files to return.
+     */
+    fun getAllFiles(limit: Int = 100): List<File>
+
+    /**
+     * Deletes a list of files.
+     */
+    fun deleteFiles(files: List<File>)
+
+    /**
+     * Deletes a list of files using their path.
+     */
+    fun deleteFilePaths(paths: List<String>)
+
+    /**
+     * Writes a screenshot represented by the [bytes] with the given [name] and [extension].
+     */
+    fun writeTempBugReportScreenshot(
+        name: String,
+        extension: String,
+        bytes: ByteArray,
+        sessionId: String,
+    ): String?
+
+    /**
+     * Returns the directory where bug report data is stored temporarily.
+     */
+    fun getBugReportDir(): File
+
+    /**
+     * Returns the directory where attachment files are stored. Creates one, if it doesn't
+     * exist yet.
+     */
+    fun getAttachmentDirectory(): String
+
+    /**
+     * Deletes attachments with given IDs.
+     */
+    fun deleteAttachmentsIfExist(attachmentIds: List<String>?)
+
+    /**
+     * Returns the file where the [sh.measure.android.config.DynamicConfig] is stored.
+     */
+    fun getConfigFile(): File?
+
+    /**
+     * Returns the path to the file where the [sh.measure.android.config.DynamicConfig] is stored.
+     */
+    fun getConfigPath(): String
+
+    /**
+     * Validates that the file exists.
+     */
+    fun validateFile(path: String): Boolean
+
+    /**
+     * Returns the directory where SDK debug log files are stored, or null if it doesn't exist.
+     */
+    fun getSdkDebugLogsDirectory(): File?
+}
+
+private const val MEASURE_DIR = "measure"
+private const val BUG_REPORTS_DIR = "bug_reports"
+private const val SDK_DEBUG_LOGS_DIR = "sdk_debug_logs"
+private const val CONFIG_FILE_NAME = "config.json"
+
+internal class FileStorageImpl(
+    private val rootDir: String,
+    private val logger: Logger,
+) : FileStorage {
+
+    override fun writeEventData(eventId: String, serializedData: String): String? {
+        val file = getOrCreateFile(eventId) ?: return null
+        try {
+            file.writeText(serializedData)
+        } catch (e: IOException) {
+            logger.log(LogLevel.Debug, "Failed to write event data to file", e)
+            deleteFileIfExists(file)
+            return null
+        }
+        return file.path
+    }
+
+    override fun writeAttachment(attachmentId: String, bytes: ByteArray): String? {
+        val file = getOrCreateFile(attachmentId) ?: return null
+        return try {
+            file.writeBytes(bytes)
+            file.path
+        } catch (e: IOException) {
+            logger.log(LogLevel.Debug, "Failed to write attachment to file", e)
+            deleteFileIfExists(file)
+            null
+        }
+    }
+
+    override fun deleteEventIfExist(eventId: String) {
+        deleteEventsIfExist(listOf(eventId))
+    }
+
+    override fun getAllFiles(limit: Int): List<File> {
+        val dir = File("$rootDir/$MEASURE_DIR")
+        return dir.listFiles()?.take(limit) ?: emptyList()
+    }
+
+    override fun deleteFiles(files: List<File>) {
+        files.forEach { file ->
+            deleteFileIfExists(file)
+        }
+    }
+
+    override fun deleteFilePaths(paths: List<String>) {
+        deleteFiles(paths.mapNotNull { getFile(it) })
+    }
+
+    override fun writeTempBugReportScreenshot(
+        name: String,
+        extension: String,
+        bytes: ByteArray,
+        sessionId: String,
+    ): String? {
+        val file = getOrCreateFile("$name.$extension", "$BUG_REPORTS_DIR/$sessionId")
+        if (file != null) {
+            file.writeBytes(bytes)
+            return file.absolutePath
+        }
+        return null
+    }
+
+    override fun getBugReportDir(): File = File("$rootDir/$MEASURE_DIR/$BUG_REPORTS_DIR")
+
+    override fun getAttachmentDirectory(): String {
+        val dirPath = "$rootDir/$MEASURE_DIR"
+        val rootDir = File(dirPath)
+        try {
+            if (!rootDir.exists()) {
+                rootDir.mkdirs()
+            }
+        } catch (e: SecurityException) {
+            logger.log(LogLevel.Debug, "Failed to create file", e)
+            return dirPath
+        }
+        return dirPath
+    }
+
+    override fun deleteEventsIfExist(eventIds: List<String>) {
+        eventIds.forEach { id ->
+            getFile("$rootDir/$MEASURE_DIR/$id")?.delete()
+        }
+    }
+
+    override fun deleteAttachmentsIfExist(attachmentIds: List<String>?) {
+        attachmentIds?.forEach { id ->
+            getFile("$rootDir/$MEASURE_DIR/$id")?.delete()
+        }
+    }
+
+    override fun getConfigFile(): File? = getOrCreateFile(CONFIG_FILE_NAME)
+
+    override fun getConfigPath(): String = "$rootDir/$MEASURE_DIR/$CONFIG_FILE_NAME"
+
+    override fun getSdkDebugLogsDirectory(): File? {
+        val dir = File("$rootDir/$MEASURE_DIR/$SDK_DEBUG_LOGS_DIR")
+        return try {
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            if (dir.exists()) dir else null
+        } catch (e: SecurityException) {
+            logger.log(LogLevel.Debug, "Failed to create sdk debug logs directory", e)
+            null
+        }
+    }
+
+    override fun validateFile(path: String): Boolean {
+        val file = getFile(path)
+        return file != null && file.exists() && file.length() > 0
+    }
+
+    override fun getFile(path: String): File? {
+        val file = File(path)
+        return when {
+            file.exists() -> file
+            else -> null
+        }
+    }
+
+    private fun getOrCreateFile(id: String, subdir: String = ""): File? {
+        val dirPath = "$rootDir/$MEASURE_DIR/$subdir"
+        val rootDir = File(dirPath)
+
+        // Create directories if they don't exist
+        try {
+            if (!rootDir.exists()) {
+                rootDir.mkdirs()
+            }
+        } catch (e: SecurityException) {
+            logger.log(LogLevel.Debug, "Failed to create file", e)
+            return null
+        }
+
+        val filePath = "$dirPath/$id"
+        val file = File(filePath)
+        try {
+            if (!file.exists()) {
+                file.createNewFile()
+            }
+        } catch (e: IOException) {
+            logger.log(LogLevel.Debug, "Failed to create file", e)
+            return null
+        }
+
+        return file
+    }
+
+    private fun deleteFileIfExists(file: File) {
+        if (file.exists()) {
+            file.delete()
+        }
+    }
+}

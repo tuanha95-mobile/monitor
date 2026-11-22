@@ -1,0 +1,84 @@
+import 'package:flutter/services.dart';
+import 'package:measure_flutter/measure_flutter.dart';
+import 'package:measure_flutter/src/method_channel/msr_method_channel.dart';
+
+class FakeMethodChannel extends MsrMethodChannel {
+  Future<void> Function(MethodCall call)? handler;
+  Uint8List? encodedWebPResult;
+  final List<({String platform, String message})> internalAddLogCalls = [];
+  bool internalAddLogShouldThrow = false;
+
+  @override
+  void setMethodCallHandler(
+      Future<void> Function(MethodCall call) handleMethodCall) {
+    handler = handleMethodCall;
+  }
+
+  // Simulate a method call from the native side
+  Future<void> simulateMethodCall(String method, [dynamic arguments]) async {
+    if (handler != null) {
+      await handler!(MethodCall(method, arguments));
+    }
+  }
+
+  @override
+  Future<void> trackEvent({
+    required Map<String, dynamic> data,
+    required String type,
+    required int timestamp,
+    required Map<String, AttributeValue> userDefinedAttrs,
+    required bool userTriggered,
+    String? threadName,
+    List<MsrAttachment>? attachments,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> triggerNativeCrash() => throw UnimplementedError();
+
+  @override
+  Future<void> start() => throw UnimplementedError();
+
+  @override
+  Future<void> stop() => throw UnimplementedError();
+
+  @override
+  Future<String?> getSessionId() => throw UnimplementedError();
+
+  @override
+  Future<void> trackSpan(dynamic data) => throw UnimplementedError();
+
+  @override
+  Future<void> clearUserId() => throw UnimplementedError();
+
+  @override
+  Future<void> setUserId(String userId) => throw UnimplementedError();
+
+  @override
+  Future<String?> getAttachmentDirectory() => throw UnimplementedError();
+
+  @override
+  Future<void> enableShakeDetector() => throw UnimplementedError();
+
+  @override
+  Future<void> disableShakeDetector() => throw UnimplementedError();
+
+  @override
+  Future<Uint8List?> encodeWebP({
+    required Uint8List pixels,
+    required int width,
+    required int height,
+  }) async =>
+      encodedWebPResult;
+
+  @override
+  Future<void> internalAddLog({
+    required String platform,
+    required String message,
+  }) async {
+    internalAddLogCalls.add((platform: platform, message: message));
+    if (internalAddLogShouldThrow) {
+      throw Exception('forced error');
+    }
+  }
+}

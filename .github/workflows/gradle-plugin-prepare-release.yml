@@ -1,0 +1,97 @@
+name: Prepare Android Gradle Plugin Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.10.0)'
+        required: true
+        type: string
+      next_version:
+        description: 'Next SNAPSHOT version (e.g., 0.11.0-SNAPSHOT)'
+        required: true
+        type: string
+
+env:
+  JAVA_VERSION: 21
+  JAVA_DISTRIBUTION: 'temurin'
+
+jobs:
+  prepare-release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/measure-gradle-plugin
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: 'main'
+          fetch-depth: 0
+          token: ${{ secrets.SDK_RELEASE }}
+
+      - name: Setup Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Validate input version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-((alpha|beta)\.[0-9]+))?$ ]]; then
+            echo "Error: Version must match semantic versioning pattern:"
+            echo "  - x.y.z (e.g. 1.2.3)"
+            echo "Got: $VERSION"
+            exit 1
+          fi
+
+      - name: Update version in gradle.properties
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/MEASURE_PLUGIN_VERSION_NAME=.*/MEASURE_PLUGIN_VERSION_NAME=$VERSION/" gradle.properties
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: android/measure-gradle-plugin/cliff.toml
+          args: --output android/measure-gradle-plugin/CHANGELOG.md --tag android-gradle-plugin-v${{ inputs.version }}
+
+      - name: Update plugin version in getting started docs
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd ../../frontend/dashboard/content/docs
+          KOTLIN_PATTERN='id("sh.measure.android.gradle") version ".*"'
+          KOTLIN_REPLACEMENT="id(\"sh.measure.android.gradle\") version \"$VERSION\""
+          sed -i "s/$KOTLIN_PATTERN/$KOTLIN_REPLACEMENT/" getting-started/android.mdx getting-started/flutter.mdx getting-started/kotlin-multiplatform.mdx
+          sed -i "s|sh\.measure\.android\.gradle:sh\.measure\.android\.gradle\.gradle\.plugin:[0-9]*\.[0-9]*\.[0-9]*|sh.measure.android.gradle:sh.measure.android.gradle.gradle.plugin:$VERSION|g" getting-started/react-native.mdx
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SDK_RELEASE }}
+          commit-message: "chore(gradle): prepare plugin release ${{ inputs.version }}"
+          branch: android-gradle-plugin-v${{ inputs.version }}
+          delete-branch: false
+          title: "chore(gradle): prepare plugin release ${{ inputs.version }}"
+          body: |
+            This PR prepares the Android Gradle Plugin for release version ${{ inputs.version }}.
+
+            Changes:
+            - Updated version to ${{ inputs.version }} in measure-gradle-plugin/gradle.properties
+            - Generated changelog for version ${{ inputs.version }}
+            - Updated plugin version in the getting started docs
+
+            <!-- release-meta
+            NEXT_VERSION=${{ inputs.next_version }}
+            -->
+          base: main
+          labels: android
+          assignees: abhaysood

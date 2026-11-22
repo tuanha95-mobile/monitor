@@ -1,0 +1,2020 @@
+import { promiseParams } from "@/__tests__/helpers/promise_params";
+import Usage from "@/app/[teamId]/usage/page";
+import {
+  INCLUDED_PRO_GB,
+  PRICE_PER_GB_MONTH,
+  PRO_RETENTION_DAYS,
+} from "@/app/utils/pricing_constants";
+import { beforeEach, describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+
+// Mock toast functions
+const mockToastPositive = jest.fn();
+const mockToastNegative = jest.fn();
+
+jest.mock("@/app/components/toast", () => ({
+  toastPositive: (...args: any[]) => mockToastPositive(...args),
+  toastNegative: (...args: any[]) => mockToastNegative(...args),
+}));
+
+// Stripe checkout and billing-portal redirects go through the navigation
+// module because jsdom's window.location can't be stubbed; mock it to
+// observe the redirect URLs.
+const mockNavigateTo = jest.fn();
+jest.mock("@/app/utils/navigation", () => ({
+  navigateTo: (...args: any[]) => mockNavigateTo(...args),
+  reloadPage: jest.fn(),
+}));
+
+// The real replaceState, kept for staging URLs after beforeEach swaps the
+// method for a mock the page's param-strip assertions observe.
+const realReplaceState = window.history.replaceState.bind(window.history);
+function setUrl(url: string) {
+  realReplaceState(null, "", url);
+}
+
+// Mock API calls - only need the enum/constant exports, not the fetch functions
+jest.mock("@/app/api/api_calls", () => ({
+  __esModule: true,
+  emptyUsage: [
+    {
+      app_id: "",
+      app_name: "",
+      monthly_app_usage: [
+        { month_year: "", sessions: 0, events: 0, spans: 0, bytes_in: 0 },
+      ],
+    },
+  ],
+}));
+
+// --- Bridge store for usage page ---
+const { create: createBridge } = jest.requireActual("zustand") as any;
+const usageBridge = createBridge(() => ({
+  usageState: "pending",
+  usage: [] as any[],
+  months: [] as string[],
+  selectedMonth: undefined as string | undefined,
+  selectedMonthUsage: [] as any[],
+  billingInfoState: "pending",
+  billingInfo: null as any,
+  currentUserCanChangePlan: false,
+  fetchUsage: jest.fn(),
+  setSelectedMonth: jest.fn(),
+  fetchPermissions: jest.fn(),
+  fetchBillingInfo: jest.fn(),
+  handleUpgrade: jest.fn(),
+  handleDowngrade: jest.fn(),
+  handleUndoDowngrade: jest.fn(),
+  handleManageBilling: jest.fn(),
+  reset: jest.fn(),
+}));
+
+function queryStatus(state: string) {
+  if (state === "loaded" || state === "no-apps") {
+    return "success";
+  }
+  if (state === "error") {
+    return "error";
+  }
+  return "pending";
+}
+
+jest.mock("@/app/query/hooks", () => ({
+  __esModule: true,
+  useUsageQuery: () => {
+    const s = usageBridge.getState();
+    const data =
+      s.usageState === "no-apps"
+        ? null
+        : s.usageState === "loaded" &&
+            s.usage.length === 0 &&
+            s.months.length > 0
+          ? // Build usage data from months/selectedMonthUsage
+            s.selectedMonthUsage.map((u: any) => ({
+              app_id: u.id,
+              app_name: u.label,
+              monthly_app_usage: [
+                {
+                  month_year: s.selectedMonth || s.months[s.months.length - 1],
+                  sessions: u.value,
+                  events: u.events,
+                  spans: u.spans,
+                  bytes_in: u.bytes_in,
+                },
+              ],
+            }))
+          : s.usage.length > 0
+            ? s.usage
+            : undefined;
+    return { data, status: queryStatus(s.usageState) };
+  },
+  useUsagePermissionsQuery: () => {
+    const s = usageBridge.getState();
+    return { data: { canChangePlan: s.currentUserCanChangePlan } };
+  },
+  useBillingInfoQuery: () => {
+    const s = usageBridge.getState();
+    return {
+      data: s.billingInfo,
+      status: queryStatus(s.billingInfoState),
+    };
+  },
+  useHandleUpgradeMutation: () => {
+    const s = usageBridge.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.handleUpgrade(params.teamId, params.successUrl);
+        if (result?.redirect) {
+          opts?.onSuccess?.({ checkout_url: result.redirect });
+        } else if (result?.alreadyUpgraded) {
+          opts?.onSuccess?.({ already_upgraded: true });
+        } else if (result?.error) {
+          opts?.onSuccess?.({}); // no checkout_url triggers error toast
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: false,
+    };
+  },
+  useDowngradeToFreeMutation: () => {
+    const s = usageBridge.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.handleDowngrade(params.teamId);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: false,
+    };
+  },
+  useUndoDowngradeMutation: () => {
+    const s = usageBridge.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.handleUndoDowngrade(params.teamId);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: false,
+    };
+  },
+  fetchCustomerPortalUrl: async (teamId: string, returnUrl: string) => {
+    const s = usageBridge.getState();
+    return await s.handleManageBilling(teamId, returnUrl);
+  },
+}));
+
+// Mock Skeleton
+jest.mock("@/app/components/skeleton", () => ({
+  Skeleton: ({ className, ...props }: any) => (
+    <div data-testid="skeleton-mock" className={className} {...props} />
+  ),
+}));
+
+// Mock feature flags - billing enabled by default
+jest.mock("@/app/utils/feature_flag_utils", () => ({
+  isBillingEnabled: jest.fn(() => true),
+}));
+
+// Mock next-themes
+jest.mock("next-themes", () => ({
+  useTheme: () => ({ theme: "light" }),
+}));
+
+// Mock ResponsivePie — renders one span per slice and captures the props of
+// the latest render so tests can call the arcLinkLabel and tooltip functions
+// the page passes in.
+let mockPieProps: any = null;
+jest.mock("@nivo/pie", () => ({
+  ResponsivePie: (props: any) => {
+    mockPieProps = props;
+    return (
+      <div data-testid="pie-chart-mock">
+        {props.data?.map((d: any) => (
+          <span key={d.id} data-testid={`pie-slice-${d.id}`}>
+            {`${d.label}: ${d.value} sessions, ${d.events} events, ${d.spans} spans`}
+          </span>
+        ))}
+      </div>
+    );
+  },
+}));
+
+// Mock the tooltip shell so rendering a captured tooltip element needs no
+// real chart styling.
+jest.mock("@/app/components/plot_tooltip", () => ({
+  __esModule: true,
+  PlotTooltipShell: ({ children }: any) => (
+    <div data-testid="plot-tooltip-shell">{children}</div>
+  ),
+}));
+
+// Mock DropdownSelect — renders the current selection and one button per
+// item so tests can pick a month.
+jest.mock("@/app/components/dropdown_select", () => ({
+  __esModule: true,
+  default: (props: any) => (
+    <div data-testid="dropdown-mock">
+      <span>{props.title}</span>
+      <span data-testid="dropdown-selected">{props.initialSelected}</span>
+      {props.items?.map((item: string) => (
+        <button
+          key={item}
+          data-testid={`dropdown-item-${item}`}
+          onClick={() => props.onChangeSelected(item)}
+        >
+          {item}
+        </button>
+      ))}
+    </div>
+  ),
+  DropdownSelectType: { SingleString: 0 },
+}));
+
+// Mock DangerConfirmationDialog
+jest.mock("@/app/components/danger_confirmation_dialog", () => ({
+  __esModule: true,
+  default: (props: any) => {
+    if (!props.open) return null;
+    return (
+      <div data-testid="danger-dialog-mock">
+        <button data-testid="dialog-affirm" onClick={props.onAffirmativeAction}>
+          {props.affirmativeText}
+        </button>
+        <button data-testid="dialog-cancel" onClick={props.onCancelAction}>
+          {props.cancelText}
+        </button>
+      </div>
+    );
+  },
+}));
+
+// Mock Button - pass through as real button elements
+jest.mock("@/app/components/button", () => ({
+  Button: (props: any) => <button {...props} />,
+  buttonVariants: (opts: any) => opts?.variant || "default",
+}));
+
+// Mock Card - pass through as div
+jest.mock("@/app/components/card", () => ({
+  Card: ({ children, className }: any) => (
+    <div className={className}>{children}</div>
+  ),
+}));
+
+// Mock next/link
+jest.mock("next/link", () => ({
+  __esModule: true,
+  default: ({ children, href, ...props }: any) => (
+    <a href={href} {...props}>
+      {children}
+    </a>
+  ),
+}));
+
+const useUsageStore = usageBridge;
+
+// Helper: default free plan billing info
+const freeBillingInfo = {
+  team_id: "team1",
+  plan: "free",
+  autumn_customer_id: null,
+  bytes_granted: 5_000_000_000,
+  bytes_used: 0,
+};
+
+// Helper: default pro plan billing info
+const proBillingInfo = {
+  team_id: "team1",
+  plan: "pro",
+  autumn_customer_id: "cust_123",
+  bytes_granted: 25_000_000_000,
+  bytes_used: 0,
+  status: "active",
+  current_period_start: 1700000000,
+  current_period_end: 1702678400,
+};
+
+// Default enterprise plan billing info, the typical shape: unlimited bytes
+// and the plan's own retention entitlement.
+const enterpriseBillingInfo = {
+  team_id: "team1",
+  plan: "enterprise",
+  autumn_customer_id: "cust_ent",
+  bytes_granted: 0,
+  bytes_used: 5_000_000_000,
+  bytes_unlimited: true,
+  retention_days: 365,
+  status: "active",
+  current_period_start: 1700000000,
+  current_period_end: 1702678400,
+};
+
+// Raw usage response shape: two apps, each reporting two months, so the page
+// itself derives the month list and per-month slices.
+const rawUsage = [
+  {
+    app_id: "app1",
+    app_name: "My App",
+    monthly_app_usage: [
+      {
+        month_year: "Mar 2026",
+        sessions: 5000,
+        events: 12000,
+        spans: 8000,
+        bytes_in: 100,
+      },
+      {
+        month_year: "Apr 2026",
+        sessions: 6200,
+        events: 15000,
+        spans: 9500,
+        bytes_in: 200,
+      },
+    ],
+  },
+  {
+    app_id: "app2",
+    app_name: "Other App",
+    monthly_app_usage: [
+      {
+        month_year: "Mar 2026",
+        sessions: 2000,
+        events: 4000,
+        spans: 3000,
+        bytes_in: 50,
+      },
+      {
+        month_year: "Apr 2026",
+        sessions: 2500,
+        events: 5000,
+        spans: 3500,
+        bytes_in: 60,
+      },
+    ],
+  },
+];
+
+describe("Usage Page", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    mockPieProps = null;
+
+    // Reset store to defaults
+    useUsageStore.setState({
+      usageState: "pending",
+      usage: [],
+      months: [],
+      selectedMonth: undefined,
+      selectedMonthUsage: [],
+      billingInfoState: "pending",
+      billingInfo: null,
+      currentUserCanChangePlan: false,
+      fetchUsage: jest.fn(),
+      setSelectedMonth: jest.fn(),
+      fetchPermissions: jest.fn(),
+      fetchBillingInfo: jest.fn(),
+      handleUpgrade: jest.fn(),
+      handleDowngrade: jest.fn(),
+      handleUndoDowngrade: jest.fn(),
+      handleManageBilling: jest.fn(),
+      reset: jest.fn(),
+    });
+
+    setUrl("/team1/usage");
+    window.history.replaceState = jest.fn();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    // Drop the instance mock so History.prototype.replaceState shows
+    // through again, then put the shared jsdom URL back.
+    delete (window.history as any).replaceState;
+    setUrl("/");
+  });
+
+  // ---- Usage section ----
+
+  it("shows loading spinner while fetching usage", async () => {
+    useUsageStore.setState({ usageState: "pending" }); // Loading
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const spinners = screen.getAllByTestId("skeleton-mock");
+    expect(spinners.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shows error message when usage fetch fails", async () => {
+    useUsageStore.setState({ usageState: "error" }); // Error
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Error fetching usage data/)).toBeInTheDocument();
+  });
+
+  it("shows a neutral empty state when no apps exist (no onboarding push)", async () => {
+    useUsageStore.setState({ usageState: "no-apps" }); // NoApps
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("No usage found")).toBeInTheDocument();
+    // Settings pages (team, notif prefs, usage, etc.) don't drive the
+    // user toward onboarding — only the apps page does that.
+    expect(
+      screen.queryByText(/don't have any apps yet/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("creating your first app!"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the empty state in place of the pie for a month with no usage", async () => {
+    useUsageStore.setState({
+      usageState: "loaded",
+      months: ["2025-01", "2025-02"],
+      selectedMonth: "2025-02",
+      selectedMonthUsage: [
+        {
+          id: "app1",
+          label: "My App",
+          value: 0,
+          events: 0,
+          spans: 0,
+          bytes_in: 0,
+        },
+      ],
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("No usage found")).toBeInTheDocument();
+    expect(screen.getByTestId("dropdown-mock")).toBeInTheDocument();
+    expect(screen.queryByTestId("pie-chart-mock")).not.toBeInTheDocument();
+  });
+
+  it("renders pie chart and month dropdown on success", async () => {
+    useUsageStore.setState({
+      usageState: "loaded",
+      months: ["2025-01", "2025-02"],
+      selectedMonth: "2025-02",
+      selectedMonthUsage: [
+        {
+          id: "app1",
+          label: "My App",
+          value: 150,
+          events: 700,
+          spans: 300,
+          bytes_in: 1_000_000,
+        },
+      ],
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByTestId("pie-chart-mock")).toBeInTheDocument();
+    expect(screen.getByTestId("dropdown-mock")).toBeInTheDocument();
+  });
+
+  it("maps the selected month's usage into pie slices with per-app values", async () => {
+    useUsageStore.setState({ usageState: "loaded", usage: rawUsage });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByTestId("pie-slice-app1")).toHaveTextContent(
+      "My App: 6200 sessions, 15000 events, 9500 spans",
+    );
+    expect(screen.getByTestId("pie-slice-app2")).toHaveTextContent(
+      "Other App: 2500 sessions, 5000 events, 3500 spans",
+    );
+  });
+
+  it("defaults the month selection to the latest month in the data", async () => {
+    useUsageStore.setState({ usageState: "loaded", usage: rawUsage });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByTestId("dropdown-selected")).toHaveTextContent(
+      "Apr 2026",
+    );
+  });
+
+  it("month dropdown lists every month present in the usage data", async () => {
+    useUsageStore.setState({ usageState: "loaded", usage: rawUsage });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByTestId("dropdown-item-Mar 2026")).toBeInTheDocument();
+    expect(screen.getByTestId("dropdown-item-Apr 2026")).toBeInTheDocument();
+  });
+
+  it("selecting a different month updates the pie data", async () => {
+    useUsageStore.setState({ usageState: "loaded", usage: rawUsage });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByTestId("pie-slice-app1")).toHaveTextContent(
+      "My App: 6200 sessions, 15000 events, 9500 spans",
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("dropdown-item-Mar 2026"));
+    });
+
+    expect(screen.getByTestId("pie-slice-app1")).toHaveTextContent(
+      "My App: 5000 sessions, 12000 events, 8000 spans",
+    );
+    expect(screen.getByTestId("pie-slice-app2")).toHaveTextContent(
+      "Other App: 2000 sessions, 4000 events, 3000 spans",
+    );
+  });
+
+  it("formats arc link labels and tooltips from the slice datum", async () => {
+    useUsageStore.setState({ usageState: "loaded", usage: rawUsage });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(mockPieProps).not.toBeNull();
+    expect(mockPieProps.arcLinkLabel({ label: "My App" })).toBe("My App");
+
+    // The tooltip is a render function the page hands to the pie chart; call
+    // it with a slice datum and render the result to check its content.
+    const tooltip = mockPieProps.tooltip({
+      datum: { id: "app1", label: "My App", value: 6200, color: "#00ff00" },
+    });
+    render(<>{tooltip}</>);
+
+    expect(screen.getByTestId("plot-tooltip-shell")).toBeInTheDocument();
+    expect(screen.getByText("My App")).toBeInTheDocument();
+    expect(screen.getByText("Sessions: 6200")).toBeInTheDocument();
+    expect(screen.getByText("Events: 15000")).toBeInTheDocument();
+    expect(screen.getByText("Spans: 9500")).toBeInTheDocument();
+  });
+
+  // ---- Billing section ----
+
+  it("does not render billing section when billing is disabled", async () => {
+    const { isBillingEnabled } = require("@/app/utils/feature_flag_utils");
+    isBillingEnabled.mockReturnValue(false);
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText("Billing")).not.toBeInTheDocument();
+
+    isBillingEnabled.mockReturnValue(true);
+  });
+
+  it("does not call billing APIs when billing is disabled", async () => {
+    const { isBillingEnabled } = require("@/app/utils/feature_flag_utils");
+    isBillingEnabled.mockReturnValue(false);
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const store = useUsageStore.getState();
+    expect(store.fetchBillingInfo).not.toHaveBeenCalled();
+    expect(store.fetchPermissions).not.toHaveBeenCalled();
+
+    isBillingEnabled.mockReturnValue(true);
+  });
+
+  it("shows billing loading spinner while billing info loads", async () => {
+    useUsageStore.setState({ billingInfoState: "pending" }); // Loading
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // There will be at least one loading spinner for billing
+    const spinners = screen.getAllByTestId("skeleton-mock");
+    expect(spinners.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shows billing error message when billing info fetch fails", async () => {
+    useUsageStore.setState({ billingInfoState: "error" }); // Error
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Error fetching billing data/)).toBeInTheDocument();
+  });
+
+  it("renders free plan card with Current Plan badge and pricing when on free plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const plan = screen
+      .getByRole("heading", { name: "Free" })
+      .closest("section")!;
+    expect(plan).toHaveTextContent("$0 per month");
+    expect(screen.getByText("Current Plan")).toBeInTheDocument();
+    expect(screen.getByText("Upgrade to Pro")).toBeInTheDocument();
+  });
+
+  it("renders pro plan card with Current Plan badge when on pro plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const plan = screen
+      .getByRole("heading", { name: "Pro" })
+      .closest("section")!;
+    expect(plan).toHaveTextContent("$50 per month");
+    expect(screen.getByText("Current Plan")).toBeInTheDocument();
+    expect(screen.getByText("Downgrade to Free")).toBeInTheDocument();
+    expect(screen.getByText("Contact us")).toBeInTheDocument();
+  });
+
+  // ---- Upgrade flow ----
+
+  it("upgrade button is disabled when user cannot change billing", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: false,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const upgradeButton = screen.getByText("Upgrade to Pro");
+    expect(upgradeButton).toBeDisabled();
+  });
+
+  it("clicking upgrade calls checkout API and redirects", async () => {
+    const handleUpgrade = jest
+      .fn()
+      .mockResolvedValue({ redirect: "https://checkout.stripe.com/test" });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUpgrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const upgradeButton = screen.getByText("Upgrade to Pro");
+    await act(async () => {
+      fireEvent.click(upgradeButton);
+    });
+
+    expect(handleUpgrade).toHaveBeenCalled();
+    expect(mockNavigateTo).toHaveBeenCalledWith(
+      "https://checkout.stripe.com/test",
+    );
+  });
+
+  it("upgrade button resets when the page is restored from the back/forward cache", async () => {
+    const handleUpgrade = jest
+      .fn()
+      .mockResolvedValue({ redirect: "https://checkout.stripe.com/test" });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUpgrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Upgrade to Pro"));
+    });
+
+    expect(screen.getByText("Redirecting...")).toBeDisabled();
+
+    await act(async () => {
+      window.dispatchEvent(
+        new PageTransitionEvent("pageshow", { persisted: true }),
+      );
+    });
+
+    expect(screen.getByText("Upgrade to Pro")).not.toBeDisabled();
+  });
+
+  it("upgrade with already_upgraded response refreshes billing info and shows toast", async () => {
+    const handleUpgrade = jest
+      .fn()
+      .mockResolvedValue({ alreadyUpgraded: true });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUpgrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const upgradeButton = screen.getByText("Upgrade to Pro");
+    await act(async () => {
+      fireEvent.click(upgradeButton);
+    });
+
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      expect.stringContaining("subscription was found"),
+    );
+  });
+
+  it("upgrade error shows toast", async () => {
+    const handleUpgrade = jest.fn().mockResolvedValue({ error: true });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUpgrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const upgradeButton = screen.getByText("Upgrade to Pro");
+    await act(async () => {
+      fireEvent.click(upgradeButton);
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to start checkout",
+      "Please try again.",
+    );
+  });
+
+  // ---- Downgrade flow ----
+
+  it("clicking downgrade opens confirmation dialog", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const downgradeButton = screen.getByText("Downgrade to Free");
+    await act(async () => {
+      fireEvent.click(downgradeButton);
+    });
+
+    expect(screen.getByTestId("danger-dialog-mock")).toBeInTheDocument();
+  });
+
+  it("confirming downgrade calls API and shows success toast", async () => {
+    const handleDowngrade = jest.fn().mockResolvedValue(true);
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Open dialog
+    const downgradeButton = screen.getByText("Downgrade to Free");
+    await act(async () => {
+      fireEvent.click(downgradeButton);
+    });
+
+    // Confirm downgrade
+    const affirmButton = screen.getByTestId("dialog-affirm");
+    await act(async () => {
+      fireEvent.click(affirmButton);
+    });
+
+    expect(handleDowngrade).toHaveBeenCalledWith("team1");
+
+    // Wait for async handleDowngrade to process
+    await act(async () => {
+      // Let promises resolve
+    });
+
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      expect.stringContaining("Cancellation scheduled"),
+    );
+  });
+
+  it("downgrade error shows error toast", async () => {
+    const handleDowngrade = jest.fn().mockResolvedValue(false);
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Open dialog
+    const downgradeButton = screen.getByText("Downgrade to Free");
+    await act(async () => {
+      fireEvent.click(downgradeButton);
+    });
+
+    // Confirm downgrade
+    const affirmButton = screen.getByTestId("dialog-affirm");
+    await act(async () => {
+      fireEvent.click(affirmButton);
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to schedule cancellation",
+      "Please try again.",
+    );
+  });
+
+  it("cancelling the downgrade dialog closes it without calling the downgrade API", async () => {
+    const handleDowngrade = jest.fn();
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Open dialog
+    await act(async () => {
+      fireEvent.click(screen.getByText("Downgrade to Free"));
+    });
+    expect(screen.getByTestId("danger-dialog-mock")).toBeInTheDocument();
+
+    // Cancel instead of confirming
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("dialog-cancel"));
+    });
+
+    expect(screen.queryByTestId("danger-dialog-mock")).not.toBeInTheDocument();
+    expect(handleDowngrade).not.toHaveBeenCalled();
+  });
+
+  // ---- Scheduled cancellation (canceled_at > 0) ----
+
+  // current_period_end must be in the future for the UI to consider the
+  // cancellation still pending. Bump well past 2030 to outlive the test
+  // suite's lifetime.
+  const futureCancelEnd = Math.floor(Date.UTC(2099, 0, 1) / 1000);
+  const scheduledCancelBillingInfo = {
+    ...proBillingInfo,
+    canceled_at: 1700100000,
+    current_period_end: futureCancelEnd,
+  };
+
+  it("shows Undo Cancellation button when cancellation is scheduled", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Undo Cancellation")).toBeInTheDocument();
+    expect(screen.queryByText("Downgrade to Free")).not.toBeInTheDocument();
+  });
+
+  it("shows scheduled-for date below Undo Cancellation button", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Cancellation scheduled for/)).toBeInTheDocument();
+  });
+
+  it("clicking Undo Cancellation calls undo API and shows success toast", async () => {
+    const handleUndoDowngrade = jest.fn().mockResolvedValue(true);
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUndoDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Undo Cancellation"));
+    });
+
+    expect(handleUndoDowngrade).toHaveBeenCalledWith("team1");
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      expect.stringContaining("Cancellation undone"),
+    );
+  });
+
+  it("Undo Cancellation error shows error toast", async () => {
+    const handleUndoDowngrade = jest.fn().mockResolvedValue(false);
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUndoDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Undo Cancellation"));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to undo cancellation",
+      "Please try again.",
+    );
+  });
+
+  it("hides scheduled-cancellation UI when current_period_end is in the past", async () => {
+    // Defensive: brief race window where Autumn still reports canceled_at
+    // but current_period_end has already passed. Treat as no cancellation
+    // — Autumn's auto-flip to Free will arrive shortly.
+    const pastEnd = Math.floor(Date.UTC(2020, 0, 1) / 1000);
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        canceled_at: 1700100000,
+        current_period_end: pastEnd,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText("Undo Cancellation")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Cancellation scheduled for/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Downgrade to Free")).toBeInTheDocument();
+  });
+
+  it("Undo Cancellation button disabled when user cannot change plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: false,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Undo Cancellation")).toBeDisabled();
+  });
+
+  it("pro plan with no scheduled cancellation shows Downgrade button and no scheduled-for line", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: { ...proBillingInfo, canceled_at: 0 },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Downgrade to Free")).toBeInTheDocument();
+    expect(screen.queryByText("Undo Cancellation")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Cancellation scheduled for/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("Manage Billing button is disabled while undoing cancellation", async () => {
+    let resolveUndo: (value: any) => void;
+    const handleUndoDowngrade = jest.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveUndo = resolve;
+        }),
+    );
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUndoDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Undo Cancellation"));
+    });
+
+    expect(screen.getByText("Manage Billing")).toBeDisabled();
+
+    await act(async () => {
+      resolveUndo!(true);
+    });
+  });
+
+  it('hides "Next invoice" line when cancellation is scheduled', async () => {
+    // current_period_end is the cancellation date, not a future invoice.
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Next invoice/)).not.toBeInTheDocument();
+    // The other Pro detail rows still render.
+    expect(screen.getByText(/Status:/)).toBeInTheDocument();
+    expect(screen.getByText(/Current billing cycle:/)).toBeInTheDocument();
+  });
+
+  it('shows "Next invoice" line on Pro plan when no cancellation is scheduled', async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: { ...proBillingInfo, canceled_at: 0 },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Next invoice/)).toBeInTheDocument();
+  });
+
+  it("Undo Cancellation button shows pending text while in flight", async () => {
+    let resolveUndo: (value: any) => void;
+    const handleUndoDowngrade = jest.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveUndo = resolve;
+        }),
+    );
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: scheduledCancelBillingInfo,
+      currentUserCanChangePlan: true,
+      handleUndoDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Undo Cancellation"));
+    });
+
+    expect(screen.getByText("Undoing...")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveUndo!(true);
+    });
+  });
+
+  // ---- Stripe redirect handling ----
+
+  it("shows success toast on ?success=true redirect", async () => {
+    setUrl("/team1/usage?success=true");
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Advance timers past the 100ms setTimeout
+    await act(async () => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      expect.stringContaining("upgraded to Pro"),
+    );
+  });
+
+  it("shows cancel toast on ?canceled=true redirect", async () => {
+    setUrl("/team1/usage?canceled=true");
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Advance timers past the 100ms setTimeout
+    await act(async () => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Checkout canceled",
+      "You can try again anytime.",
+    );
+  });
+
+  it("shows success toast and clears URL params on success redirect", async () => {
+    setUrl("/team1/usage?success=true");
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Trigger useEffect timeout (100ms)
+    await act(async () => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      expect.stringContaining("upgraded to Pro"),
+    );
+    expect(window.history.replaceState).toHaveBeenCalled();
+  });
+
+  it("shows pro plan feature list and personalised-plans contact prompt when on free plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/GB of data, then/)).toBeInTheDocument();
+    expect(screen.getAllByText(/days retention/).length).toBeGreaterThan(0);
+    expect(
+      screen.getByText("MCP server and Measure Agent"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/personalised plans/)).toBeInTheDocument();
+  });
+
+  it("hides pro plan feature list when on pro plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/days retention/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("MCP server and Measure Agent"),
+    ).not.toBeInTheDocument();
+    // The "personalised plans" contact-us prompt is now shared across free
+    // and pro — only enterprise hides it. Pro users should still see it.
+    expect(screen.getByText(/personalised plans/)).toBeInTheDocument();
+  });
+
+  it("shows subscription info on pro plan when user can change billing", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Status:/)).toBeInTheDocument();
+    expect(screen.getByText(/active/i)).toBeInTheDocument();
+    expect(screen.getByText(/Current billing cycle:/)).toBeInTheDocument();
+    expect(screen.getByText(/Next invoice:/)).toBeInTheDocument();
+    expect(screen.getByText(/^Data:/)).toBeInTheDocument();
+  });
+
+  it("does not show subscription info when on free plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Free plan — subscription info should not be displayed
+    expect(screen.queryByText(/Status:/)).not.toBeInTheDocument();
+  });
+
+  it("does not show subscription info when can_change_billing is false", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: false,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Status:/)).not.toBeInTheDocument();
+  });
+
+  it("handles missing subscription state gracefully", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        status: undefined,
+        current_period_start: undefined,
+        current_period_end: undefined,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Subscription info section should be absent, no crash
+    expect(screen.queryByText(/Status:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Next invoice:/)).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Pro" })).toBeInTheDocument();
+  });
+
+  it("Free plan card shows 'Data: X of Y used' from Autumn values", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...freeBillingInfo,
+        bytes_used: 1_000_000_000,
+        bytes_granted: 5_000_000_000,
+      },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/^Data:/)).toBeInTheDocument();
+    expect(screen.getByText(/1\.00 GB of 5\.00 GB used/)).toBeInTheDocument();
+    // Free has no overage, so the overage suffix must not appear even if
+    // used > granted (which can't happen on Free in practice).
+    expect(screen.queryByText(/overage/)).not.toBeInTheDocument();
+    expect(screen.queryByText("MCP server")).not.toBeInTheDocument();
+  });
+
+  it("Pro upgrade-pitch card shown to free users keeps the marketing copy", async () => {
+    // The Pro card on a Free user's view is purely marketing (we don't have
+    // Pro's Autumn balance for an unattached user). Lock the contract so a
+    // future "use Autumn for everything" attempt doesn't silently delete the
+    // pitch bullets.
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const plan = screen
+      .getByRole("heading", { name: "Pro" })
+      .closest("section")!;
+    expect(plan).toHaveTextContent(
+      `${INCLUDED_PRO_GB} GB of data, then $${PRICE_PER_GB_MONTH.toFixed(2)} per GB`,
+    );
+    expect(plan).toHaveTextContent(`${PRO_RETENTION_DAYS} days retention`);
+    expect(plan).toHaveTextContent("MCP server and Measure Agent");
+  });
+
+  it("Pro plan Data line shows 'X of Y used' when under quota", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        bytes_used: 1_000_000_000, // 1 GB
+        bytes_granted: 25_000_000_000, // 25 GB
+        bytes_overage_allowed: true,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/1\.00 GB of 25\.00 GB used/)).toBeInTheDocument();
+    expect(screen.queryByText(/overage/)).not.toBeInTheDocument();
+  });
+
+  it("Pro plan Data line appends ', Z overage' when used > granted and overage is allowed", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        bytes_used: 30_000_000_000, // 30 GB
+        bytes_granted: 25_000_000_000, // 25 GB
+        bytes_overage_allowed: true,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(
+      screen.getByText(/30\.00 GB of 25\.00 GB used, 5\.00 GB overage/),
+    ).toBeInTheDocument();
+  });
+
+  it("Pro plan Token credits line shows 'X of Y used' when agent credits have been used", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        token_credits_used: 1_500_000,
+        token_credits_granted: 10_000_000,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/^Token credits:/)).toBeInTheDocument();
+    expect(screen.getByText(/1\.5M of 10M used/)).toBeInTheDocument();
+  });
+
+  it("Pro plan Token credits line is hidden when no agent credits have been used", async () => {
+    // proBillingInfo carries no token credit fields, so usage is zero and the
+    // line must not render — we only surface credits once the agent has run.
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Data still renders; Token credits does not.
+    expect(screen.getByText(/^Data:/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Token credits:/)).not.toBeInTheDocument();
+  });
+
+  it("Pro plan Token credits line reads 'X used' when the plan grants no credit allowance", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        token_credits_used: 1_500_000,
+        token_credits_granted: 0,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/^Token credits:/)).toBeInTheDocument();
+    expect(screen.getByText(/^1\.5M used$/)).toBeInTheDocument();
+    // No granted allowance, so it must not fall into the "X of Y used" form.
+    expect(screen.queryByText(/1\.5M of/)).not.toBeInTheDocument();
+  });
+
+  it("Pro plan Token credits line appends ', Z overage' when used > granted and overage is allowed", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...proBillingInfo,
+        token_credits_used: 12_000_000,
+        token_credits_granted: 10_000_000,
+        token_credits_overage_allowed: true,
+      },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/12M of 10M used, 2M overage/)).toBeInTheDocument();
+  });
+
+  it("Subscription block (Status/Cycle/Data) is hidden on pro when status is missing", async () => {
+    // The Data line on Pro lives inside the subscription block; if status
+    // isn't populated yet the whole block is omitted, so "Data:" must not
+    // appear on the Pro card.
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: { ...proBillingInfo, status: undefined },
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Status:/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Current billing cycle:/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Data:/)).not.toBeInTheDocument();
+  });
+
+  // ---- Manage Billing button ----
+
+  it("shows Manage Billing button when on pro plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Manage Billing")).toBeInTheDocument();
+  });
+
+  it("hides Manage Billing button when on free plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: freeBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText("Manage Billing")).not.toBeInTheDocument();
+  });
+
+  it("Manage Billing button is disabled when user cannot change billing", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: false,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const btn = screen.getByText("Manage Billing");
+    expect(btn).toBeDisabled();
+  });
+
+  it("clicking Manage Billing calls portal API and redirects", async () => {
+    const handleManageBilling = jest.fn().mockResolvedValue({
+      redirect: "https://billing.stripe.com/session/test",
+    });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(handleManageBilling).toHaveBeenCalledWith(
+      "team1",
+      "http://localhost/team1/usage",
+    );
+    expect(mockNavigateTo).toHaveBeenCalledWith(
+      "https://billing.stripe.com/session/test",
+    );
+  });
+
+  it("Manage Billing shows Redirecting... while loading", async () => {
+    let resolveManageBilling: (value: any) => void;
+    const handleManageBilling = jest.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveManageBilling = resolve;
+        }),
+    );
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(screen.getByText("Redirecting...")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveManageBilling!({
+        redirect: "https://billing.stripe.com/session/test",
+      });
+    });
+  });
+
+  it("Manage Billing button resets when the page is restored from the back/forward cache", async () => {
+    const handleManageBilling = jest.fn().mockResolvedValue({
+      redirect: "https://billing.stripe.com/session/test",
+    });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(screen.getByText("Redirecting...")).toBeDisabled();
+
+    await act(async () => {
+      window.dispatchEvent(
+        new PageTransitionEvent("pageshow", { persisted: true }),
+      );
+    });
+
+    expect(screen.getByText("Manage Billing")).not.toBeDisabled();
+  });
+
+  it("Manage Billing error shows toast", async () => {
+    const handleManageBilling = jest
+      .fn()
+      .mockResolvedValue({ error: "Please try again." });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to open billing portal",
+      "Please try again.",
+    );
+  });
+
+  it("Manage Billing cancelled shows toast", async () => {
+    const handleManageBilling = jest
+      .fn()
+      .mockResolvedValue({ error: "Request was cancelled." });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to open billing portal",
+      "Request was cancelled.",
+    );
+  });
+
+  it("Downgrade button is disabled while Manage Billing is loading", async () => {
+    let resolveManageBilling: (value: any) => void;
+    const handleManageBilling = jest.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveManageBilling = resolve;
+        }),
+    );
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(screen.getByText("Downgrade to Free")).toBeDisabled();
+
+    await act(async () => {
+      resolveManageBilling!({
+        redirect: "https://billing.stripe.com/session/test",
+      });
+    });
+  });
+
+  it("Manage Billing button is disabled while downgrading", async () => {
+    let resolveDowngrade: (value: any) => void;
+    const handleDowngrade = jest.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveDowngrade = resolve;
+        }),
+    );
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleDowngrade,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    // Open and confirm downgrade dialog
+    await act(async () => {
+      fireEvent.click(screen.getByText("Downgrade to Free"));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("dialog-affirm"));
+    });
+
+    expect(screen.getByText("Manage Billing")).toBeDisabled();
+
+    await act(async () => {
+      resolveDowngrade!(true);
+    });
+  });
+
+  it("shows skeleton placeholders while subscription info is loading on pro plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    const skeletons = screen.getAllByTestId("skeleton-mock");
+    expect(skeletons.length).toBeGreaterThan(0);
+  });
+
+  it("Manage Billing success with no URL shows toast", async () => {
+    const handleManageBilling = jest
+      .fn()
+      .mockResolvedValue({ error: "No portal URL returned." });
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: proBillingInfo,
+      currentUserCanChangePlan: true,
+      handleManageBilling,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Manage Billing"));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith(
+      "Failed to open billing portal",
+      "No portal URL returned.",
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // Enterprise plan card — full-width, no price, custom retention/bytes
+  // -----------------------------------------------------------------------
+
+  it("renders Enterprise card with Enterprise title on enterprise plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Enterprise" }),
+    ).toBeInTheDocument();
+  });
+
+  it("Enterprise Data line reads 'Unlimited' when bytes_unlimited is true", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/^Data:/)).toBeInTheDocument();
+    expect(screen.getByText("Unlimited")).toBeInTheDocument();
+    expect(screen.queryByText(/used/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/overage/)).not.toBeInTheDocument();
+  });
+
+  it("Enterprise Data line reads 'X of Y used' for bounded plans without overage", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...enterpriseBillingInfo,
+        bytes_unlimited: false,
+        bytes_granted: 100_000_000_000,
+        bytes_used: 5_000_000_000,
+        bytes_overage_allowed: false,
+      },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText("Unlimited")).not.toBeInTheDocument();
+    expect(screen.getByText(/5\.00 GB of 100\.00 GB used/)).toBeInTheDocument();
+    expect(screen.queryByText(/overage/)).not.toBeInTheDocument();
+  });
+
+  it("Enterprise Data line appends ', Z overage' when overage allowed and used > granted", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...enterpriseBillingInfo,
+        bytes_unlimited: false,
+        bytes_granted: 100_000_000_000,
+        bytes_used: 110_000_000_000,
+        bytes_overage_allowed: true,
+      },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(
+      screen.getByText(/110\.00 GB of 100\.00 GB used, 10\.00 GB overage/),
+    ).toBeInTheDocument();
+  });
+
+  it("Enterprise Data line omits overage even when used > granted if overage is not allowed", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...enterpriseBillingInfo,
+        bytes_unlimited: false,
+        bytes_granted: 100_000_000_000,
+        bytes_used: 110_000_000_000,
+        bytes_overage_allowed: false,
+      },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(
+      screen.getByText(/110\.00 GB of 100\.00 GB used/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/overage/)).not.toBeInTheDocument();
+  });
+
+  it("shows retention line when retention_days is set on enterprise", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Retention:/)).toBeInTheDocument();
+    expect(screen.getByText("365 days")).toBeInTheDocument();
+  });
+
+  it("hides retention line when retention_days is missing on enterprise", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: { ...enterpriseBillingInfo, retention_days: 0 },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Retention:/)).not.toBeInTheDocument();
+  });
+
+  it("shows plan period when both period timestamps are set on enterprise", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText(/Plan period:/)).toBeInTheDocument();
+  });
+
+  it("hides plan period when timestamps are missing on enterprise", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: {
+        ...enterpriseBillingInfo,
+        current_period_start: 0,
+        current_period_end: 0,
+      },
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Plan period:/)).not.toBeInTheDocument();
+  });
+
+  it("Enterprise card never uses the Pro 'Data used this cycle' wording", async () => {
+    // The Pro framing implies a recurring cycle; Enterprise plans often
+    // aren't recurring. Whatever variant the Data line takes, it's just
+    // "Data:".
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/Data used this cycle:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Data used:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Data included:/)).not.toBeInTheDocument();
+  });
+
+  it("hides Free and Pro cards on enterprise plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(
+      screen.queryByRole("heading", { name: "Free" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Pro" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Upgrade to Pro")).not.toBeInTheDocument();
+    expect(screen.queryByText("Downgrade to Free")).not.toBeInTheDocument();
+  });
+
+  it('hides "personalised plans" footer on enterprise plan', async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.queryByText(/personalised plans/)).not.toBeInTheDocument();
+  });
+
+  it("shows Manage Billing button on enterprise plan", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+      currentUserCanChangePlan: true,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Manage Billing")).toBeInTheDocument();
+  });
+
+  it("Manage Billing on enterprise is disabled when user cannot change billing", async () => {
+    useUsageStore.setState({
+      billingInfoState: "loaded",
+      billingInfo: enterpriseBillingInfo,
+      currentUserCanChangePlan: false,
+    });
+
+    await act(async () => {
+      render(<Usage params={promiseParams({ teamId: "team1" })} />);
+    });
+
+    expect(screen.getByText("Manage Billing")).toBeDisabled();
+  });
+});

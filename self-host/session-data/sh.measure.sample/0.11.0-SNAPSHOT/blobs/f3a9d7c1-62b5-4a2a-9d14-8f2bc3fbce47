@@ -1,0 +1,382 @@
+{
+  "label": "All Elements Demo Screen",
+  "type": "container",
+  "x": 0,
+  "y": 0,
+  "width": 360,
+  "height": 800,
+  "scrollable": true,
+  "highlighted": false,
+  "children": [
+    {
+      "label": "Header Section",
+      "type": "container",
+      "x": 0,
+      "y": 0,
+      "width": 360,
+      "height": 60,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "App Title",
+          "type": "text",
+          "x": 10,
+          "y": 15,
+          "width": 150,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Search Icon",
+          "type": "icon",
+          "x": 280,
+          "y": 15,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Menu Icon",
+          "type": "icon",
+          "x": 320,
+          "y": 15,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "label": "Media Section",
+      "type": "container",
+      "x": 10,
+      "y": 70,
+      "width": 340,
+      "height": 120,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "Main Image",
+          "type": "image",
+          "x": 0,
+          "y": 0,
+          "width": 200,
+          "height": 120,
+          "scrollable": false,
+          "highlighted": true,
+          "children": []
+        },
+        {
+          "label": "Video Player",
+          "type": "video",
+          "x": 210,
+          "y": 0,
+          "width": 130,
+          "height": 120,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "label": "Form Section",
+      "type": "container",
+      "x": 10,
+      "y": 200,
+      "width": 340,
+      "height": 180,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "Name Input",
+          "type": "input",
+          "x": 0,
+          "y": 0,
+          "width": 340,
+          "height": 40,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Email Input",
+          "type": "input",
+          "x": 0,
+          "y": 50,
+          "width": 340,
+          "height": 40,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Submit Button",
+          "type": "button",
+          "x": 0,
+          "y": 100,
+          "width": 100,
+          "height": 40,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Reset Button",
+          "type": "button",
+          "x": 110,
+          "y": 100,
+          "width": 100,
+          "height": 40,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Category Select",
+          "type": "dropdown",
+          "x": 220,
+          "y": 100,
+          "width": 120,
+          "height": 40,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "label": "Controls Section",
+      "type": "container",
+      "x": 10,
+      "y": 390,
+      "width": 340,
+      "height": 120,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "Agree to Terms",
+          "type": "checkbox",
+          "x": 0,
+          "y": 0,
+          "width": 160,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Subscribe to Newsletter",
+          "type": "checkbox",
+          "x": 170,
+          "y": 0,
+          "width": 170,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Option A",
+          "type": "radio",
+          "x": 0,
+          "y": 40,
+          "width": 110,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Option B",
+          "type": "radio",
+          "x": 120,
+          "y": 40,
+          "width": 110,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Option C",
+          "type": "radio",
+          "x": 240,
+          "y": 40,
+          "width": 100,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Volume Control",
+          "type": "slider",
+          "x": 0,
+          "y": 80,
+          "width": 200,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Upload Progress",
+          "type": "progress",
+          "x": 210,
+          "y": 80,
+          "width": 130,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "label": "Content Section",
+      "type": "container",
+      "x": 10,
+      "y": 520,
+      "width": 340,
+      "height": 200,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "Main Content Text",
+          "type": "text",
+          "x": 0,
+          "y": 0,
+          "width": 340,
+          "height": 80,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Features List",
+          "type": "list",
+          "x": 0,
+          "y": 90,
+          "width": 340,
+          "height": 100,
+          "scrollable": true,
+          "highlighted": false,
+          "children": [
+            {
+              "label": "Feature Item 1",
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 340,
+              "height": 25,
+              "scrollable": false,
+              "highlighted": false,
+              "children": []
+            },
+            {
+              "label": "Feature Item 2",
+              "type": "text",
+              "x": 0,
+              "y": 30,
+              "width": 340,
+              "height": 25,
+              "scrollable": false,
+              "highlighted": false,
+              "children": []
+            },
+            {
+              "label": "Feature Item 3",
+              "type": "text",
+              "x": 0,
+              "y": 60,
+              "width": 340,
+              "height": 25,
+              "scrollable": false,
+              "highlighted": false,
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Footer Section",
+      "type": "container",
+      "x": 0,
+      "y": 730,
+      "width": 360,
+      "height": 70,
+      "scrollable": false,
+      "highlighted": false,
+      "children": [
+        {
+          "label": "Home",
+          "type": "icon",
+          "x": 40,
+          "y": 20,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Search",
+          "type": "icon",
+          "x": 110,
+          "y": 20,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Favorites",
+          "type": "icon",
+          "x": 180,
+          "y": 20,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Profile",
+          "type": "icon",
+          "x": 250,
+          "y": 20,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        },
+        {
+          "label": "Settings",
+          "type": "icon",
+          "x": 320,
+          "y": 20,
+          "width": 30,
+          "height": 30,
+          "scrollable": false,
+          "highlighted": false,
+          "children": []
+        }
+      ]
+    }
+  ]
+}

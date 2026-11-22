@@ -1,0 +1,21 @@
+package event
+
+// FrameworkApple represents Apple context
+// in an app's collected data.
+const FrameworkApple = "apple"
+
+// FrameworkJVM represents JVM context in
+// an app's collected data.
+const FrameworkJVM = "jvm"
+
+// FrameworkDart represents Dart context
+// in an app's collected data.
+const FrameworkDart = "dart"
+
+// FrameworkJS represents JavaScript context
+// in an app's collected data.
+const FrameworkJS = "js"
+
+// FrameworkNDK represents native C and C++
+// context in an Android app's collected data.
+const FrameworkNDK = "ndk"

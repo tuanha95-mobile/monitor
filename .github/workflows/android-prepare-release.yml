@@ -1,0 +1,110 @@
+name: Prepare Android Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.9.0)'
+        required: true
+        type: string
+      next_version:
+        description: 'Next SNAPSHOT version (e.g., 0.10.0-SNAPSHOT)'
+        required: true
+        type: string
+
+env:
+  JAVA_VERSION: 21
+  JAVA_DISTRIBUTION: 'temurin'
+
+jobs:
+  prepare-release:
+    name: Prepare Android SDK Release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/measure-android
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: 'main'
+          fetch-depth: 0
+          token: ${{ secrets.SDK_RELEASE }}
+
+      - name: Setup Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Validate input version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-((alpha|beta)\.[0-9]+))?$ ]]; then
+            echo "Error: Version must match semantic versioning pattern:"
+            echo "  - x.y.z (e.g. 1.2.3)"
+            echo "Got: $VERSION"
+            exit 1
+          fi
+
+      - name: Update version in gradle.properties
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/MEASURE_VERSION_NAME=.*/MEASURE_VERSION_NAME=$VERSION/" gradle.properties
+
+      - name: Update version in plugin libs.versions.toml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/measure-android = \".*\"/measure-android = \"$VERSION\"/" ../measure-gradle-plugin/gradle/libs.versions.toml
+
+      - name: Update MEASURE_ANDROID_VERSION in KMP gradle.properties
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/MEASURE_ANDROID_VERSION=.*/MEASURE_ANDROID_VERSION=$VERSION/" ../../kmp/measure-kmp/gradle.properties
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: android/measure-android/cliff.toml
+          args: --output android/measure-android/CHANGELOG.md --tag android-v${{ inputs.version }}
+
+      - name: Update SDK version in getting started docs
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd ../../frontend/dashboard/content/docs
+          KOTLIN_PATTERN='implementation("sh.measure:measure-android:.*")'
+          KOTLIN_REPLACEMENT="implementation(\"sh.measure:measure-android:$VERSION\")"
+          sed -i "s/$KOTLIN_PATTERN/$KOTLIN_REPLACEMENT/" getting-started/android.mdx
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SDK_RELEASE }}
+          commit-message: "chore(android): prepare sdk release ${{ inputs.version }}"
+          branch: android-v${{ inputs.version }}
+          delete-branch: false
+          title: "chore(android): prepare sdk release ${{ inputs.version }}"
+          body: |
+            This PR prepares the Android SDK for release version ${{ inputs.version }}.
+
+            Changes:
+            - Updated version to ${{ inputs.version }} in gradle.properties
+            - Updated version to ${{ inputs.version }} in libs.versions.toml
+            - Updated MEASURE_ANDROID_VERSION to ${{ inputs.version }} in kmp/measure-kmp/gradle.properties
+            - Generated changelog for version ${{ inputs.version }}
+            - Updated SDK version in the getting started docs
+
+            <!-- release-meta
+            NEXT_VERSION=${{ inputs.next_version }}
+            -->
+          base: main
+          labels: android
+          assignees: abhaysood

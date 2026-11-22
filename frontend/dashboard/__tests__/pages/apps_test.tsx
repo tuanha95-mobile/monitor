@@ -1,0 +1,1729 @@
+import { promiseParams } from "@/__tests__/helpers/promise_params";
+import Apps from "@/app/[teamId]/apps/page";
+import { beforeEach, describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+
+const mockToastPositive = jest.fn();
+const mockToastNegative = jest.fn();
+
+const baseMockApp = {
+  id: "app-1",
+  team_id: "team-1",
+  name: "Demo App",
+  api_key: {
+    created_at: "2025-01-01T00:00:00Z",
+    key: "msrsh_key_checksum",
+    last_seen: null,
+    revoked: false,
+  },
+  onboarded: true,
+  created_at: "2025-01-01T00:00:00Z",
+  updated_at: "2025-01-01T00:00:00Z",
+  os_names: ["android"],
+  onboarded_at: "2025-01-01T00:00:00Z",
+  unique_identifier: "com.example.app",
+};
+
+let mockCurrentApp = { ...baseMockApp, api_key: { ...baseMockApp.api_key } };
+
+const getAppPayload = () => ({
+  ...mockCurrentApp,
+  api_key: { ...mockCurrentApp.api_key },
+});
+
+jest.mock("@/app/components/toast", () => ({
+  toastPositive: (...args: any[]) => mockToastPositive(...args),
+  toastNegative: (...args: any[]) => mockToastNegative(...args),
+}));
+
+jest.mock("@/app/utils/env_utils", () => ({
+  isCloud: jest.fn(() => false),
+}));
+
+jest.mock("@/app/api/api_calls", () => ({
+  __esModule: true,
+  defaultAppThresholdPrefs: {
+    error_good_threshold: 95,
+    error_caution_threshold: 85,
+    error_spike_min_count_threshold: 100,
+    error_spike_min_rate_threshold: 0.5,
+  },
+  emptyAppRetention: {
+    retention: 30,
+  },
+  fetchAuthzAndMembersFromServer: jest.fn(),
+  fetchBillingInfoFromServer: jest.fn(),
+  fetchAppRetentionFromServer: jest.fn(),
+  updateAppRetentionFromServer: jest.fn(),
+  fetchSdkConfigFromServer: jest.fn(),
+  changeAppNameFromServer: jest.fn(),
+  changeAppApiKeyFromServer: jest.fn(),
+  fetchAppThresholdPrefsFromServer: jest.fn(),
+  updateAppThresholdPrefsFromServer: jest.fn(),
+}));
+
+// --- Bridge store: tests control this, query hook mocks read from it ---
+const { create: createBridge } = jest.requireActual("zustand") as any;
+const appsStore = createBridge((set: any) => ({
+  // Apps query state, where "no-apps" is a loaded empty list and an
+  // appsVersion bump stands in for a refetch
+  appsStatus: "pending",
+  appsVersion: 0,
+  // Permissions (derived from the authzAndMembers query)
+  canCreateApp: false,
+  canRenameApp: false,
+  canChangeRetention: false,
+  canRotateApiKey: false,
+  canWriteSdkConfig: false,
+  canChangeAppThresholdPrefs: false,
+  pageLoadState: "idle",
+  appRetention: { retention: 90 },
+  updatedAppRetention: { retention: 90 },
+  sdkConfig: null as any,
+  billingInfoState: "loading",
+  retentionChangeAllowed: false,
+  appThresholdPrefsState: "idle",
+  updateAppThresholdPrefsState: "idle",
+  appThresholdPrefs: {
+    error_good_threshold: 2,
+    error_caution_threshold: 5,
+    error_spike_min_count_threshold: 100,
+    error_spike_min_rate_threshold: 5,
+  },
+  savedAppThresholdPrefs: {
+    error_good_threshold: 2,
+    error_caution_threshold: 5,
+    error_spike_min_count_threshold: 100,
+    error_spike_min_rate_threshold: 5,
+  },
+  updateAppRetentionState: "idle",
+  appNameChangeState: "idle",
+  appApiKeyChangeState: "idle",
+  fetchPermissions: jest.fn(),
+  loadPageData: jest.fn(),
+  fetchBillingInfo: jest.fn(),
+  updateAppThresholdPrefs: jest.fn(),
+  saveAppRetention: jest.fn(),
+  changeAppName: jest.fn(),
+  changeAppApiKey: jest.fn(),
+  setUpdatedAppRetention: jest.fn((retention: any) =>
+    set({ updatedAppRetention: retention }),
+  ),
+  setAppThresholdPrefs: jest.fn((prefs: any) =>
+    set({ appThresholdPrefs: prefs }),
+  ),
+  setUpdateAppThresholdPrefsState: jest.fn((status: any) =>
+    set({ updateAppThresholdPrefsState: status }),
+  ),
+  setAppNameChangeState: jest.fn((status: any) =>
+    set({ appNameChangeState: status }),
+  ),
+  reset: jest.fn(),
+}));
+
+// The page reads two queries that load together, so one fixture state drives
+// both. Anything before the load finishes counts as pending.
+function deriveQueryStatuses(state: any) {
+  const status =
+    state.pageLoadState === "error" || state.pageLoadState === "success"
+      ? state.pageLoadState
+      : "pending";
+  return { retentionStatus: status, sdkStatus: status };
+}
+
+function deriveThresholdStatus(state: any) {
+  const s = state.appThresholdPrefsState;
+  if (s === "success") {
+    return "success";
+  }
+  if (s === "error") {
+    return "error";
+  }
+  if (s === "loading") {
+    return "pending";
+  }
+  return "success"; // default for loaded page
+}
+
+jest.mock("@/app/query/hooks", () => ({
+  __esModule: true,
+  useAppsQuery: () => {
+    const status = appsStore((s: any) => s.appsStatus);
+    appsStore((s: any) => s.appsVersion);
+    const data =
+      status === "success"
+        ? [getAppPayload()]
+        : status === "no-apps"
+          ? []
+          : undefined;
+    return {
+      data,
+      isPending: status === "pending",
+      isSuccess: status === "success" || status === "no-apps",
+      isError: status === "error",
+    };
+  },
+  useAuthzAndMembersQuery: () => {
+    const s = appsStore.getState();
+    return {
+      data: {
+        can_create_app: s.canCreateApp,
+        can_rename_app: s.canRenameApp,
+        can_change_retention: s.canChangeRetention,
+        can_rotate_api_key: s.canRotateApiKey,
+        can_write_sdk_config: s.canWriteSdkConfig,
+        can_change_app_threshold_prefs: s.canChangeAppThresholdPrefs,
+      },
+    };
+  },
+  useAppRetentionQuery: () => {
+    const s = appsStore.getState();
+    const { retentionStatus } = deriveQueryStatuses(s);
+    return { data: s.appRetention, status: retentionStatus };
+  },
+  useSdkConfigQuery: () => {
+    const s = appsStore.getState();
+    const { sdkStatus } = deriveQueryStatuses(s);
+    return { data: s.sdkConfig, status: sdkStatus };
+  },
+  useAppThresholdPrefsQuery: () => {
+    const s = appsStore.getState();
+    return { data: s.savedAppThresholdPrefs, status: deriveThresholdStatus(s) };
+  },
+  useBillingInfoQuery: () => {
+    const s = appsStore.getState();
+    // When retentionChangeAllowed is true, simulate a paid plan
+    const data = s.retentionChangeAllowed ? { plan: "pro" } : null;
+    return { data, status: "success" };
+  },
+  useUpdateAppRetentionMutation: () => {
+    const s = appsStore.getState();
+    return {
+      mutate: (params: any, opts: any) => {
+        const result = s.saveAppRetention(params.appId, params.retention);
+        if (result && typeof result.then === "function") {
+          result.then(() => {
+            const st = appsStore.getState();
+            if (st.updateAppRetentionState === "success") {
+              opts?.onSuccess?.();
+            } else if (st.updateAppRetentionState === "error") {
+              opts?.onError?.();
+            }
+          });
+        } else {
+          const st = appsStore.getState();
+          if (st.updateAppRetentionState === "success") {
+            opts?.onSuccess?.();
+          } else if (st.updateAppRetentionState === "error") {
+            opts?.onError?.();
+          }
+        }
+      },
+      isPending: s.updateAppRetentionState === "loading",
+    };
+  },
+  useChangeAppNameMutation: () => {
+    const s = appsStore.getState();
+    return {
+      mutate: (params: any, opts: any) => {
+        const result = s.changeAppName(params.appName);
+        if (result && typeof result.then === "function") {
+          result.then((success: boolean) => {
+            if (success) {
+              opts?.onSuccess?.();
+            } else {
+              opts?.onError?.();
+            }
+          });
+        }
+      },
+      isPending: s.appNameChangeState === "loading",
+    };
+  },
+  useChangeAppApiKeyMutation: () => {
+    const s = appsStore.getState();
+    return {
+      mutate: (params: any, opts: any) => {
+        const result = s.changeAppApiKey(params.appId);
+        if (result && typeof result.then === "function") {
+          result.then((success: boolean) => {
+            if (success) {
+              mockCurrentApp = {
+                ...mockCurrentApp,
+                api_key: {
+                  ...mockCurrentApp.api_key,
+                  key: "msrsh_rotated_key_checksum",
+                },
+              };
+              appsStore.setState({
+                appsVersion: appsStore.getState().appsVersion + 1,
+              });
+              opts?.onSuccess?.();
+            } else {
+              opts?.onError?.();
+            }
+          });
+        }
+      },
+      isPending: s.appApiKeyChangeState === "loading",
+    };
+  },
+  useUpdateAppThresholdPrefsMutation: () => {
+    const s = appsStore.getState();
+    return {
+      mutate: (params: any, opts: any) => {
+        const result = s.updateAppThresholdPrefs(params.appId, params.prefs);
+        if (result && typeof result.then === "function") {
+          result.then((success: boolean) => {
+            if (success !== false) {
+              opts?.onSuccess?.();
+            } else {
+              opts?.onError?.();
+            }
+          });
+        } else {
+          opts?.onSuccess?.();
+        }
+      },
+      isPending: s.updateAppThresholdPrefsState === "loading",
+    };
+  },
+}));
+
+jest.mock("@/app/stores/provider", () => {
+  const { create } = jest.requireActual("zustand");
+  const filtersStore = create((set: any) => ({
+    selectedApp: null,
+    setSelectedApp: (app: any) => set({ selectedApp: app }),
+  }));
+  return {
+    __esModule: true,
+    useFiltersStore: filtersStore,
+  };
+});
+
+jest.mock("@/app/components/onboarding", () => ({
+  __esModule: true,
+  default: () => <div data-testid="onboarding-mock" />,
+}));
+
+jest.mock("@/app/components/filter_bar/app_select", () => ({
+  __esModule: true,
+  default: ({ selected }: any) => (
+    <div data-testid="app-select-mock">{selected.name}</div>
+  ),
+}));
+
+jest.mock("@/app/components/button", () => ({
+  Button: ({ children, loading, disabled, ...props }: any) => (
+    <button disabled={disabled || loading} {...props}>
+      {children}
+    </button>
+  ),
+}));
+
+jest.mock("@/app/components/input", () => ({
+  Input: (props: any) => <input {...props} />,
+}));
+
+jest.mock("@/app/components/dropdown_select", () => ({
+  __esModule: true,
+  default: (props: any) => (
+    <div data-testid="dropdown-select-mock">
+      <span>{props.title}</span>
+      <button
+        data-testid="retention-select-90"
+        disabled={props.disabled}
+        onClick={() => props.onChangeSelected("3 months")}
+      >
+        Set 3 months
+      </button>
+    </div>
+  ),
+  DropdownSelectType: { SingleString: "single" },
+}));
+
+jest.mock("@/app/components/create_app", () => ({
+  __esModule: true,
+  default: ({ disabled }: any) => (
+    <div
+      data-testid="create-app-mock"
+      data-disabled={disabled ? "true" : "false"}
+    />
+  ),
+}));
+
+jest.mock("@/app/components/skeleton", () => ({
+  Skeleton: ({ className, ...props }: any) => (
+    <div data-testid="skeleton-mock" className={className} {...props} />
+  ),
+}));
+
+jest.mock("@/app/components/sdk_configurator", () => ({
+  __esModule: true,
+  default: ({ currentUserCanChangeAppSettings }: any) => (
+    <div
+      data-testid="sdk-configurator-mock"
+      data-can-change={currentUserCanChangeAppSettings ? "true" : "false"}
+    />
+  ),
+}));
+
+jest.mock("@/app/components/danger_confirmation_dialog", () => ({
+  __esModule: true,
+  default: (props: any) => {
+    if (!props.open) return null;
+
+    return (
+      <div data-testid={`danger-dialog-${props.affirmativeText}`}>
+        {props.body}
+        <button onClick={props.onAffirmativeAction}>
+          {props.affirmativeText}
+        </button>
+        <button onClick={props.onCancelAction}>{props.cancelText}</button>
+      </div>
+    );
+  },
+}));
+
+jest.mock("next/link", () => ({
+  __esModule: true,
+  default: ({ children, href, ...props }: any) => (
+    <a href={href} {...props}>
+      {children}
+    </a>
+  ),
+}));
+
+const useAppsStore = appsStore;
+const { useFiltersStore } = require("@/app/stores/provider") as any;
+
+const defaultLoadedAppsState = {
+  canCreateApp: true,
+  canRenameApp: true,
+  canChangeRetention: true,
+  canRotateApiKey: true,
+  canWriteSdkConfig: true,
+  canChangeAppThresholdPrefs: true,
+  pageLoadState: "success",
+  appRetention: { retention: 30 },
+  updatedAppRetention: { retention: 30 },
+  sdkConfig: { session_sampling_rate: 100 },
+  retentionChangeAllowed: true,
+  appThresholdPrefsState: "success",
+  appThresholdPrefs: {
+    error_good_threshold: 95,
+    error_caution_threshold: 85,
+    error_spike_min_count_threshold: 100,
+    error_spike_min_rate_threshold: 0.5,
+  },
+  savedAppThresholdPrefs: {
+    error_good_threshold: 95,
+    error_caution_threshold: 85,
+    error_spike_min_count_threshold: 100,
+    error_spike_min_rate_threshold: 0.5,
+  },
+};
+
+const renderPage = async () => {
+  await act(async () => {
+    render(<Apps params={promiseParams({ teamId: "team-1" })} />);
+    await Promise.resolve();
+  });
+};
+
+const renderLoadedPage = async () => {
+  useAppsStore.setState({
+    ...defaultLoadedAppsState,
+    changeAppName: jest.fn().mockResolvedValue(true),
+    changeAppApiKey: jest.fn().mockResolvedValue(true),
+    updateAppThresholdPrefs: jest.fn().mockResolvedValue(true),
+    saveAppRetention: jest.fn().mockImplementation(async () => {
+      useAppsStore.setState({ updateAppRetentionState: "success" });
+    }),
+  });
+
+  await renderPage();
+
+  await act(async () => {
+    useAppsStore.setState({ appsStatus: "success" });
+  });
+};
+
+const openRotateDialog = async () => {
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Rotate" }));
+  });
+};
+
+const openRenameDialog = async () => {
+  const renameInput = screen.getByDisplayValue("Demo App");
+  await act(async () => {
+    fireEvent.change(renameInput, { target: { value: "Renamed App" } });
+  });
+
+  const saveButtons = screen.getAllByRole("button", { name: "Save" });
+  await act(async () => {
+    fireEvent.click(saveButtons[1]);
+  });
+};
+
+const openRetentionDialog = async () => {
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("retention-select-90"));
+  });
+
+  const saveButtons = screen.getAllByRole("button", { name: "Save" });
+  await act(async () => {
+    fireEvent.click(saveButtons[0]);
+  });
+};
+
+describe("Apps Page", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Reset the isCloud mock to its default (false = self-hosted). Individual
+    // tests that need cloud mode call isCloud.mockReturnValue(true) themselves.
+    // Without this reset, the state leaks from one test to the next and
+    // failures become order-dependent.
+    const { isCloud } = require("@/app/utils/env_utils");
+    isCloud.mockReturnValue(false);
+    mockCurrentApp = { ...baseMockApp, api_key: { ...baseMockApp.api_key } };
+    useFiltersStore.setState({ selectedApp: null });
+    useAppsStore.setState({
+      appsStatus: "pending",
+      appsVersion: 0,
+      canCreateApp: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canRotateApiKey: false,
+      canWriteSdkConfig: false,
+      canChangeAppThresholdPrefs: false,
+      pageLoadState: "idle",
+      appRetention: { retention: 90 },
+      updatedAppRetention: { retention: 90 },
+      sdkConfig: null,
+      billingInfoState: "loading",
+      retentionChangeAllowed: false,
+      appThresholdPrefsState: "idle",
+      updateAppThresholdPrefsState: "idle",
+      appThresholdPrefs: {
+        error_good_threshold: 2,
+        error_caution_threshold: 5,
+        error_spike_min_count_threshold: 100,
+        error_spike_min_rate_threshold: 5,
+      },
+      savedAppThresholdPrefs: {
+        error_good_threshold: 2,
+        error_caution_threshold: 5,
+        error_spike_min_count_threshold: 100,
+        error_spike_min_rate_threshold: 5,
+      },
+      updateAppRetentionState: "idle",
+      appNameChangeState: "idle",
+      appApiKeyChangeState: "idle",
+      fetchPermissions: jest.fn(),
+      loadPageData: jest.fn(),
+      fetchBillingInfo: jest.fn(),
+      updateAppThresholdPrefs: jest.fn(),
+      saveAppRetention: jest.fn(),
+      changeAppName: jest.fn(),
+      changeAppApiKey: jest.fn(),
+      setUpdatedAppRetention: jest.fn((retention: any) =>
+        useAppsStore.setState({ updatedAppRetention: retention }),
+      ),
+      setAppThresholdPrefs: jest.fn((prefs: any) =>
+        useAppsStore.setState({ appThresholdPrefs: prefs }),
+      ),
+      setUpdateAppThresholdPrefsState: jest.fn((status: any) =>
+        useAppsStore.setState({ updateAppThresholdPrefsState: status }),
+      ),
+      setAppNameChangeState: jest.fn((status: any) =>
+        useAppsStore.setState({ appNameChangeState: status }),
+      ),
+      reset: jest.fn(),
+    });
+    process.env.NEXT_PUBLIC_API_BASE_URL = "https://api.measure.sh";
+    Object.assign(navigator, {
+      clipboard: {
+        writeText: jest.fn(),
+      },
+    });
+  });
+
+  it("renders main settings sections after app filters load", async () => {
+    await renderLoadedPage();
+
+    expect(
+      await screen.findByText("Configure Data Retention"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Change App Name")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeInTheDocument();
+    expect(screen.getByTestId("sdk-configurator-mock")).toBeInTheDocument();
+    expect(screen.getByTestId("create-app-mock")).toHaveAttribute(
+      "data-disabled",
+      "false",
+    );
+    expect(screen.getByTestId("sdk-configurator-mock")).toHaveAttribute(
+      "data-can-change",
+      "true",
+    );
+  });
+
+  it("shows app metadata for an onboarded app", async () => {
+    await renderLoadedPage();
+
+    expect(screen.getByText("Unique Identifier")).toBeInTheDocument();
+    expect(screen.getByText("com.example.app")).toBeInTheDocument();
+    expect(screen.getByText("Operating Systems")).toBeInTheDocument();
+    expect(screen.getByText("android")).toBeInTheDocument();
+    expect(screen.getByText("Created at")).toBeInTheDocument();
+  });
+
+  it("shows the setup docs link instead of metadata when the app has no unique identifier", async () => {
+    mockCurrentApp = {
+      ...baseMockApp,
+      api_key: { ...baseMockApp.api_key },
+      unique_identifier: null as any,
+      os_names: null as any,
+    };
+
+    await renderLoadedPage();
+
+    expect(screen.getByText(/Follow our/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "docs" })).toHaveAttribute(
+      "href",
+      "/docs",
+    );
+    expect(screen.queryByText("Unique Identifier")).not.toBeInTheDocument();
+    expect(screen.queryByText("Operating Systems")).not.toBeInTheDocument();
+  });
+
+  it("renders onboarding and hides the Create App button when the team has no apps", async () => {
+    useAppsStore.setState({ ...defaultLoadedAppsState, appsStatus: "no-apps" });
+
+    await renderPage();
+
+    expect(screen.getByTestId("onboarding-mock")).toBeInTheDocument();
+    expect(screen.queryByTestId("create-app-mock")).not.toBeInTheDocument();
+  });
+
+  it("does not render settings sections before filters are ready", async () => {
+    await renderPage();
+
+    expect(
+      screen.queryByText("Configure Data Retention"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Change App Name")).not.toBeInTheDocument();
+    expect(screen.queryByText("Rotate API key")).not.toBeInTheDocument();
+  });
+
+  it("shows loading state while app settings are being fetched", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      pageLoadState: "pending",
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(screen.getAllByTestId("skeleton-mock").length).toBeGreaterThan(0);
+  });
+
+  it("shows error message when app settings fetch fails", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      pageLoadState: "error",
+      sdkConfig: null,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(
+      await screen.findByText(/Error fetching app settings/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows rotate button for admin users", async () => {
+    await renderLoadedPage();
+
+    expect(
+      await screen.findByRole("button", { name: "Rotate" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows rotate button for owner users", async () => {
+    await renderLoadedPage();
+
+    expect(
+      await screen.findByRole("button", { name: "Rotate" }),
+    ).toBeInTheDocument();
+  });
+
+  it("disables rotate button for non-admin users", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      canRotateApiKey: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canWriteSdkConfig: false,
+      canCreateApp: false,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeDisabled();
+    expect(screen.getByTestId("create-app-mock")).toHaveAttribute(
+      "data-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("sdk-configurator-mock")).toHaveAttribute(
+      "data-can-change",
+      "false",
+    );
+  });
+
+  it("keeps retention and rename save disabled for non-admin users", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      canRotateApiKey: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canWriteSdkConfig: false,
+      canCreateApp: false,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("retention-select-90"));
+    });
+
+    const renameInput = screen.getByDisplayValue("Demo App");
+    await act(async () => {
+      fireEvent.change(renameInput, { target: { value: "Renamed App" } });
+    });
+
+    const saveButtons = screen.getAllByRole("button", { name: "Save" });
+    expect(saveButtons[0]).toBeDisabled();
+    expect(saveButtons[1]).toBeDisabled();
+    expect(screen.getByDisplayValue("Renamed App")).toBeDisabled();
+    expect(screen.getByTestId("retention-select-90")).toBeDisabled();
+  });
+
+  it("handles authz API error by disabling rotate button", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      canRotateApiKey: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canWriteSdkConfig: false,
+      canCreateApp: false,
+      canChangeAppThresholdPrefs: false,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeDisabled();
+    expect(screen.getByTestId("create-app-mock")).toHaveAttribute(
+      "data-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("sdk-configurator-mock")).toHaveAttribute(
+      "data-can-change",
+      "false",
+    );
+  });
+
+  it("handles authz API cancelled by disabling app write controls", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      canRotateApiKey: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canWriteSdkConfig: false,
+      canCreateApp: false,
+      canChangeAppThresholdPrefs: false,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeDisabled();
+    expect(screen.getByTestId("create-app-mock")).toHaveAttribute(
+      "data-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("sdk-configurator-mock")).toHaveAttribute(
+      "data-can-change",
+      "false",
+    );
+  });
+
+  it("handles missing permission flags by disabling rotate button", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      canRotateApiKey: false,
+      canRenameApp: false,
+      canChangeRetention: false,
+      canWriteSdkConfig: false,
+      canCreateApp: false,
+      canChangeAppThresholdPrefs: false,
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeDisabled();
+    expect(screen.getByTestId("create-app-mock")).toHaveAttribute(
+      "data-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("sdk-configurator-mock")).toHaveAttribute(
+      "data-can-change",
+      "false",
+    );
+  });
+
+  it("opens rotate confirmation dialog with warning text", async () => {
+    await renderLoadedPage();
+
+    await openRotateDialog();
+
+    expect(
+      screen.getByText(/won't be able to send data anymore/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Yes, rotate key" }),
+    ).toBeInTheDocument();
+  });
+
+  it("cancels rotate and does not call API", async () => {
+    await renderLoadedPage();
+    await openRotateDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    expect(useAppsStore.getState().changeAppApiKey).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "Yes, rotate key" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("rotates API key successfully and updates displayed key", async () => {
+    await renderLoadedPage();
+    await openRotateDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, rotate key" }));
+    });
+
+    expect(useAppsStore.getState().changeAppApiKey).toHaveBeenCalled();
+    expect(mockToastPositive).toHaveBeenCalledWith("API key rotated");
+    expect(
+      await screen.findAllByDisplayValue("msrsh_rotated_key_checksum"),
+    ).toHaveLength(2);
+    expect(
+      screen.queryByRole("button", { name: "Yes, rotate key" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows failure toast when API key rotation fails", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppApiKey: jest.fn().mockResolvedValue(false),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRotateDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, rotate key" }));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith("Error rotating API key");
+  });
+
+  it("re-enables the Rotate button after a failed rotation", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppApiKey: jest.fn().mockResolvedValue(false),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRotateDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, rotate key" }));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith("Error rotating API key");
+    expect(screen.getByRole("button", { name: "Rotate" })).not.toBeDisabled();
+  });
+
+  it("disables rotate button while rotation is in progress and prevents repeated submit", async () => {
+    let resolvePromise: (value: any) => void;
+    const pendingPromise = new Promise<boolean>((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppApiKey: jest.fn().mockImplementation(() => {
+        useAppsStore.setState({ appApiKeyChangeState: "loading" });
+        return pendingPromise;
+      }),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRotateDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, rotate key" }));
+    });
+
+    const rotateButton = screen.getByRole("button", { name: "Rotate" });
+    expect(rotateButton).toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(rotateButton);
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Yes, rotate key" }),
+    ).not.toBeInTheDocument();
+    expect(useAppsStore.getState().changeAppApiKey).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvePromise!(true);
+    });
+  });
+
+  it("enables rename save only when name changes", async () => {
+    await renderLoadedPage();
+
+    const renameInput = screen.getByDisplayValue("Demo App");
+    const saveButtons = screen.getAllByRole("button", { name: "Save" });
+    const renameSaveButton = saveButtons[1];
+
+    expect(renameSaveButton).toBeDisabled();
+
+    await act(async () => {
+      fireEvent.change(renameInput, { target: { value: "Renamed App" } });
+    });
+
+    expect(renameSaveButton).not.toBeDisabled();
+  });
+
+  it("renames app successfully", async () => {
+    await renderLoadedPage();
+    await openRenameDialog();
+
+    expect(
+      screen.getByText(/Are you sure you want to rename app/i),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    expect(useAppsStore.getState().changeAppName).toHaveBeenCalledWith(
+      "Renamed App",
+    );
+    expect(mockToastPositive).toHaveBeenCalledWith("App name changed");
+    expect(
+      screen.queryByRole("button", { name: "Yes, I'm sure" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables rename actions while rename is in progress and prevents double submit", async () => {
+    let resolvePromise: (value: any) => void;
+    const pendingPromise = new Promise<boolean>((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppName: jest.fn().mockImplementation(() => {
+        useAppsStore.setState({ appNameChangeState: "loading" });
+        return pendingPromise;
+      }),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRenameDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    const renameSaveButton = screen.getAllByRole("button", { name: "Save" })[1];
+    expect(renameSaveButton).toBeDisabled();
+    expect(useAppsStore.getState().changeAppName).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.click(renameSaveButton);
+    });
+    expect(useAppsStore.getState().changeAppName).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvePromise!(true);
+    });
+  });
+
+  it("shows rename error toast on failure", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppName: jest.fn().mockResolvedValue(false),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRenameDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith("Error changing app name");
+  });
+
+  it("handles cancelled rename without toasts", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      changeAppName: jest.fn().mockResolvedValue(false),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRenameDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith("Error changing app name");
+  });
+
+  it("cancels rename and does not call API", async () => {
+    await renderLoadedPage();
+    await openRenameDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    expect(useAppsStore.getState().changeAppName).not.toHaveBeenCalled();
+  });
+
+  it("enables retention save when retention period changes", async () => {
+    await renderLoadedPage();
+
+    const saveButtons = screen.getAllByRole("button", { name: "Save" });
+    const retentionSaveButton = saveButtons[0];
+
+    expect(retentionSaveButton).toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("retention-select-90"));
+    });
+
+    expect(retentionSaveButton).not.toBeDisabled();
+  });
+
+  it("updates retention successfully", async () => {
+    await renderLoadedPage();
+    await openRetentionDialog();
+
+    expect(
+      screen.getByText(/change the retention period/i),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    expect(useAppsStore.getState().saveAppRetention).toHaveBeenCalled();
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      "Your app settings have been saved",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Yes, I'm sure" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables retention actions while update is in progress and prevents double submit", async () => {
+    let resolvePromise: (value: any) => void;
+    const pendingPromise = new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      saveAppRetention: jest.fn().mockImplementation(() => {
+        useAppsStore.setState({ updateAppRetentionState: "loading" });
+        return pendingPromise;
+      }),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRetentionDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    const retentionSaveButton = screen.getAllByRole("button", {
+      name: "Save",
+    })[0];
+    expect(retentionSaveButton).toBeDisabled();
+    expect(useAppsStore.getState().saveAppRetention).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.click(retentionSaveButton);
+    });
+    expect(useAppsStore.getState().saveAppRetention).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvePromise!(undefined);
+    });
+  });
+
+  it("shows retention error toast on failure", async () => {
+    useAppsStore.setState({
+      ...defaultLoadedAppsState,
+      saveAppRetention: jest.fn().mockImplementation(async () => {
+        useAppsStore.setState({ updateAppRetentionState: "error" });
+      }),
+    });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    await openRetentionDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+    });
+
+    expect(mockToastNegative).toHaveBeenCalledWith("Error saving app settings");
+  });
+
+  it("cancels retention update and does not call API", async () => {
+    await renderLoadedPage();
+    await openRetentionDialog();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    expect(useAppsStore.getState().saveAppRetention).not.toHaveBeenCalled();
+  });
+
+  it("displays ingest URL when NEXT_PUBLIC_INGEST_BASE_URL is set", async () => {
+    process.env.NEXT_PUBLIC_INGEST_BASE_URL = "https://ingest.measure.sh";
+
+    await renderLoadedPage();
+
+    expect(
+      screen.getByDisplayValue("https://ingest.measure.sh"),
+    ).toBeInTheDocument();
+
+    delete process.env.NEXT_PUBLIC_INGEST_BASE_URL;
+  });
+
+  it("displays api base URL when NEXT_PUBLIC_INGEST_BASE_URL is not set", async () => {
+    delete process.env.NEXT_PUBLIC_INGEST_BASE_URL;
+
+    await renderLoadedPage();
+
+    expect(
+      screen.getByDisplayValue("https://api.measure.sh"),
+    ).toBeInTheDocument();
+  });
+
+  it("copies API URL from copy sdk variables section", async () => {
+    await renderLoadedPage();
+
+    const copyButtons = screen.getAllByRole("button", { name: "Copy" });
+
+    await act(async () => {
+      fireEvent.click(copyButtons[0]);
+    });
+
+    expect(navigator.clipboard.writeText as jest.Mock).toHaveBeenCalledWith(
+      "https://api.measure.sh",
+    );
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      "Base URL copied to clipboard",
+    );
+  });
+
+  it("copies ingest URL when NEXT_PUBLIC_INGEST_BASE_URL is set", async () => {
+    process.env.NEXT_PUBLIC_INGEST_BASE_URL = "https://ingest.measure.sh";
+
+    await renderLoadedPage();
+
+    const copyButtons = screen.getAllByRole("button", { name: "Copy" });
+
+    await act(async () => {
+      fireEvent.click(copyButtons[0]);
+    });
+
+    expect(navigator.clipboard.writeText as jest.Mock).toHaveBeenCalledWith(
+      "https://ingest.measure.sh",
+    );
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      "Base URL copied to clipboard",
+    );
+
+    delete process.env.NEXT_PUBLIC_INGEST_BASE_URL;
+  });
+
+  it("copy buttons are scoped to Copy SDK Variables section", async () => {
+    await renderLoadedPage();
+
+    const copySdkHeader = screen.getByText("Copy SDK Variables");
+    const section = copySdkHeader.parentElement as HTMLElement;
+    const copyButtons = within(section).getAllByRole("button", {
+      name: "Copy",
+    });
+    expect(copyButtons).toHaveLength(2);
+  });
+
+  it("copies API key from copy sdk variables section", async () => {
+    await renderLoadedPage();
+
+    const copyButtons = screen.getAllByRole("button", { name: "Copy" });
+
+    await act(async () => {
+      fireEvent.click(copyButtons[1]);
+    });
+
+    expect(navigator.clipboard.writeText as jest.Mock).toHaveBeenCalledWith(
+      "msrsh_key_checksum",
+    );
+    expect(mockToastPositive).toHaveBeenCalledWith(
+      "API key copied to clipboard",
+    );
+  });
+
+  it("retention section is hidden in cloud mode (plan-driven)", async () => {
+    const { isCloud } = require("@/app/utils/env_utils");
+    isCloud.mockReturnValue(true);
+    useAppsStore.setState({ ...defaultLoadedAppsState });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(
+      screen.queryByText("Configure Data Retention"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("retention-select-90")).not.toBeInTheDocument();
+  });
+
+  it("retention section is shown in self-hosted mode", async () => {
+    const { isCloud } = require("@/app/utils/env_utils");
+    isCloud.mockReturnValue(false);
+    useAppsStore.setState({ ...defaultLoadedAppsState });
+
+    await renderPage();
+
+    await act(async () => {
+      useAppsStore.setState({ appsStatus: "success" });
+    });
+
+    expect(
+      await screen.findByText("Configure Data Retention"),
+    ).toBeInTheDocument();
+  });
+
+  describe("editable state on app change", () => {
+    // Make unsaved retention (30 → 90) and threshold (good 95 → 90) edits.
+    const makeEdits = async () => {
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("retention-select-90"));
+      });
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+    };
+
+    // Retention and rename are the two plain "Save" buttons (retention first);
+    // the threshold button is labelled "Save thresholds".
+    const retentionSave = () =>
+      screen.getAllByRole("button", { name: "Save" })[0];
+    const thresholdSave = () =>
+      screen.getByRole("button", { name: "Save thresholds" });
+
+    it("keeps unsaved retention and threshold edits when the current app is renamed", async () => {
+      await renderLoadedPage();
+      await makeEdits();
+
+      expect(retentionSave()).not.toBeDisabled();
+      expect(thresholdSave()).not.toBeDisabled();
+
+      // A rename keeps the app id and changes the name
+      await act(async () => {
+        mockCurrentApp = { ...getAppPayload(), name: "Renamed App" };
+        useAppsStore.setState({
+          appsVersion: useAppsStore.getState().appsVersion + 1,
+        });
+      });
+
+      // The name input follows the rename...
+      expect(screen.getByDisplayValue("Renamed App")).toBeInTheDocument();
+      // ...but the unsaved edits survive because the id is unchanged.
+      expect(retentionSave()).not.toBeDisabled();
+      expect(thresholdSave()).not.toBeDisabled();
+    });
+
+    it("drops unsaved retention and threshold edits when switching to a different app", async () => {
+      await renderLoadedPage();
+      await makeEdits();
+
+      expect(retentionSave()).not.toBeDisabled();
+      expect(thresholdSave()).not.toBeDisabled();
+
+      // Switch to a different app id
+      await act(async () => {
+        mockCurrentApp = { ...getAppPayload(), id: "app-2", name: "Other App" };
+        useAppsStore.setState({
+          appsVersion: useAppsStore.getState().appsVersion + 1,
+        });
+      });
+
+      // Edits reset to the saved values, so both save buttons disable again.
+      expect(retentionSave()).toBeDisabled();
+      expect(thresholdSave()).toBeDisabled();
+    });
+  });
+
+  describe("Threshold Preferences", () => {
+    it("shows threshold sections after app filters load", async () => {
+      await renderLoadedPage();
+
+      expect(
+        await screen.findByText("Change Error Thresholds"),
+      ).toBeInTheDocument();
+    });
+
+    it("shows loading state while threshold prefs are fetched", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        appThresholdPrefsState: "loading",
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      const spinners = screen.getAllByTestId("skeleton-mock");
+      expect(spinners.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("shows error message when threshold prefs fetch fails", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        appThresholdPrefsState: "error",
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      const errorMessages = screen.getAllByText(
+        /Error fetching app threshold preferences/,
+      );
+      expect(errorMessages.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("shows threshold inputs with fetched values", async () => {
+      await renderLoadedPage();
+
+      expect(screen.getByTestId("error-good-threshold-input")).toHaveValue(95);
+      expect(screen.getByTestId("error-caution-threshold-input")).toHaveValue(
+        85,
+      );
+      expect(
+        screen.getByTestId("error-spike-min-count-threshold-input"),
+      ).toHaveValue(100);
+      expect(
+        screen.getByTestId("error-spike-min-rate-threshold-input"),
+      ).toHaveValue(0.5);
+    });
+
+    it("threshold save button is disabled when no changes have been made", async () => {
+      await renderLoadedPage();
+
+      expect(
+        screen.getByRole("button", { name: "Save thresholds" }),
+      ).toBeDisabled();
+    });
+
+    it("threshold save button enabled when good threshold changes", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      expect(saveButtons[0]).not.toBeDisabled();
+    });
+
+    it("threshold save button enabled when caution threshold changes", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-caution-threshold-input"), {
+          target: { value: "80" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      expect(saveButtons[0]).not.toBeDisabled();
+    });
+
+    it("threshold save button enabled when spike min count changes", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(
+          screen.getByTestId("error-spike-min-count-threshold-input"),
+          { target: { value: "200" } },
+        );
+      });
+
+      expect(
+        screen.getByRole("button", { name: "Save thresholds" }),
+      ).not.toBeDisabled();
+    });
+
+    it("threshold save button enabled when spike rate changes", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(
+          screen.getByTestId("error-spike-min-rate-threshold-input"),
+          { target: { value: "1" } },
+        );
+      });
+
+      expect(
+        screen.getByRole("button", { name: "Save thresholds" }),
+      ).not.toBeDisabled();
+    });
+
+    it("updates threshold prefs successfully and shows toast", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      await act(async () => {
+        fireEvent.click(saveButtons[0]);
+      });
+
+      expect(
+        useAppsStore.getState().updateAppThresholdPrefs,
+      ).toHaveBeenCalled();
+      expect(mockToastPositive).toHaveBeenCalledWith(
+        "Thresholds updated successfully",
+      );
+    });
+
+    it("calls updateAppThresholdPrefs when save is clicked", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        updateAppThresholdPrefs: jest.fn().mockResolvedValue(true),
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      await act(async () => {
+        fireEvent.click(saveButtons[0]);
+      });
+
+      expect(
+        useAppsStore.getState().updateAppThresholdPrefs,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it("shows error toast when threshold update fails", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        updateAppThresholdPrefs: jest.fn().mockResolvedValue(false),
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      await act(async () => {
+        fireEvent.click(saveButtons[0]);
+      });
+
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error updating thresholds",
+      );
+    });
+
+    it("handles cancelled threshold update without toasts", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        updateAppThresholdPrefs: jest.fn().mockResolvedValue(false),
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "90" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      await act(async () => {
+        fireEvent.click(saveButtons[0]);
+      });
+
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error updating thresholds",
+      );
+    });
+
+    it("disables threshold inputs for users without can_change_app_threshold_prefs", async () => {
+      useAppsStore.setState({
+        ...defaultLoadedAppsState,
+        canChangeAppThresholdPrefs: false,
+      });
+
+      await renderPage();
+
+      await act(async () => {
+        useAppsStore.setState({ appsStatus: "success" });
+      });
+
+      expect(screen.getByTestId("error-good-threshold-input")).toBeDisabled();
+      expect(
+        screen.getByTestId("error-caution-threshold-input"),
+      ).toBeDisabled();
+      expect(
+        screen.getByTestId("error-spike-min-count-threshold-input"),
+      ).toBeDisabled();
+      expect(
+        screen.getByTestId("error-spike-min-rate-threshold-input"),
+      ).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "Save thresholds" }),
+      ).toBeDisabled();
+    });
+
+    it("shows validation error when good threshold is not greater than caution", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "80" },
+        });
+      });
+
+      const saveButtons = screen.getAllByRole("button", {
+        name: "Save thresholds",
+      });
+      await act(async () => {
+        fireEvent.click(saveButtons[0]);
+      });
+
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error updating thresholds",
+        "Good threshold must be greater than caution threshold",
+      );
+      expect(
+        useAppsStore.getState().updateAppThresholdPrefs,
+      ).not.toHaveBeenCalled();
+    });
+
+    it("makes no API call when the good threshold is set outside 0-100", async () => {
+      await renderLoadedPage();
+
+      // The numeric input clamps typed values into its 0-100 range, so 0 is
+      // the lowest reachable value; validation then rejects it because a good
+      // threshold of 0 can never exceed the caution threshold.
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-caution-threshold-input"), {
+          target: { value: "-1" },
+        });
+      });
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("error-good-threshold-input"), {
+          target: { value: "0" },
+        });
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Save thresholds" }),
+        );
+      });
+
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error updating thresholds",
+        expect.any(String),
+      );
+      expect(
+        useAppsStore.getState().updateAppThresholdPrefs,
+      ).not.toHaveBeenCalled();
+    });
+
+    it("shows validation error when spike rate threshold is zero", async () => {
+      await renderLoadedPage();
+
+      await act(async () => {
+        fireEvent.change(
+          screen.getByTestId("error-spike-min-rate-threshold-input"),
+          { target: { value: "0" } },
+        );
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Save thresholds" }),
+        );
+      });
+
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error updating thresholds",
+        "Spike threshold must be between 0 (exclusive) and 100",
+      );
+      expect(
+        useAppsStore.getState().updateAppThresholdPrefs,
+      ).not.toHaveBeenCalled();
+    });
+
+    // Note: loadPageData and fetchPermissions are now handled automatically by TanStack Query hooks
+  });
+});

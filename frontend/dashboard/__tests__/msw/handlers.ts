@@ -1,0 +1,611 @@
+/**
+ * MSW request handlers for the overview page's API endpoints.
+ *
+ * These serve the fixture data from ./fixtures.ts by default. Individual
+ * tests can override specific handlers via `server.use(...)` to test
+ * error states, empty data, etc.
+ *
+ * URL paths use the /api/* prefix that the frontend sends. The Next.js
+ * proxy strips /api and proxies to the Go backend in production,
+ * but in tests MSW intercepts before that happens.
+ */
+import { http, HttpResponse } from "msw";
+import {
+  makeAlertsOverviewFixture,
+  makeAppFixture,
+  makeAppRetentionFixture,
+  makeAuthzAndMembersFixture,
+  makeBillingInfoFixture,
+  makeBugReportDetailFixture,
+  makeBugReportsFilterKeysFixture,
+  makeJourneysFilterKeysFixture,
+  makeSessionsFilterKeysFixture,
+  makeBugReportsOverviewFixture,
+  makeBugReportsPlotFixture,
+  makeBuildsFixture,
+  makeCommonPathFixture,
+  makeCrashPlotFixture,
+  makeErrorGroupEventsFilterKeysFixture,
+  makeErrorsFilterKeysFixture,
+  makeAttributeDistributionFixture,
+  makeExceptionDistributionFixture,
+  makeExceptionInstanceFixture,
+  makeExceptionsOverviewFixture,
+  makeFilterKeysFixture,
+  makeNetworkFilterKeysFixture,
+  makeFilterValuesFixture,
+  makeFunnelConversionFixture,
+  makeFunnelEventNamesFixture,
+  makeFunnelFixture,
+  makeFunnelCadenceFixture,
+  makeFunnelsFixture,
+  makeFunnelStepErrorsFixture,
+  makeFunnelStepNetworkFixture,
+  makeFunnelStepSessionsFixture,
+  makeFunnelStepTracesFixture,
+  makeFunnelTrendFixture,
+  makeHealthPlotFixture,
+  makeJourneyFixture,
+  makeMetricsFixture,
+  makeNetworkEndpointStatusCodesFixture,
+  makeNetworkEndpointLatencyFixture,
+  makeNetworkStatusCodesFixture,
+  makeNetworkEndpointsFixture,
+  makeNetworkTimelineFixture,
+  makeNetworkTrendsFixture,
+  makeNotifPrefsFixture,
+  makePendingInvitesFixture,
+  makePinnedFunnelsFixture,
+  makeSdkConfigFixture,
+  makeSearchToCartFunnelFixture,
+  makeSearchToCartTrendFixture,
+  makeSearchToOrderFunnelFixture,
+  makeSearchToOrderTrendFixture,
+  makeSessionPlotFixture,
+  makeSessionReplayFixture,
+  makeSessionReplayOverviewFixture,
+  makeSlackConnectUrlFixture,
+  makeSlackStatusFixture,
+  makeSpanMetricsPlotFixture,
+  makeSpansOverviewFixture,
+  makeTeamsFixture,
+  makeThresholdPrefsFixture,
+  makeTraceDetailFixture,
+  makeUsageFixture,
+} from "./fixtures";
+
+function funnelFixtureById(funnelId: string) {
+  return [
+    makeFunnelFixture(),
+    makeSearchToCartFunnelFixture(),
+    makeSearchToOrderFunnelFixture(),
+  ].find((funnel) => funnel.id === funnelId);
+}
+
+export const handlers = [
+  // 1. GET /api/teams/:teamId/apps
+  http.get("*/api/teams/:teamId/apps", () => {
+    return HttpResponse.json([makeAppFixture()]);
+  }),
+
+  // 4. GET /api/apps/:appId/sessions/plots/instances
+  http.get("*/api/apps/:appId/sessions/plots/instances", () => {
+    return HttpResponse.json(makeSessionPlotFixture());
+  }),
+
+  // 5. GET /api/apps/:appId/errorGroups/plots/instances (unified errors overview plot)
+  http.get("*/api/apps/:appId/errorGroups/plots/instances", () => {
+    return HttpResponse.json(makeCrashPlotFixture());
+  }),
+
+  // 6. GET /api/apps/:appId/health/plots/instances (overview app health plot)
+  http.get("*/api/apps/:appId/health/plots/instances", () => {
+    return HttpResponse.json(makeHealthPlotFixture());
+  }),
+
+  // 7. GET /api/apps/:appId/metrics
+  http.get("*/api/apps/:appId/metrics", () => {
+    return HttpResponse.json(makeMetricsFixture());
+  }),
+
+  // 8. GET /api/apps/:appId/thresholdPrefs
+  http.get("*/api/apps/:appId/thresholdPrefs", () => {
+    return HttpResponse.json(makeThresholdPrefsFixture());
+  }),
+
+  // 9. GET /api/apps/:appId/sessions (paginated list)
+  http.get("*/api/apps/:appId/sessions", ({ request }) => {
+    // Only match the list endpoint, not /sessions/:sessionId
+    const url = new URL(request.url);
+    const pathParts = url.pathname.split("/");
+    // /api/apps/:appId/sessions has 4 parts after split
+    // /api/apps/:appId/sessions/:sessionId has 5 parts
+    if (pathParts.filter(Boolean).length > 4) {
+      return;
+    }
+    return HttpResponse.json(makeSessionReplayOverviewFixture());
+  }),
+
+  // 10. GET /api/apps/:appId/sessions/:sessionId (single session detail)
+  http.get("*/api/apps/:appId/sessions/:sessionId", () => {
+    return HttpResponse.json(makeSessionReplayFixture());
+  }),
+
+  // 11. GET /api/apps/:appId/journey (user journeys)
+  http.get("*/api/apps/:appId/journey", () => {
+    return HttpResponse.json(makeJourneyFixture());
+  }),
+
+  // 12. GET /api/apps/:appId/errorGroups (unified errors overview)
+  http.get("*/api/apps/:appId/errorGroups", ({ request }) => {
+    const url = new URL(request.url);
+    // Don't match sub-paths like /errorGroups/:id/errors
+    if (
+      url.pathname.includes("/plots/") ||
+      url.pathname.match(/errorGroups\/[^/]+\//)
+    )
+      return;
+    return HttpResponse.json(makeExceptionsOverviewFixture());
+  }),
+
+  // 13. GET /api/apps/:appId/errorGroups/:id/errors (unified error instances)
+  http.get("*/api/apps/:appId/errorGroups/:groupId/errors", () => {
+    return HttpResponse.json(makeExceptionInstanceFixture());
+  }),
+
+  // 14. GET /api/apps/:appId/errorGroups/:id/plots/instances (error detail plot)
+  http.get("*/api/apps/:appId/errorGroups/:groupId/plots/instances", () => {
+    return HttpResponse.json(makeCrashPlotFixture());
+  }),
+
+  // 15. GET /api/apps/:appId/errorGroups/:id/plots/distribution and
+  // /plots/distribution/:attribute
+  http.get("*/api/apps/:appId/errorGroups/:groupId/plots/distribution", () => {
+    return HttpResponse.json(makeExceptionDistributionFixture());
+  }),
+  http.get(
+    "*/api/apps/:appId/errorGroups/:groupId/plots/distribution/:attribute",
+    () => {
+      return HttpResponse.json(makeAttributeDistributionFixture());
+    },
+  ),
+
+  // 16. GET /api/apps/:appId/errorGroups/:id/path (common path)
+  http.get("*/api/apps/:appId/errorGroups/:groupId/path", () => {
+    return HttpResponse.json(makeCommonPathFixture());
+  }),
+
+  // 22. GET /api/apps/:appId/bugReports (bug reports list)
+  http.get("*/api/apps/:appId/bugReports", ({ request }) => {
+    const url = new URL(request.url);
+    // Only match the exact /bugReports path, not /bugReports/:id or /bugReports/plots/*
+    const pathParts = url.pathname.split("/").filter(Boolean);
+    if (pathParts.length > 4) return;
+    return HttpResponse.json(makeBugReportsOverviewFixture());
+  }),
+
+  // 23. GET /api/apps/:appId/bugReports/plots/instances (bug reports plot)
+  http.get("*/api/apps/:appId/bugReports/plots/instances", () => {
+    return HttpResponse.json(makeBugReportsPlotFixture());
+  }),
+
+  // 24. GET /api/apps/:appId/bugReports/:bugReportId (single bug report detail)
+  http.get("*/api/apps/:appId/bugReports/:bugReportId", () => {
+    return HttpResponse.json(makeBugReportDetailFixture());
+  }),
+
+  // 25. PATCH /api/apps/:appId/bugReports/:bugReportId (toggle bug report status)
+  http.patch("*/api/apps/:appId/bugReports/:bugReportId", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 26. GET /api/apps/:appId/alerts (alerts list)
+  http.get("*/api/apps/:appId/alerts", () => {
+    return HttpResponse.json(makeAlertsOverviewFixture());
+  }),
+
+  // 27. GET /api/apps/:appId/spans/plots/metrics (span metrics plot — before /spans catch-all)
+  http.get("*/api/apps/:appId/spans/plots/metrics", () => {
+    return HttpResponse.json(makeSpanMetricsPlotFixture());
+  }),
+
+  // 28. GET /api/apps/:appId/spans/roots/names (root span names — before /spans catch-all)
+  http.get("*/api/apps/:appId/spans/roots/names", () => {
+    return HttpResponse.json({
+      results: ["checkout_full_display", "api_fetch_payments", "render_ui"],
+    });
+  }),
+
+  // 29. GET /api/apps/:appId/spans (spans list for traces overview)
+  http.get("*/api/apps/:appId/spans", () => {
+    return HttpResponse.json(makeSpansOverviewFixture());
+  }),
+
+  // 30. GET /api/apps/:appId/traces/:traceId (single trace detail)
+  http.get("*/api/apps/:appId/traces/:traceId", () => {
+    return HttpResponse.json(makeTraceDetailFixture());
+  }),
+
+  // --- Network endpoints ---
+
+  // 31. GET /api/apps/:appId/networkRequests/endpoints
+  http.get("*/api/apps/:appId/networkRequests/endpoints", () => {
+    return HttpResponse.json(makeNetworkEndpointsFixture());
+  }),
+
+  // 32. GET /api/apps/:appId/networkRequests/trends
+  http.get("*/api/apps/:appId/networkRequests/trends", () => {
+    return HttpResponse.json(makeNetworkTrendsFixture());
+  }),
+
+  // 33. GET /api/apps/:appId/networkRequests/plots/statusCodes
+  http.get("*/api/apps/:appId/networkRequests/plots/statusCodes", () => {
+    return HttpResponse.json(makeNetworkStatusCodesFixture());
+  }),
+
+  // 34. GET /api/apps/:appId/networkRequests/plots/endpointStatusCodes
+  http.get(
+    "*/api/apps/:appId/networkRequests/plots/endpointStatusCodes",
+    () => {
+      return HttpResponse.json(makeNetworkEndpointStatusCodesFixture());
+    },
+  ),
+
+  // 35. GET /api/apps/:appId/networkRequests/plots/latency
+  http.get("*/api/apps/:appId/networkRequests/plots/latency", () => {
+    return HttpResponse.json(makeNetworkEndpointLatencyFixture());
+  }),
+
+  // 36. GET /api/apps/:appId/networkRequests/plots/timeline
+  http.get("*/api/apps/:appId/networkRequests/plots/timeline", () => {
+    return HttpResponse.json(makeNetworkTimelineFixture());
+  }),
+
+  // --- Apps settings endpoints (39-47) ---
+
+  // 39. GET /api/teams/:teamId/authz (returns full authz+members for team page)
+  http.get("*/api/teams/:teamId/authz", () => {
+    return HttpResponse.json(makeAuthzAndMembersFixture());
+  }),
+
+  // 40. GET /api/teams/:teamId/billing/info
+  http.get("*/api/teams/:teamId/billing/info", () => {
+    return HttpResponse.json(makeBillingInfoFixture());
+  }),
+
+  // 41. GET /api/apps/:appId/retention
+  http.get("*/api/apps/:appId/retention", () => {
+    return HttpResponse.json(makeAppRetentionFixture());
+  }),
+
+  // 42. GET /api/apps/:appId/config
+  http.get("*/api/apps/:appId/config", () => {
+    return HttpResponse.json(makeSdkConfigFixture());
+  }),
+
+  // GET /api/apps/:appId/config/history
+  http.get("*/api/apps/:appId/config/history", () => {
+    return HttpResponse.json({
+      meta: { next: false, previous: false },
+      results: [],
+    });
+  }),
+
+  // 43. PATCH /api/apps/:appId/thresholdPrefs
+  http.patch("*/api/apps/:appId/thresholdPrefs", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 44. PATCH /api/apps/:appId/retention
+  http.patch("*/api/apps/:appId/retention", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 45. PATCH /api/apps/:appId/rename
+  http.patch("*/api/apps/:appId/rename", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 46. PATCH /api/apps/:appId/apiKey
+  http.patch("*/api/apps/:appId/apiKey", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 47. PATCH /api/apps/:appId/config (SDK config update)
+  http.patch("*/api/apps/:appId/config", () => {
+    return HttpResponse.json(makeSdkConfigFixture());
+  }),
+
+  // --- Team page endpoints (48-58) ---
+
+  // 48. GET /api/teams (list all teams)
+  http.get("*/api/teams", ({ request }) => {
+    const url = new URL(request.url);
+    // Don't match sub-paths like /teams/:teamId/authz
+    const pathParts = url.pathname.split("/").filter(Boolean);
+    if (pathParts.length > 2) return;
+    return HttpResponse.json(makeTeamsFixture());
+  }),
+
+  // 49. GET /api/teams/:teamId/invites
+  http.get("*/api/teams/:teamId/invites", () => {
+    return HttpResponse.json(makePendingInvitesFixture());
+  }),
+
+  // 50. GET /api/teams/:teamId/slack/connect-url
+  http.get("*/api/teams/:teamId/slack/connect-url", () => {
+    return HttpResponse.json(makeSlackConnectUrlFixture());
+  }),
+
+  // 51. GET /api/teams/:teamId/slack
+  http.get("*/api/teams/:teamId/slack", () => {
+    return HttpResponse.json(makeSlackStatusFixture());
+  }),
+
+  // 52. PATCH /api/teams/:teamId/rename
+  http.patch("*/api/teams/:teamId/rename", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 53. PATCH /api/teams/:teamId/members/:memberId/role
+  http.patch("*/api/teams/:teamId/members/:memberId/role", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 54. DELETE /api/teams/:teamId/members/:memberId
+  http.delete("*/api/teams/:teamId/members/:memberId", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 55. POST /api/teams/:teamId/invite
+  http.post("*/api/teams/:teamId/invite", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 56. PATCH /api/teams/:teamId/invite/:inviteId (resend)
+  http.patch("*/api/teams/:teamId/invite/:inviteId", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 57. DELETE /api/teams/:teamId/invite/:inviteId (revoke)
+  http.delete("*/api/teams/:teamId/invite/:inviteId", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 58. PATCH /api/teams/:teamId/slack/status
+  http.patch("*/api/teams/:teamId/slack/status", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 59. POST /api/teams/:teamId/slack/test
+  http.post("*/api/teams/:teamId/slack/test", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 60. DELETE /api/teams/:teamId/slack
+  http.delete("*/api/teams/:teamId/slack", () => {
+    return HttpResponse.json({ ok: "done" });
+  }),
+
+  // 61. GET /api/prefs/notifPrefs
+  http.get("*/api/prefs/notifPrefs", () => {
+    return HttpResponse.json(makeNotifPrefsFixture());
+  }),
+
+  // 62. PATCH /api/prefs/notifPrefs
+  http.patch("*/api/prefs/notifPrefs", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 62a. GET /api/auth/session (for UserAvatar component)
+  http.get("*/api/auth/session", () => {
+    return HttpResponse.json({
+      user: {
+        id: "user-001",
+        own_team_id: "team-001",
+        name: "Test User",
+        email: "test@example.com",
+        avatar_url: "https://example.com/avatar.png",
+        confirmed_at: "2026-01-01T00:00:00Z",
+        last_sign_in_at: "2026-04-10T12:00:00Z",
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-04-10T00:00:00Z",
+      },
+    });
+  }),
+
+  // 63. GET /api/teams/:teamId/usage
+  http.get("*/api/teams/:teamId/usage", () => {
+    return HttpResponse.json(makeUsageFixture());
+  }),
+
+  // 64. PATCH /api/teams/:teamId/billing/checkout
+  http.patch("*/api/teams/:teamId/billing/checkout", () => {
+    return HttpResponse.json({
+      checkout_url: "https://checkout.stripe.com/test",
+    });
+  }),
+
+  // 66. PATCH /api/teams/:teamId/billing/downgrade
+  http.patch("*/api/teams/:teamId/billing/downgrade", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+
+  // 67. POST /api/teams/:teamId/billing/portal
+  http.post("*/api/teams/:teamId/billing/portal", () => {
+    return HttpResponse.json({ url: "https://billing.stripe.com/portal/test" });
+  }),
+
+  // 68. GET /api/apps/:appId/filters/keys (keys differ per entity)
+  http.get("*/api/apps/:appId/filters/keys", ({ request }) => {
+    const entity = new URL(request.url).searchParams.get("entity");
+    if (entity === "bug_reports") {
+      return HttpResponse.json(makeBugReportsFilterKeysFixture());
+    }
+    if (entity === "sessions") {
+      return HttpResponse.json(makeSessionsFilterKeysFixture());
+    }
+    if (entity === "journeys") {
+      return HttpResponse.json(makeJourneysFilterKeysFixture());
+    }
+    if (entity === "network") {
+      return HttpResponse.json(makeNetworkFilterKeysFixture());
+    }
+    if (entity === "errors") {
+      return HttpResponse.json(makeErrorsFilterKeysFixture());
+    }
+    if (entity === "error_group_events") {
+      return HttpResponse.json(makeErrorGroupEventsFilterKeysFixture());
+    }
+    if (entity === "alerts") {
+      return HttpResponse.json({
+        keys: [],
+        key_groups: [],
+        keys_truncated: false,
+      });
+    }
+    return HttpResponse.json(makeFilterKeysFixture());
+  }),
+
+  // 69. GET /api/apps/:appId/filters/values
+  http.get("*/api/apps/:appId/filters/values", () => {
+    return HttpResponse.json(makeFilterValuesFixture());
+  }),
+
+  // 71. GET /api/apps/:appId/builds
+  http.get("*/api/apps/:appId/builds", () => {
+    return HttpResponse.json(makeBuildsFixture());
+  }),
+
+  // --- Funnel endpoints ---
+  // The fixed sub-paths come before /funnels/:funnelId, which would
+  // otherwise match /funnels/pinned and /funnels/events.
+
+  // 72. GET /api/apps/:appId/funnels (paginated, searchable list)
+  http.get("*/api/apps/:appId/funnels", () => {
+    return HttpResponse.json(makeFunnelsFixture());
+  }),
+
+  // 73. GET /api/apps/:appId/funnels/pinned
+  http.get("*/api/apps/:appId/funnels/pinned", () => {
+    return HttpResponse.json(makePinnedFunnelsFixture());
+  }),
+
+  // 74. PUT /api/apps/:appId/funnels/pinned (reorder)
+  http.put("*/api/apps/:appId/funnels/pinned", async ({ request }) => {
+    const { funnel_ids } = (await request.json()) as { funnel_ids: string[] };
+    return HttpResponse.json({
+      results: funnel_ids.map((id, i) => ({
+        ...funnelFixtureById(id),
+        pin_order: i,
+      })),
+    });
+  }),
+
+  // 75. GET /api/apps/:appId/funnels/events
+  http.get("*/api/apps/:appId/funnels/events", () => {
+    return HttpResponse.json(makeFunnelEventNamesFixture());
+  }),
+
+  // 76. POST /api/apps/:appId/funnels (create)
+  http.post("*/api/apps/:appId/funnels", async ({ request }) => {
+    const draft = (await request.json()) as Record<string, any>;
+    return HttpResponse.json(
+      makeFunnelFixture({
+        id: "funnel-new",
+        pinned: false,
+        pin_order: null,
+        ...draft,
+      }),
+    );
+  }),
+
+  // 77. GET /api/apps/:appId/funnels/:funnelId/conversion
+  http.get("*/api/apps/:appId/funnels/:funnelId/conversion", () => {
+    return HttpResponse.json(makeFunnelConversionFixture());
+  }),
+
+  // 78. GET /api/apps/:appId/funnels/:funnelId/errors
+  http.get("*/api/apps/:appId/funnels/:funnelId/errors", () => {
+    return HttpResponse.json(makeFunnelStepErrorsFixture());
+  }),
+
+  // 79. GET /api/apps/:appId/funnels/:funnelId/traces
+  http.get("*/api/apps/:appId/funnels/:funnelId/traces", () => {
+    return HttpResponse.json(makeFunnelStepTracesFixture());
+  }),
+
+  // 80. GET /api/apps/:appId/funnels/:funnelId/network
+  http.get("*/api/apps/:appId/funnels/:funnelId/network", () => {
+    return HttpResponse.json(makeFunnelStepNetworkFixture());
+  }),
+
+  // 81. GET /api/apps/:appId/funnels/:funnelId/sessions
+  http.get("*/api/apps/:appId/funnels/:funnelId/sessions", () => {
+    return HttpResponse.json(makeFunnelStepSessionsFixture());
+  }),
+
+  // 82. GET /api/apps/:appId/funnels/:funnelId/cadence
+  http.get("*/api/apps/:appId/funnels/:funnelId/cadence", () => {
+    return HttpResponse.json(makeFunnelCadenceFixture());
+  }),
+
+  // 83. GET /api/apps/:appId/funnels/:funnelId/trend
+  http.get("*/api/apps/:appId/funnels/:funnelId/trend", ({ params }) => {
+    if (params.funnelId === makeSearchToCartFunnelFixture().id) {
+      return HttpResponse.json(makeSearchToCartTrendFixture());
+    }
+    if (params.funnelId === makeSearchToOrderFunnelFixture().id) {
+      return HttpResponse.json(makeSearchToOrderTrendFixture());
+    }
+    return HttpResponse.json(makeFunnelTrendFixture());
+  }),
+
+  // 84. PUT /api/apps/:appId/funnels/:funnelId/pin
+  http.put("*/api/apps/:appId/funnels/:funnelId/pin", ({ params }) => {
+    const funnel = funnelFixtureById(params.funnelId as string);
+    if (!funnel) {
+      return HttpResponse.json({ error: "Funnel not found" }, { status: 404 });
+    }
+    return HttpResponse.json({ ...funnel, pinned: true });
+  }),
+
+  // 85. DELETE /api/apps/:appId/funnels/:funnelId/pin
+  http.delete("*/api/apps/:appId/funnels/:funnelId/pin", ({ params }) => {
+    const funnel = funnelFixtureById(params.funnelId as string);
+    if (!funnel) {
+      return HttpResponse.json({ error: "Funnel not found" }, { status: 404 });
+    }
+    return HttpResponse.json({ ...funnel, pinned: false, pin_order: null });
+  }),
+
+  // 86. GET /api/apps/:appId/funnels/:funnelId (unknown ids are not found)
+  http.get("*/api/apps/:appId/funnels/:funnelId", ({ params }) => {
+    const funnel = funnelFixtureById(params.funnelId as string);
+    if (!funnel) {
+      return HttpResponse.json({ error: "Funnel not found" }, { status: 404 });
+    }
+    return HttpResponse.json(funnel);
+  }),
+
+  // 87. PATCH /api/apps/:appId/funnels/:funnelId (update)
+  http.patch(
+    "*/api/apps/:appId/funnels/:funnelId",
+    async ({ params, request }) => {
+      const funnel = funnelFixtureById(params.funnelId as string);
+      if (!funnel) {
+        return HttpResponse.json(
+          { error: "Funnel not found" },
+          { status: 404 },
+        );
+      }
+      const draft = (await request.json()) as Record<string, any>;
+      return HttpResponse.json({ ...funnel, ...draft });
+    },
+  ),
+
+  // 88. DELETE /api/apps/:appId/funnels/:funnelId
+  http.delete("*/api/apps/:appId/funnels/:funnelId", () => {
+    return HttpResponse.json({ ok: true });
+  }),
+];

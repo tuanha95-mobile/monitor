@@ -1,0 +1,128 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"backend/ingest-worker/measure"
+	"backend/ingest-worker/server"
+	"backend/libs/inet"
+	"backend/libs/middleware"
+	"backend/libs/posthog"
+
+	"github.com/gin-gonic/gin"
+
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+)
+
+func main() {
+	config := server.NewConfig()
+	server.Init(config)
+
+	defer server.Server.PgPool.Close()
+	if server.Server.VK != nil {
+		defer server.Server.VK.Close()
+	}
+
+	// Close ClickHouse connection pool at shutdown
+	defer func() {
+		if err := server.Server.ChPool.Close(); err != nil {
+			log.Fatalf("Unable to close clickhouse connection: %v", err)
+		}
+	}()
+
+	// Close geo ip database at shutdown
+	defer func() {
+		if err := inet.Close(); err != nil {
+			log.Fatalf("Unable to close geo ip db: %v", err)
+		}
+	}()
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	r := gin.Default()
+
+	closeTracer := config.InitTracing()
+	// Close OTel tracer
+	defer func() {
+		if err := closeTracer(context.Background()); err != nil {
+			log.Fatalf("Unable to close OTel tracer: %v", err)
+		}
+	}()
+
+	r.Use(otelgin.Middleware(config.OtelServiceName))
+	r.Use(middleware.CaptureRequest())
+	r.Use(middleware.CapturePanic())
+	r.Use(middleware.CaptureErrorBody())
+
+	// health check
+	r.GET("/ping", func(c *gin.Context) {
+		c.String(http.StatusOK, "pong")
+	})
+
+	// ingest batch receive endpoint
+	pushEnabled := os.Getenv("INGEST_PUBSUB_PUSH_ENABLED") == "true"
+	if config.IsCloud() && pushEnabled {
+		r.POST("/subscribe/batch", measure.PushHandler)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8086"
+	}
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	// Start bus consumer if initialized
+	if server.Server.BusConsumer != nil {
+		defer server.Server.BusConsumer.Close()
+
+		go func() {
+			fmt.Println("bus consumer listening")
+			if err := server.Server.BusConsumer.Listen(appCtx, measure.ConsumeHandler); err != nil && !errors.Is(err, context.Canceled) {
+				log.Fatalf("bus consumer stopped: %v", err)
+			}
+		}()
+	}
+
+	// Run server in a goroutine
+	go func() {
+		fmt.Printf("Listening and serving HTTP on %s\n", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Failed to listen and serve on %s\n", srv.Addr)
+		}
+	}()
+
+	// Listen for shutdown signals
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	fmt.Println("Shutting down ingest-worker service...")
+
+	shutdownTimeout := 9 * time.Second
+	if gin.Mode() == gin.DebugMode {
+		shutdownTimeout = 0 * time.Second
+	}
+
+	// Graceful shutdown with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Printf("Failed to gracefully shutdown server: %v\n", err)
+	}
+
+	// Flush PostHog after the HTTP server stops accepting requests.
+	posthog.Close()
+}

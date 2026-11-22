@@ -1,0 +1,228 @@
+package sh.measure.android.storage
+
+import sh.measure.android.SessionManager
+import sh.measure.android.config.ConfigProvider
+import sh.measure.android.executors.MeasureExecutorService
+import sh.measure.android.logger.LogLevel
+import sh.measure.android.logger.Logger
+import sh.measure.android.tracing.InternalTrace
+import sh.measure.android.utils.TimeProvider
+import sh.measure.android.utils.iso8601Timestamp
+
+internal interface DataCleanupService {
+    fun cleanup()
+}
+
+private const val DB_DELETION_BATCH_SIZE = 1000
+private const val MAX_SDK_DEBUG_LOG_FILES = 5
+private const val MAX_SESSIONS_TO_RETAIN = 5
+
+/**
+ * Cleans up stale data from the database and file storage.
+ *
+ * This service deletes all events, attachments, and sessions that
+ * are not marked for reporting. It also deletes events for the oldest session if
+ * the total number of events in database exceeds the maximum allowed. The rows of
+ * the most recently created sessions are always retained, so late-delivered
+ * signals can be attributed to the session they occurred in.
+ */
+internal class DataCleanupServiceImpl(
+    private val logger: Logger,
+    private val fileStorage: FileStorage,
+    private val database: Database,
+    private val ioExecutor: MeasureExecutorService,
+    private val sessionManager: SessionManager,
+    private val configProvider: ConfigProvider,
+    private val timeProvider: TimeProvider,
+) : DataCleanupService {
+    override fun cleanup() {
+        val currentSessionId = sessionManager.getSessionId()
+        ioExecutor.submit {
+            InternalTrace.trace(
+                { "msr-cleanup" },
+                {
+                    deleteEvents(currentSessionId)
+                    deleteSpans(currentSessionId)
+                    deleteExpiredAttachments()
+                    deleteBugReports(currentSessionId)
+                    deleteEmptySessions(currentSessionId)
+                    trimMemoryUsage(currentSessionId)
+                    trimSdkDebugLogs()
+                },
+            )
+        }
+    }
+
+    private fun deleteBugReports(currentSessionId: String) {
+        try {
+            val bugReportsDir = fileStorage.getBugReportDir()
+            if (!bugReportsDir.exists() || !bugReportsDir.isDirectory) {
+                return
+            }
+
+            val files = bugReportsDir.listFiles()
+            if (files != null) {
+                logger.log(LogLevel.Debug, "Cleanup: Cleaning up ${files.size} bug reports")
+                files.forEach { sessionDir ->
+                    if (sessionDir.isDirectory && sessionDir.name != currentSessionId) {
+                        sessionDir.deleteRecursively()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.log(LogLevel.Debug, "Cleanup: Failed to clean up stale bug reports", e)
+        }
+    }
+
+    private fun deleteEvents(currentSessionId: String) {
+        InternalTrace.trace(
+            { "msr-deleteEvents" },
+            {
+                while (true) {
+                    val deletedEventIds = database.deleteEvents(
+                        excludeSessionId = currentSessionId,
+                        batchSize = DB_DELETION_BATCH_SIZE,
+                    )
+
+                    if (deletedEventIds.isNotEmpty()) {
+                        logger.log(
+                            LogLevel.Debug,
+                            "Cleanup: Deleted ${deletedEventIds.size} events",
+                        )
+                    }
+
+                    if (deletedEventIds.isEmpty()) break
+
+                    fileStorage.deleteEventsIfExist(deletedEventIds)
+                    fileStorage.deleteAttachmentsIfExist(deletedEventIds)
+
+                    if (deletedEventIds.size < DB_DELETION_BATCH_SIZE) break
+                }
+            },
+        )
+    }
+
+    private fun deleteSpans(currentSessionId: String) {
+        InternalTrace.trace(
+            { "msr-deleteSpans" },
+            {
+                while (true) {
+                    val deletedSpanIds = database.deleteSpans(
+                        excludeSessionId = currentSessionId,
+                        batchSize = DB_DELETION_BATCH_SIZE,
+                    )
+                    if (deletedSpanIds.isNotEmpty()) {
+                        logger.log(LogLevel.Debug, "Cleanup: Deleted ${deletedSpanIds.size} spans")
+                    }
+                    if (deletedSpanIds.isEmpty()) break
+                    if (deletedSpanIds.size < DB_DELETION_BATCH_SIZE) break
+                }
+            },
+        )
+    }
+
+    private fun deleteExpiredAttachments() {
+        InternalTrace.trace(
+            { "msr-deleteExpiredAttachments" },
+            {
+                val currentTime = timeProvider.now().iso8601Timestamp()
+                while (true) {
+                    val expiredAttachmentIds = database.getExpiredAttachments(
+                        currentTime = currentTime,
+                        batchSize = DB_DELETION_BATCH_SIZE,
+                    )
+
+                    if (expiredAttachmentIds.isNotEmpty()) {
+                        logger.log(
+                            LogLevel.Debug,
+                            "Cleanup: Deleted ${expiredAttachmentIds.size} expired attachments",
+                        )
+                    }
+
+                    if (expiredAttachmentIds.isEmpty()) break
+
+                    fileStorage.deleteAttachmentsIfExist(expiredAttachmentIds)
+                    database.deleteAttachments(expiredAttachmentIds)
+
+                    if (expiredAttachmentIds.size < DB_DELETION_BATCH_SIZE) break
+                }
+            },
+        )
+    }
+
+    private fun deleteEmptySessions(currentSessionId: String) {
+        InternalTrace.trace(
+            { "msr-deleteEmptySessions" },
+            {
+                val retainedSessionIds = database.getRecentSessionIds(MAX_SESSIONS_TO_RETAIN).toSet()
+                val sessionIds = database.getSessionIds(excludeSessionId = currentSessionId)
+                    .filterNot { it in retainedSessionIds }
+                val sessionsToDelete = mutableListOf<String>()
+                for (sessionId in sessionIds) {
+                    val events = database.getEventsCount(sessionId)
+                    val spans = database.getSpansCount(sessionId)
+
+                    if (events + spans == 0) {
+                        sessionsToDelete.add(sessionId)
+                    }
+                }
+
+                if (sessionsToDelete.isEmpty()) {
+                    return@trace
+                }
+
+                logger.log(
+                    LogLevel.Debug,
+                    "Cleanup: Deleting ${sessionsToDelete.size} sessions with no events or spans",
+                )
+                sessionsToDelete.forEach {
+                    database.deleteSession(it)
+                }
+            },
+        )
+    }
+
+    private fun trimSdkDebugLogs() {
+        try {
+            val dir = fileStorage.getSdkDebugLogsDirectory() ?: return
+            val files = dir.listFiles() ?: return
+            if (files.size <= MAX_SDK_DEBUG_LOG_FILES) return
+
+            val filesToDelete = files.sortedBy { it.name }.dropLast(MAX_SDK_DEBUG_LOG_FILES)
+            logger.log(
+                LogLevel.Debug,
+                "Cleanup: Deleting ${filesToDelete.size} old SDK debug log files",
+            )
+            filesToDelete.forEach { it.delete() }
+        } catch (e: Exception) {
+            logger.log(LogLevel.Debug, "Cleanup: Failed to clean up SDK debug log files", e)
+        }
+    }
+
+    private fun trimMemoryUsage(currentSessionId: String) {
+        val eventsCount = database.getEventsCount()
+        val spansCount = database.getSpansCount()
+        val totalSignals = eventsCount + spansCount
+        val estimatedSizeInMb = (totalSignals * configProvider.estimatedEventSizeInKb) / 1024
+
+        if (estimatedSizeInMb <= configProvider.maxDiskUsageInMb.coerceIn(20, 1500)) {
+            return
+        }
+        database.getOldestSessionWithSignals()?.let {
+            if (it != currentSessionId) {
+                val eventIds = database.getEventsForSession(it)
+                fileStorage.deleteEventsIfExist(eventIds)
+                val attachmentIds = database.getAttachmentsForEvents(eventIds)
+                fileStorage.deleteAttachmentsIfExist(attachmentIds)
+
+                // the session row is kept so late-delivered signals can still be
+                // attributed to it, deleteEmptySessions prunes it eventually.
+                database.deleteSessionData(it)
+                logger.log(
+                    LogLevel.Debug,
+                    "DataCleanup: deleted data for session $it estimated storage: $estimatedSizeInMb, maxAllowed: ${configProvider.maxDiskUsageInMb}",
+                )
+            }
+        }
+    }
+}

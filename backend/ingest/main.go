@@ -1,0 +1,109 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"backend/ingest/measure"
+	"backend/ingest/server"
+	"backend/libs/middleware"
+
+	"github.com/gin-gonic/gin"
+
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+)
+
+func main() {
+	config := server.NewConfig()
+	server.Init(config)
+
+	defer server.Server.PgPool.Close()
+	if server.Server.VK != nil {
+		defer server.Server.VK.Close()
+	}
+	if server.Server.BusProducer != nil {
+		defer server.Server.BusProducer.Close()
+	}
+
+	// Close ClickHouse connection pool at shutdown
+	defer func() {
+		if err := server.Server.ChPool.Close(); err != nil {
+			log.Fatalf("Unable to close clickhouse connection: %v", err)
+		}
+	}()
+
+	r := gin.Default()
+
+	closeTracer := config.InitTracing()
+	// Close OTel tracer
+	defer func() {
+		if err := closeTracer(context.Background()); err != nil {
+			log.Fatalf("Unable to close OTel tracer: %v", err)
+		}
+	}()
+
+	r.Use(otelgin.Middleware(config.OtelServiceName))
+	r.Use(middleware.CaptureRequest())
+	r.Use(middleware.CapturePanic())
+	r.Use(middleware.CaptureErrorBody())
+
+	// health check
+	r.GET("/ping", func(c *gin.Context) {
+		c.String(http.StatusOK, "pong")
+	})
+
+	// ask well-behaved crawlers not to fetch any route in this service
+	r.GET("/robots.txt", func(c *gin.Context) {
+		c.String(http.StatusOK, "User-agent: *\nDisallow: /\n")
+	})
+
+	// SDK routes
+	r.PUT("/events", measure.ValidateAPIKey(), measure.PutEvents)
+	r.PUT("/builds", measure.ValidateAPIKey(), measure.PutBuilds)
+	r.PUT("/builds/ota", measure.ValidateAPIKey(), measure.PutOTABuilds)
+	r.GET("/config", measure.ValidateAPIKey(), measure.GetConfigForSdk)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8085"
+	}
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	// Run server in a goroutine
+	go func() {
+		fmt.Printf("Listening and serving HTTP on %s\n", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Failed to listen and serve on %s\n", srv.Addr)
+		}
+	}()
+
+	// Listen for shutdown signals
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	fmt.Println("Shutting down ingest service...")
+
+	shutdownTimeout := 9 * time.Second
+	if gin.Mode() == gin.DebugMode {
+		shutdownTimeout = 0 * time.Second
+	}
+
+	// Graceful shutdown with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Printf("Failed to gracefully shutdown server: %v\n", err)
+	}
+
+}

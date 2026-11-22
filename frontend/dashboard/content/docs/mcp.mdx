@@ -1,0 +1,395 @@
+---
+title: "MCP Server"
+seoTitle: "MCP Server for Mobile App Monitoring"
+description: "Connect Measure to Claude Code, OpenAI Codex, Google Antigravity, Cursor and other AI coding agents. Query crashes, traces, sessions and bug reports from your editor or AI agent workflows."
+---
+
+Measure exposes a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets AI-powered coding tools query your app's crash and error data directly.
+
+## What is MCP?
+
+The [Model Context Protocol](https://modelcontextprotocol.io) is an open standard that allows AI tools to interact with external data sources through a consistent interface. With Measure's MCP server, you can ask AI assistants to look up crashes, analyze error trends and inspect stack traces without leaving your editor.
+
+## Setup
+
+You can connect Measure's remote MCP server to any client with the endpoint:
+
+| Version     | Endpoint                                  |
+| ----------- | ----------------------------------------- |
+| Cloud       | `https://agent.measure.sh/mcp`            |
+| Self Hosted | `https://[your-measure-agent-domain]/mcp` |
+
+The examples below use the cloud endpoint. If you self-host Measure, replace it with your own agent domain.
+
+<Tabs items={["Claude Code", "Codex", "Cursor", "VS Code", "Claude Desktop", "Android Studio", "Antigravity", "Zed", "opencode", "Other"]}>
+
+<Tab value="Claude Code">
+
+Add the server from the terminal:
+
+```sh
+claude mcp add --transport http measure https://agent.measure.sh/mcp
+```
+
+Or add it to `.mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "measure": {
+      "type": "http",
+      "url": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="Codex">
+
+Add the server from the terminal:
+
+```sh
+codex mcp add measure --url https://agent.measure.sh/mcp
+```
+
+Or add it to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.measure]
+url = "https://agent.measure.sh/mcp"
+```
+
+</Tab>
+
+<Tab value="Cursor">
+
+Add the server to `~/.cursor/mcp.json` to use it everywhere, or to `.cursor/mcp.json` to scope it to one project:
+
+```json
+{
+  "mcpServers": {
+    "measure": {
+      "url": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="VS Code">
+
+Add the server to `.vscode/mcp.json` in your workspace, or open your user config with the **MCP: Open User Configuration** command and add it there:
+
+```json
+{
+  "servers": {
+    "measure": {
+      "type": "http",
+      "url": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="Claude Desktop">
+
+Open **Settings > Connectors**, click **Add custom connector**, name it `measure` and enter `https://agent.measure.sh/mcp` as the remote MCP server URL.
+
+</Tab>
+
+<Tab value="Android Studio">
+
+Go to **Settings > Tools > AI > MCP Servers**, select **Enable MCP Servers** and add:
+
+```json
+{
+  "mcpServers": {
+    "measure": {
+      "httpUrl": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="Antigravity">
+
+Open **Settings > Customizations > Installed MCP Servers**, click **Manage MCP Servers**, then **View raw config** and add:
+
+```json
+{
+  "mcpServers": {
+    "measure": {
+      "serverUrl": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+Antigravity requires the `serverUrl` field for remote servers; `url` and `httpUrl` are not supported.
+
+</Tab>
+
+<Tab value="Zed">
+
+Open **Settings > AI > MCP Servers**, click **Add Server** and choose **Add Remote Server**, or add the entry to your `settings.json` directly:
+
+```json
+{
+  "context_servers": {
+    "measure": {
+      "url": "https://agent.measure.sh/mcp"
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="opencode">
+
+Add the server to `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "measure": {
+      "type": "remote",
+      "url": "https://agent.measure.sh/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+</Tab>
+
+<Tab value="Other">
+
+Any client that supports remote MCP servers over streamable HTTP can connect by pointing at `https://agent.measure.sh/mcp`. Check your client's documentation for where its MCP config lives and which field name it uses for the URL.
+
+If your client only supports local MCP servers, bridge to the remote one with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "measure": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://agent.measure.sh/mcp"]
+    }
+  }
+}
+```
+
+</Tab>
+
+</Tabs>
+
+When you first use a Measure tool, your client opens a browser window for you to sign in to Measure. Subsequent requests work automatically.
+
+## Available Tools
+
+### `ask_question`
+
+Ask a natural language question to help debug an app and let [Measure Agent](/docs/agent) work out the answer using the app's telemetry data.
+
+### `list_apps`
+
+List all apps the authenticated user has access to.
+
+### `get_filter_keys`
+
+List the filter keys of an entity (spans, bug_reports, sessions, errors, error_group_events, journeys, network, app_health, memory, funnels or builds): the vocabulary a filter expression is written with.
+
+### `get_filter_values`
+
+List the values a filter key can be set to for an app.
+
+### `get_metrics`
+
+Get app metrics including adoption, crash-free/ANR-free sessions and launch performance (cold/warm/hot p95).
+
+### `get_app_health_over_time`
+
+Get the app health timeline: sessions, crashes (fatal exceptions) and ANRs bucketed over time.
+
+### `get_errors`
+
+Get error groups (crashes, non-fatal exceptions and ANRs) for an app, filterable by error type and severity.
+
+### `get_error`
+
+Get individual error events (exception or ANR) for a specific error group.
+
+### `get_errors_over_time`
+
+Get time-series of error occurrences across all error groups, filterable by error type and severity.
+
+### `get_error_over_time`
+
+Get time-series of occurrences for a specific error group.
+
+### `get_error_distribution`
+
+Get attribute distribution (OS, device, version, country etc) for a specific error group.
+
+### `get_error_common_path`
+
+Get the most common user navigation path leading to a specific error group.
+
+### `get_sessions`
+
+Get sessions for an app, ordered by most recent first.
+
+### `get_sessions_over_time`
+
+Get time-series of session counts.
+
+### `get_session`
+
+Get full session with all events.
+
+### `get_memory_usage_over_time`
+
+Get aggregate memory usage over time. Use it to compare shifts in app's memory profile. Returns p50/p90/p95/p99 in KiB by app version/build and time bucket.
+
+### `get_memory_usage_by_device_tier`
+
+Get a breakdown of memory usage by different device memory tiers. Returns p50/p90/p95 in KiB along with sampled-session and sample counts.
+
+### `get_high_memory_sessions`
+
+Get a paginated list of sessions with high memory usage. Use `get_session` to connect a returned session ID to user actions, screens, and errors.
+
+### `get_bug_reports`
+
+Get bug reports for an app, ordered by most recent first.
+
+### `get_bug_reports_over_time`
+
+Get time-series of bug report counts.
+
+### `get_bug_report`
+
+Get a single bug report with full details.
+
+### `update_bug_report_status`
+
+Update the status of a bug report (open or closed).
+
+### `get_root_span_names`
+
+Get all root span names for an app.
+
+### `get_span_instances`
+
+Get span instances for a root span name.
+
+### `get_span_metrics_over_time`
+
+Get p50/p90/p95/p99 duration metrics over time for a span name.
+
+### `get_trace`
+
+Get full trace with all child spans.
+
+### `get_alerts`
+
+Get alerts for an app, ordered by most recent first.
+
+### `get_journey`
+
+Get user journeys for an app as a graph of screens.
+
+### `get_funnels`
+
+Get an app's funnels, most recently updated first, optionally narrowed by a search on the funnel name.
+
+### `get_pinned_funnels`
+
+Get an app's pinned funnels in their pinned order.
+
+### `get_funnel`
+
+Get a single funnel with its steps, conversion window and pin.
+
+### `get_funnel_event_names`
+
+Get the custom event names an app sent, which a funnel's steps are chosen from.
+
+### `get_funnel_conversion`
+
+Get the users that reached each step of a funnel over a time range, and the median time between steps.
+
+### `get_funnel_trend`
+
+Get a funnel's conversion by day, week or month, optionally with the builds released in that time.
+
+### `get_funnel_cadence`
+
+Get how many users entered a funnel and converted in each hour of the week.
+
+### `get_funnel_step_errors`
+
+Get the errors users hit while trying to get from one funnel step to the next, with how many of them converted or dropped off.
+
+### `get_funnel_step_traces`
+
+Get the root spans recorded while users tried to get from one funnel step to the next, with their durations for users that converted and those that dropped off.
+
+### `get_funnel_step_network`
+
+Get the network requests made while users tried to get from one funnel step to the next, with their latencies for users that converted and those that dropped off.
+
+### `get_funnel_step_sessions`
+
+Get the sessions of users that converted, or of those that dropped off, between two funnel steps.
+
+### `create_funnel`
+
+Create a funnel from a name, an ordered list of custom event names and a conversion window.
+
+### `update_funnel`
+
+Change a funnel's name, steps or conversion window.
+
+### `delete_funnel`
+
+Delete a funnel.
+
+### `set_funnel_pinned`
+
+Pin or unpin a funnel.
+
+### `reorder_pinned_funnels`
+
+Change the order of an app's pinned funnels.
+
+`create_funnel`, `update_funnel`, `delete_funnel`, `set_funnel_pinned` and `reorder_pinned_funnels` change funnels for everyone on the team, and need a role that can edit funnels in the dashboard.
+
+### `get_network_metrics_trends`
+
+Get top network endpoints for an app by latency, error rate and frequency.
+
+### `get_network_status_codes_over_time`
+
+Get time-series of HTTP status class counts (2xx, 3xx, 4xx, 5xx) for an app or a specific endpoint.
+
+### `get_network_endpoint_status_codes_over_time`
+
+Get time-series of exact HTTP status code counts for a specific endpoint.
+
+### `get_network_latency_over_time`
+
+Get time-series of p50/p90/p95/p99 latency for an app or a specific endpoint.
+
+### `get_network_timeline`
+
+Get time-series of network requests per session, bucketed by time since session start, for an app or a specific endpoint.

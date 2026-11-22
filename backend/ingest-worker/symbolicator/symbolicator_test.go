@@ -1,0 +1,1867 @@
+//go:build integration
+
+package symbolicator
+
+import (
+	"backend/libs/artdump"
+	"backend/libs/event"
+	"backend/libs/symbol"
+	"backend/testinfra"
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/moby/moby/api/types/container"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/network"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+// symbolicatorImage is the Docker image used for the symbolicator service.
+// Change this to test against a different version.
+const symbolicatorImage = "ghcr.io/getsentry/symbolicator:26.3.1"
+
+var (
+	pgPool                    *pgxpool.Pool
+	symbolicatorOrigin        string
+	minioEndpoint             string
+	s3Client                  *s3.Client
+	s3InContainerClient       *s3.Client // signs presigned URLs reachable from inside containers
+	symbolsBucket             = "test-symbols"
+	basicProguardMappingKey   string // unified layout key for the basic proguard mapping
+	basicProguardDebugID      string // UUID-formatted debug ID for the basic proguard mapping
+	realProguardMappingKey    string // unified layout key for the real proguard mapping
+	sqliteProguardMappingKey  string // unified layout key for the sqlite proguard mapping
+	artdumpProguardMappingKey string // unified layout key for the art thread dump proguard mapping
+	elfDebugMappingKey        string // unified layout key for the ELF debug symbols
+	nativeMappingKey          string // unified layout key for the native shared library
+	nativeUAFMappingKey       string // unified layout key for the native shared library with the use after free
+	jsBundleMappingKey        string // unified layout key for the JS bundle
+	jsSourcemapMappingKey     string // unified layout key for the JS sourcemap
+	symbolicatorContainer     testcontainers.Container
+	minioContainer            testcontainers.Container
+	sentrySourceURL           string // URL for the Sentry source handler, reachable from symbolicator container
+	symboloaderOriginURL      string // origin (no path) of the same test HTTP server; used as the /symbols/js host
+	sentryListener            net.Listener
+	update                    = flag.Bool("update", false, "update golden files")
+	testdataDir               string
+)
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	ctx := context.Background()
+
+	// Resolve testdata directory
+	_, filename, _, _ := runtime.Caller(0)
+	testdataDir = filepath.Join(filepath.Dir(filename), "testdata")
+
+	// Override retry duration for faster tests
+	defaultRetryDuration = 1 * time.Second
+
+	// 1. Create shared Docker network
+	nw, err := network.New(ctx)
+	if err != nil {
+		fmt.Printf("failed to create docker network: %v\n", err)
+		os.Exit(1)
+	}
+
+	networkName := nw.Name
+
+	// 2. Start PostgreSQL via testinfra
+	pool, pgCleanup := testinfra.SetupPostgres(ctx)
+	pgPool = pool
+
+	// 3. Start MinIO
+	minioContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "pgsty/minio:RELEASE.2026-08-04T00-00-00Z",
+			ExposedPorts: []string{"9000/tcp"},
+			Env: map[string]string{
+				"MINIO_ROOT_USER":     "minioadmin",
+				"MINIO_ROOT_PASSWORD": "minioadmin",
+			},
+			Cmd:      []string{"server", "/data"},
+			Networks: []string{networkName},
+			NetworkAliases: map[string][]string{
+				networkName: {"minio"},
+			},
+			WaitingFor: wait.ForHTTP("/minio/health/live").WithPort("9000/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		fmt.Printf("failed to start minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	minioHost, _ := minioContainer.Host(ctx)
+	minioPort, _ := minioContainer.MappedPort(ctx, "9000/tcp")
+	minioEndpoint = fmt.Sprintf("http://%s:%s", minioHost, minioPort.Port())
+
+	// Create S3 client for MinIO
+	s3Client = s3.New(s3.Options{
+		BaseEndpoint: aws.String(minioEndpoint),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", ""),
+		UsePathStyle: true,
+	})
+
+	// A separate S3 client whose BaseEndpoint uses the docker
+	// network alias "minio:9000". Used solely to sign presigned
+	// URLs returned from the /symbols/js handler — those
+	// URLs are fetched by the symbolicator container, which
+	// can't reach the test host's mapped MinIO port.
+	s3InContainerClient = s3.New(s3.Options{
+		BaseEndpoint: aws.String("http://minio:9000"),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", ""),
+		UsePathStyle: true,
+	})
+
+	// Create symbols bucket
+	_, err = s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(symbolsBucket),
+	})
+	if err != nil {
+		fmt.Printf("failed to create bucket: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload proguard mapping file to MinIO
+	mappingBytes, err := os.ReadFile(filepath.Join(testdataDir, "mapping_basic.txt"))
+	if err != nil {
+		fmt.Printf("failed to read mapping_basic.txt: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Compute debug ID the same way symboloader does
+	ns := uuid.NewSHA1(uuid.NameSpaceDNS, []byte("guardsquare.com"))
+	debugUUID := uuid.NewSHA1(ns, mappingBytes)
+	basicProguardMappingKey = symbol.BuildUnifiedLayout(debugUUID.String()) + "/proguard"
+	basicProguardDebugID = symbol.MappingKeyToDebugId(symbol.BuildUnifiedLayout(debugUUID.String()))
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(basicProguardMappingKey),
+		Body:   bytes.NewReader(mappingBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload mapping to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload real-world proguard mapping (mapping_real.txt) to MinIO
+	realMappingBytes, err := os.ReadFile(filepath.Join(testdataDir, "mapping_real.txt"))
+	if err != nil {
+		fmt.Printf("failed to read mapping_real.txt: %v\n", err)
+		os.Exit(1)
+	}
+
+	realDebugUUID := uuid.NewSHA1(ns, realMappingBytes)
+	realProguardMappingKey = symbol.BuildUnifiedLayout(realDebugUUID.String()) + "/proguard"
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(realProguardMappingKey),
+		Body:   bytes.NewReader(realMappingBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload real mapping to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload the mapping matching the real ART thread dump fixture
+	artdumpMappingBytes, err := os.ReadFile(filepath.Join(testdataDir, "mapping_artdump.txt"))
+	if err != nil {
+		fmt.Printf("failed to read mapping_artdump.txt: %v\n", err)
+		os.Exit(1)
+	}
+
+	artdumpDebugUUID := uuid.NewSHA1(ns, artdumpMappingBytes)
+	artdumpProguardMappingKey = symbol.BuildUnifiedLayout(artdumpDebugUUID.String()) + "/proguard"
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(artdumpProguardMappingKey),
+		Body:   bytes.NewReader(artdumpMappingBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload art thread dump mapping to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload sqlite proguard mapping (mapping_sqlite.txt) to MinIO
+	sqliteMappingBytes, err := os.ReadFile(filepath.Join(testdataDir, "mapping_sqlite.txt"))
+	if err != nil {
+		fmt.Printf("failed to read mapping_sqlite.txt: %v\n", err)
+		os.Exit(1)
+	}
+
+	sqliteDebugUUID := uuid.NewSHA1(ns, sqliteMappingBytes)
+	sqliteProguardMappingKey = symbol.BuildUnifiedLayout(sqliteDebugUUID.String()) + "/proguard"
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(sqliteProguardMappingKey),
+		Body:   bytes.NewReader(sqliteMappingBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload sqlite mapping to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload Apple dSYM binary to MinIO
+	dsymBytes, err := os.ReadFile(filepath.Join(testdataDir, "DemoApp"))
+	if err != nil {
+		fmt.Printf("failed to read DemoApp dSYM: %v\n", err)
+		os.Exit(1)
+	}
+
+	dsymUUID := "58e1fac9-54f5-3cf2-945a-0f6f2e16786c"
+	dsymUnifiedPath := symbol.BuildUnifiedLayout(dsymUUID)
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(dsymUnifiedPath + "/debuginfo"),
+		Body:   bytes.NewReader(dsymBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload dSYM debuginfo to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	dsymMeta := []byte(`{"name":"DemoApp","arch":"arm64","file_format":"macho"}`)
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(dsymUnifiedPath + "/meta"),
+		Body:   bytes.NewReader(dsymMeta),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload dSYM meta to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload ELF debug symbols (Flutter/Dart) to MinIO
+	elfBytes, err := os.ReadFile(filepath.Join(testdataDir, "app.android-arm64.symbols"))
+	if err != nil {
+		fmt.Printf("failed to read ELF symbols: %v\n", err)
+		os.Exit(1)
+	}
+
+	elfBuildID := "ea47d982ecc4473f2a94b949fe4b9166"
+	elfUnifiedPath := symbol.BuildUnifiedLayout(elfBuildID)
+	elfDebugMappingKey = elfUnifiedPath + "/debuginfo"
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(elfUnifiedPath + "/debuginfo"),
+		Body:   bytes.NewReader(elfBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload ELF debuginfo to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	elfMeta := []byte(`{"name":"app.android-arm64.symbols","arch":"arm64","file_format":"elf"}`)
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(elfUnifiedPath + "/meta"),
+		Body:   bytes.NewReader(elfMeta),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload ELF meta to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Upload unstripped native shared libraries to MinIO, keyed
+	// by their full 20 byte GNU build ID as symboloader stores them.
+	nativeMappingKey = uploadNativeLibrary(ctx, s3Client, "libfrank_crash.so")
+	nativeUAFMappingKey = uploadNativeLibrary(ctx, s3Client, "libfrank_crash_uaf.so")
+
+	// Upload React Native JS bundle + sourcemap to MinIO. Keys
+	// mirror what ExtractJsBundle now produces: unified layout
+	// derived from a SHA1 of the *file contents*, with the
+	// original inner filename as the last path segment.
+	jsBundleBytes, err := os.ReadFile(filepath.Join(testdataDir, "main.jsbundle"))
+	if err != nil {
+		fmt.Printf("failed to read main.jsbundle: %v\n", err)
+		os.Exit(1)
+	}
+	jsMapBytes, err := os.ReadFile(filepath.Join(testdataDir, "main.jsbundle.map"))
+	if err != nil {
+		fmt.Printf("failed to read main.jsbundle.map: %v\n", err)
+		os.Exit(1)
+	}
+
+	jsNS := uuid.NewSHA1(uuid.NameSpaceDNS, []byte("measure.sh"))
+	jsBundleID := uuid.NewSHA1(jsNS, jsBundleBytes)
+	jsMapID := uuid.NewSHA1(jsNS, jsMapBytes)
+	jsBundleMappingKey = symbol.BuildUnifiedLayout(jsBundleID.String()) + "/main.jsbundle"
+	jsSourcemapMappingKey = symbol.BuildUnifiedLayout(jsMapID.String()) + "/main.jsbundle.map"
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(jsBundleMappingKey),
+		Body:   bytes.NewReader(jsBundleBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload js bundle to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(symbolsBucket),
+		Key:    aws.String(jsSourcemapMappingKey),
+		Body:   bytes.NewReader(jsMapBytes),
+	})
+	if err != nil {
+		fmt.Printf("failed to upload js sourcemap to minio: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 4. Start Sentry source HTTP handler (serves ProGuard files from MinIO)
+	sentryMux := http.NewServeMux()
+	sentryMux.HandleFunc("/symbols", func(w http.ResponseWriter, r *http.Request) {
+		debugID := r.URL.Query().Get("debug_id")
+		fileID := r.URL.Query().Get("id")
+
+		if debugID != "" {
+			// List mode: check if proguard file exists for this debug ID
+			key := symbol.BuildUnifiedLayout(debugID) + "/proguard"
+			_, err := s3Client.HeadObject(r.Context(), &s3.HeadObjectInput{
+				Bucket: aws.String(symbolsBucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte("[]"))
+				return
+			}
+			type sentryFile struct {
+				ID         string `json:"id"`
+				SymbolType string `json:"symbolType"`
+			}
+			resp, _ := json.Marshal([]sentryFile{{ID: key, SymbolType: "proguard"}})
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(resp)
+		} else if fileID != "" {
+			// Download mode: fetch file from MinIO
+			output, err := s3Client.GetObject(r.Context(), &s3.GetObjectInput{
+				Bucket: aws.String(symbolsBucket),
+				Key:    aws.String(fileID),
+			})
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			defer output.Body.Close()
+			io.Copy(w, output.Body)
+		}
+	})
+
+	// /symbols/js serves the Sentry-compatible artifact-lookup
+	// protocol that Symbolicator's JS code path queries. This is
+	// an in-process replica of backend/symboloader/symbolsjs.go's
+	// URL-fallback path (non-OTA): given app_id + version_name +
+	// version_code + url=, return file entries pointing at presigned
+	// GETs against MinIO. The patch_id (OTA) branch is intentionally
+	// short-circuited to [] — this test exercises the non-OTA flow.
+	sentryMux.HandleFunc("/symbols/js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		q := r.URL.Query()
+		debugIDs := q["debug_id"]
+		appIDStr := q.Get("app_id")
+		versionName := q.Get("version_name")
+		versionCode := q.Get("version_code")
+		urls := q["url"]
+
+		if len(debugIDs) > 0 {
+			// OTA path not exercised by this test.
+			w.Write([]byte("[]"))
+			return
+		}
+
+		if appIDStr == "" || versionName == "" || versionCode == "" || len(urls) == 0 {
+			w.Write([]byte("[]"))
+			return
+		}
+
+		rows, qerr := pgPool.Query(r.Context(),
+			`SELECT key FROM build_mappings WHERE app_id=$1 AND version_name=$2 AND version_code=$3 AND mapping_type=$4 ORDER BY last_updated DESC`,
+			appIDStr, versionName, versionCode, symbol.TypeJsBundle.String())
+		if qerr != nil {
+			http.Error(w, qerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		byFilename := make(map[string]string)
+		for rows.Next() {
+			var key string
+			if scanErr := rows.Scan(&key); scanErr != nil {
+				http.Error(w, scanErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			filename := path.Base(key)
+			if _, exists := byFilename[filename]; !exists {
+				byFilename[filename] = key
+			}
+		}
+
+		type lookupFile struct {
+			Type         string            `json:"type"`
+			ID           string            `json:"id"`
+			URL          string            `json:"url"`
+			AbsPath      string            `json:"abs_path"`
+			Headers      map[string]string `json:"headers"`
+			ResolvedWith string            `json:"resolved_with"`
+		}
+
+		presigner := s3.NewPresignClient(s3InContainerClient)
+		results := []lookupFile{}
+		seen := make(map[string]bool)
+
+		for _, u := range urls {
+			bundleFilename := strings.TrimPrefix(u, "/")
+			if bundleFilename == "" {
+				continue
+			}
+			sourcemapFilename := bundleFilename + ".map"
+
+			bundleKey := byFilename[bundleFilename]
+			sourcemapKey := byFilename[sourcemapFilename]
+			if bundleKey == "" && sourcemapKey == "" {
+				continue
+			}
+
+			sig := bundleKey + "|" + sourcemapKey
+			if seen[sig] {
+				continue
+			}
+			seen[sig] = true
+
+			if bundleKey != "" {
+				req, perr := presigner.PresignGetObject(r.Context(), &s3.GetObjectInput{
+					Bucket: aws.String(symbolsBucket),
+					Key:    aws.String(bundleKey),
+				}, s3.WithPresignExpires(5*time.Minute))
+				if perr == nil {
+					headers := map[string]string{}
+					if sourcemapKey != "" {
+						headers["Sourcemap"] = sourcemapFilename
+					}
+					results = append(results, lookupFile{
+						Type:         "file",
+						ID:           bundleKey,
+						URL:          req.URL,
+						AbsPath:      "~/" + bundleFilename,
+						Headers:      headers,
+						ResolvedWith: "release",
+					})
+				}
+			}
+
+			if sourcemapKey != "" {
+				req, perr := presigner.PresignGetObject(r.Context(), &s3.GetObjectInput{
+					Bucket: aws.String(symbolsBucket),
+					Key:    aws.String(sourcemapKey),
+				}, s3.WithPresignExpires(5*time.Minute))
+				if perr == nil {
+					results = append(results, lookupFile{
+						Type:         "file",
+						ID:           sourcemapKey,
+						URL:          req.URL,
+						AbsPath:      "~/" + sourcemapFilename,
+						Headers:      map[string]string{},
+						ResolvedWith: "release",
+					})
+				}
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(results)
+	})
+
+	sentryListener, err = net.Listen("tcp", ":0")
+	if err != nil {
+		fmt.Printf("failed to start sentry source listener: %v\n", err)
+		os.Exit(1)
+	}
+	sentryPort := sentryListener.Addr().(*net.TCPAddr).Port
+	go http.Serve(sentryListener, sentryMux)
+
+	// The Sentry source URL must be reachable from inside the symbolicator
+	// container. host.docker.internal resolves to the host on Docker Desktop
+	// (macOS/Windows). The HostConfigModifier below adds the mapping for Linux.
+	sentrySourceURL = fmt.Sprintf("http://host.docker.internal:%d/symbols", sentryPort)
+	symboloaderOriginURL = fmt.Sprintf("http://host.docker.internal:%d", sentryPort)
+
+	// 5. Start Symbolicator
+	configPath := filepath.Join(testdataDir, "symbolicator.yml")
+	symbolicatorContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        symbolicatorImage,
+			ExposedPorts: []string{"3021/tcp"},
+			Files: []testcontainers.ContainerFile{
+				{
+					HostFilePath:      configPath,
+					ContainerFilePath: "/etc/symbolicator/config.yml",
+					FileMode:          0o444,
+				},
+			},
+			Cmd:      []string{"run", "-c", "/etc/symbolicator/config.yml"},
+			Networks: []string{networkName},
+			NetworkAliases: map[string][]string{
+				networkName: {"symbolicator"},
+			},
+			HostConfigModifier: func(hc *container.HostConfig) {
+				hc.ExtraHosts = append(hc.ExtraHosts, "host.docker.internal:host-gateway")
+			},
+			WaitingFor: wait.ForHTTP("/healthcheck").WithPort("3021/tcp").WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		fmt.Printf("failed to start symbolicator: %v\n", err)
+		os.Exit(1)
+	}
+
+	symbolicatorHost, _ := symbolicatorContainer.Host(ctx)
+	symbolicatorPort, _ := symbolicatorContainer.MappedPort(ctx, "3021/tcp")
+	symbolicatorOrigin = fmt.Sprintf("http://%s:%s", symbolicatorHost, symbolicatorPort.Port())
+
+	// Run tests, then clean up explicitly before exiting.
+	// os.Exit skips defers, so cleanup must happen before the call.
+	code := m.Run()
+
+	symbolicatorContainer.Terminate(ctx)
+	minioContainer.Terminate(ctx)
+	sentryListener.Close()
+	pgCleanup()
+	nw.Remove(ctx)
+
+	os.Exit(code)
+}
+
+// seedApp creates a team and app in Postgres for testing.
+func seedApp(ctx context.Context, t *testing.T, appID uuid.UUID) {
+	t.Helper()
+	teamID := uuid.New()
+	now := time.Now()
+
+	_, err := pgPool.Exec(ctx,
+		`INSERT INTO teams (id, name, created_at, updated_at) VALUES ($1, $2, $3, $4)`,
+		teamID, "test-team", now, now)
+	if err != nil {
+		t.Fatalf("seed team: %v", err)
+	}
+
+	_, err = pgPool.Exec(ctx,
+		`INSERT INTO apps (id, team_id, app_name, unique_identifier, os_names, first_version, onboarded, onboarded_at, retention, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		appID, teamID, "test-app", "sh.measure.test", []string{"android"}, "1.0.0", true, now, 90, now, now)
+	if err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+}
+
+// seedBuildMappingRow inserts a build mapping row in Postgres.
+// It does not upload the mapping file object itself.
+func seedBuildMappingRow(ctx context.Context, t *testing.T, appID uuid.UUID, versionName, versionCode, mappingType, key string) {
+	t.Helper()
+	now := time.Now()
+
+	_, err := pgPool.Exec(ctx,
+		`INSERT INTO build_mappings (id, app_id, version_name, version_code, mapping_type, key, location, fnv1_hash, file_size, last_updated) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		uuid.New(), appID, versionName, versionCode, mappingType, key, "s3://"+symbolsBucket+"/"+key, "0000000000000000", 100, now)
+	if err != nil {
+		t.Fatalf("seed build mapping: %v", err)
+	}
+}
+
+// newS3Source creates an S3 source for Android that points to the MinIO
+// instance. The Region field uses the Docker network alias so the
+// symbolicator container can reach MinIO.
+func newS3Source() Source {
+	return NewS3SourceAndroid(
+		"test-source",
+		symbolsBucket,
+		"us-east-1",
+		"http://minio:9000", // Docker network alias
+		"minioadmin",
+		"minioadmin",
+	)
+}
+
+// newSentrySource creates a Sentry source pointing to the test HTTP handler.
+func newSentrySource() SentrySource {
+	return NewSentrySource("test-sentry-source", sentrySourceURL, "test-token")
+}
+
+// makeJVMExceptionEvents creates EventField entries with obfuscated
+// class/method names that match the test mapping.txt.
+func makeJVMExceptionEvents(versionName, versionCode string) []event.EventField {
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			Exception: &event.Exception{
+				Handled: false,
+				Exceptions: event.ExceptionUnits{
+					{
+						Type:    "java.lang.IllegalStateException",
+						Message: "Test exception",
+						Frames: event.Frames{
+							{
+								LineNum:    29,
+								ClassName:  "a.b.c",
+								MethodName: "d",
+								FileName:   "SourceFile",
+							},
+							{
+								LineNum:    7506,
+								ClassName:  "android.view.View",
+								MethodName: "performClick",
+								FileName:   "View.java",
+							},
+						},
+					},
+				},
+				Threads: event.Threads{
+					{
+						Name: "Thread-2",
+						Frames: event.Frames{
+							{
+								LineNum:    102,
+								ClassName:  "f.g",
+								MethodName: "h",
+								FileName:   "SourceFile",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// makeJVMANREvents creates EventField entries with obfuscated ANR events.
+func makeJVMANREvents(versionName, versionCode string) []event.EventField {
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeANR,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			ANR: &event.ANR{
+				Handled: false,
+				Exceptions: event.ExceptionUnits{
+					{
+						Type:    "java.lang.RuntimeException",
+						Message: "ANR detected",
+						Frames: event.Frames{
+							{
+								LineNum:    50,
+								ClassName:  "i.j",
+								MethodName: "k",
+								FileName:   "SourceFile",
+							},
+							{
+								LineNum:    -2,
+								ClassName:  "java.lang.Thread",
+								MethodName: "sleep",
+								FileName:   "Thread.java",
+							},
+						},
+					},
+				},
+				Threads: event.Threads{
+					{
+						Name: "main",
+						Frames: event.Frames{
+							{
+								LineNum:    29,
+								ClassName:  "a.b.c",
+								MethodName: "d",
+								FileName:   "SourceFile",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// makeJVMLifecycleEvents creates lifecycle + launch + app_exit events
+// with obfuscated class names.
+func makeJVMLifecycleEvents(versionName, versionCode string) []event.EventField {
+	attr := event.Attribute{
+		AppVersion: versionName,
+		AppBuild:   versionCode,
+		OSName:     "android",
+	}
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeLifecycleActivity,
+			Attribute: attr,
+			LifecycleActivity: &event.LifecycleActivity{
+				Type:      "created",
+				ClassName: "a.b.c",
+			},
+		},
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeLifecycleFragment,
+			Attribute: attr,
+			LifecycleFragment: &event.LifecycleFragment{
+				Type:           "attached",
+				ClassName:      "q.r",
+				ParentActivity: "a.b.c",
+			},
+		},
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeColdLaunch,
+			Attribute: attr,
+			ColdLaunch: &event.ColdLaunch{
+				LaunchedActivity: "o.p",
+				OnNextDrawUptime: 1000,
+			},
+		},
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeHotLaunch,
+			Attribute: attr,
+			HotLaunch: &event.HotLaunch{
+				LaunchedActivity: "l.m",
+				OnNextDrawUptime: 500,
+			},
+		},
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeAppExit,
+			Attribute: attr,
+			AppExit: &event.AppExit{
+				Reason:      "CRASH",
+				Importance:  "FOREGROUND",
+				Trace:       "a.b.c",
+				ProcessName: "sh.measure.test",
+				PID:         "12345",
+			},
+		},
+	}
+}
+
+// extractSymbolicatedFields extracts only the fields that symbolication
+// modifies, for golden file comparison. This avoids issues with
+// non-deterministic fields like UUID, timestamps, etc.
+type symbolicatedResult struct {
+	Type string `json:"type"`
+	// Exception fields
+	ExceptionTypes  []string        `json:"exception_types,omitempty"`
+	ExceptionFrames [][]goldenFrame `json:"exception_frames,omitempty"`
+	ThreadFrames    [][]goldenFrame `json:"thread_frames,omitempty"`
+	// Lifecycle fields
+	ClassName        string `json:"class_name,omitempty"`
+	ParentActivity   string `json:"parent_activity,omitempty"`
+	ParentFragment   string `json:"parent_fragment,omitempty"`
+	LaunchedActivity string `json:"launched_activity,omitempty"`
+	Trace            string `json:"trace,omitempty"`
+}
+
+type goldenFrame struct {
+	ClassName  string `json:"class_name"`
+	MethodName string `json:"method_name"`
+	FileName   string `json:"file_name"`
+	LineNum    int    `json:"line_num"`
+	// ColNum is meaningful only for JS frames. omitempty keeps
+	// existing JVM / Apple / Dart golden files byte-identical.
+	ColNum int `json:"col_num,omitempty"`
+}
+
+func extractResult(events []event.EventField) []symbolicatedResult {
+	results := make([]symbolicatedResult, 0, len(events))
+	for _, ev := range events {
+		r := symbolicatedResult{Type: ev.Type}
+		switch ev.Type {
+		case event.TypeException:
+			for _, exc := range ev.Exception.Exceptions {
+				r.ExceptionTypes = append(r.ExceptionTypes, exc.Type)
+				frames := make([]goldenFrame, 0, len(exc.Frames))
+				for _, f := range exc.Frames {
+					frames = append(frames, goldenFrame{
+						ClassName:  f.ClassName,
+						MethodName: f.MethodName,
+						FileName:   f.FileName,
+						LineNum:    f.LineNum,
+						ColNum:     f.ColNum,
+					})
+				}
+				r.ExceptionFrames = append(r.ExceptionFrames, frames)
+			}
+			for _, th := range ev.Exception.Threads {
+				frames := make([]goldenFrame, 0, len(th.Frames))
+				for _, f := range th.Frames {
+					frames = append(frames, goldenFrame{
+						ClassName:  f.ClassName,
+						MethodName: f.MethodName,
+						FileName:   f.FileName,
+						LineNum:    f.LineNum,
+						ColNum:     f.ColNum,
+					})
+				}
+				r.ThreadFrames = append(r.ThreadFrames, frames)
+			}
+		case event.TypeANR:
+			for _, exc := range ev.ANR.Exceptions {
+				r.ExceptionTypes = append(r.ExceptionTypes, exc.Type)
+				frames := make([]goldenFrame, 0, len(exc.Frames))
+				for _, f := range exc.Frames {
+					frames = append(frames, goldenFrame{
+						ClassName:  f.ClassName,
+						MethodName: f.MethodName,
+						FileName:   f.FileName,
+						LineNum:    f.LineNum,
+						ColNum:     f.ColNum,
+					})
+				}
+				r.ExceptionFrames = append(r.ExceptionFrames, frames)
+			}
+			for _, th := range ev.ANR.Threads {
+				frames := make([]goldenFrame, 0, len(th.Frames))
+				for _, f := range th.Frames {
+					frames = append(frames, goldenFrame{
+						ClassName:  f.ClassName,
+						MethodName: f.MethodName,
+						FileName:   f.FileName,
+						LineNum:    f.LineNum,
+						ColNum:     f.ColNum,
+					})
+				}
+				r.ThreadFrames = append(r.ThreadFrames, frames)
+			}
+		case event.TypeLifecycleActivity:
+			r.ClassName = ev.LifecycleActivity.ClassName
+		case event.TypeLifecycleFragment:
+			r.ClassName = ev.LifecycleFragment.ClassName
+			r.ParentActivity = ev.LifecycleFragment.ParentActivity
+			r.ParentFragment = ev.LifecycleFragment.ParentFragment
+		case event.TypeColdLaunch:
+			r.LaunchedActivity = ev.ColdLaunch.LaunchedActivity
+		case event.TypeWarmLaunch:
+			r.LaunchedActivity = ev.WarmLaunch.LaunchedActivity
+		case event.TypeHotLaunch:
+			r.LaunchedActivity = ev.HotLaunch.LaunchedActivity
+		case event.TypeAppExit:
+			r.Trace = ev.AppExit.Trace
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
+func assertStacktraceMatchesGolden(t *testing.T, goldenFile string, got string) {
+	t.Helper()
+
+	goldenPath := filepath.Join(testdataDir, goldenFile)
+
+	if *update {
+		if err := os.WriteFile(goldenPath, []byte(got), 0o644); err != nil {
+			t.Fatalf("update golden file: %v", err)
+		}
+		t.Logf("updated golden file: %s", goldenPath)
+		return
+	}
+
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (run with -update to generate)", goldenFile, err)
+	}
+
+	if got != string(want) {
+		t.Errorf("stacktrace does not match golden file %s\n\ngot:\n%s\n\nwant:\n%s", goldenFile, got, string(want))
+	}
+}
+
+func assertMatchesGolden(t *testing.T, goldenFile string, results []symbolicatedResult) {
+	t.Helper()
+
+	got, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal results: %v", err)
+	}
+
+	goldenPath := filepath.Join(testdataDir, goldenFile)
+
+	if *update {
+		if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
+			t.Fatalf("update golden file: %v", err)
+		}
+		t.Logf("updated golden file: %s", goldenPath)
+		return
+	}
+
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (run with -update to generate)", goldenFile, err)
+	}
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("symbolication output does not match golden file %s\n\ngot:\n%s\n\nwant:\n%s", goldenFile, string(got), string(want))
+	}
+}
+
+func TestJVMExceptionSymbolicationBasic(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0.0"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	events := makeJVMExceptionEvents(versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_exception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "jvm_exception_stacktrace_golden.txt", stacktrace)
+}
+
+func TestJVMANRSymbolicationBasic(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0.0"
+	versionCode := "2"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	events := makeJVMANREvents(versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_anr_golden.json", results)
+
+	stacktrace := events[0].ANR.Stacktrace()
+	assertStacktraceMatchesGolden(t, "jvm_anr_stacktrace_golden.txt", stacktrace)
+}
+
+func TestJVMLifecycleSymbolicationBasic(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0.0"
+	versionCode := "3"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	events := makeJVMLifecycleEvents(versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_lifecycle_golden.json", results)
+}
+
+func TestSymbolicationNoMapping(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "99.0.0"
+	versionCode := "99"
+
+	seedApp(ctx, t, appID)
+	// No build mapping seeded - version has no mapping file
+
+	events := makeJVMExceptionEvents(versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	// Save original class names
+	origClassName := events[0].Exception.Exceptions[0].Frames[0].ClassName
+	origMethodName := events[0].Exception.Exceptions[0].Frames[0].MethodName
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	// Events should be unchanged
+	if events[0].Exception.Exceptions[0].Frames[0].ClassName != origClassName {
+		t.Errorf("expected class name to remain %q, got %q", origClassName, events[0].Exception.Exceptions[0].Frames[0].ClassName)
+	}
+	if events[0].Exception.Exceptions[0].Frames[0].MethodName != origMethodName {
+		t.Errorf("expected method name to remain %q, got %q", origMethodName, events[0].Exception.Exceptions[0].Frames[0].MethodName)
+	}
+}
+
+func TestSymbolicationNonSymbolicatableEvents(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0.0"
+	versionCode := "4"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	// Create a gesture_click event - should not be symbolicated
+	events := []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeGestureClick,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			GestureClick: &event.GestureClick{
+				Target:   "a.b.c",
+				TargetID: "button1",
+			},
+		},
+	}
+
+	origTarget := events[0].GestureClick.Target
+
+	sources := []Source{newS3Source()}
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	// Event should be unchanged
+	if events[0].GestureClick.Target != origTarget {
+		t.Errorf("expected target to remain %q, got %q", origTarget, events[0].GestureClick.Target)
+	}
+}
+
+// newS3SourceApple creates an S3 source for Apple that points to the MinIO
+// instance via the Docker network alias.
+func newS3SourceApple() Source {
+	return NewS3SourceApple(
+		"test-source-apple",
+		symbolsBucket,
+		"us-east-1",
+		"http://minio:9000",
+		"minioadmin",
+		"minioadmin",
+	)
+}
+
+// makeAppleExceptionEvents loads an Apple exception fixture from JSON
+// and wraps it into an EventField slice.
+func makeAppleExceptionEvents(t *testing.T, fixture, versionName, versionCode string) []event.EventField {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(testdataDir, fixture))
+	if err != nil {
+		t.Fatalf("read apple fixture: %v", err)
+	}
+
+	var exception event.Exception
+	if err := json.Unmarshal(data, &exception); err != nil {
+		t.Fatalf("unmarshal apple fixture: %v", err)
+	}
+
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion:    versionName,
+				AppBuild:      versionCode,
+				OSName:        "ios",
+				OSVersion:     "26.0",
+				DeviceCPUArch: "arm64",
+			},
+			Exception: &exception,
+		},
+	}
+}
+
+func TestAppleExceptionSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0"
+	versionCode := "1"
+
+	// Apple symbolication bypasses DB lookup, but we still need a
+	// valid app for the Symbolicate() call signature.
+	seedApp(ctx, t, appID)
+
+	events := makeAppleExceptionEvents(t, "apple_abort_input.json", versionName, versionCode)
+	sources := []Source{newS3SourceApple()}
+
+	symb := New(symbolicatorOrigin, "ios", sources, nil)
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "apple_exception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "apple_exception_stacktrace_golden.txt", stacktrace)
+}
+
+func TestAppleNSExceptionSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+
+	events := makeAppleExceptionEvents(t, "apple_nsexception_input.json", versionName, versionCode)
+	sources := []Source{newS3SourceApple()}
+
+	symb := New(symbolicatorOrigin, "ios", sources, nil)
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "apple_nsexception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "apple_nsexception_stacktrace_golden.txt", stacktrace)
+}
+
+// makeDartExceptionEvents loads a Dart/Flutter exception fixture from the
+// full event JSON and wraps it into an EventField slice.
+func makeDartExceptionEvents(t *testing.T, versionName, versionCode string) []event.EventField {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(testdataDir, "flutter_input.json"))
+	if err != nil {
+		t.Fatalf("read flutter fixture: %v", err)
+	}
+
+	// The flutter input is a full event JSON; extract just the exception.
+	var raw struct {
+		Exception event.Exception `json:"exception"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal flutter fixture: %v", err)
+	}
+
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			Exception: &raw.Exception,
+		},
+	}
+}
+
+func TestDartExceptionSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.4.0"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "elf_debug", elfDebugMappingKey)
+
+	events := makeDartExceptionEvents(t, versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, nil)
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "dart_exception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "dart_exception_stacktrace_golden.txt", stacktrace)
+}
+
+// uploadNativeLibrary uploads an unstripped native shared library and its
+// meta to MinIO, and returns the library's mapping key.
+func uploadNativeLibrary(ctx context.Context, s3Client *s3.Client, file string) string {
+	ndkBytes, err := os.ReadFile(filepath.Join(testdataDir, file))
+	if err != nil {
+		fmt.Printf("failed to read native library: %v\n", err)
+		os.Exit(1)
+	}
+
+	ndkBuildID, err := symbol.GetBuildIDFromELF(ndkBytes)
+	if err != nil {
+		fmt.Printf("failed to read native library build ID: %v\n", err)
+		os.Exit(1)
+	}
+	ndkUnifiedPath := symbol.BuildUnifiedLayout(ndkBuildID)
+	meta := fmt.Sprintf(`{"name":"arm64-v8a/%s.gz","arch":"arm64","file_format":"elf"}`, file)
+
+	for key, body := range map[string][]byte{
+		ndkUnifiedPath + "/debuginfo": ndkBytes,
+		ndkUnifiedPath + "/meta":      []byte(meta),
+	} {
+		_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(symbolsBucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(body),
+		})
+		if err != nil {
+			fmt.Printf("failed to upload native library to minio: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	return ndkUnifiedPath + "/debuginfo"
+}
+
+// makeNativeCrashEvents loads a native crash fixture as an
+// event for the given app version.
+func makeNativeCrashEvents(t *testing.T, fixture, versionName, versionCode string) []event.EventField {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(testdataDir, fixture))
+	if err != nil {
+		t.Fatalf("read native crash fixture: %v", err)
+	}
+
+	var raw struct {
+		Exception event.Exception `json:"exception"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal native crash fixture: %v", err)
+	}
+
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			Exception: &raw.Exception,
+		},
+	}
+}
+
+func TestNativeCrashSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.1.0"
+	versionCode := "5524"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "elf_debug", nativeMappingKey)
+
+	events := makeNativeCrashEvents(t, "ndk_sigsegv_input.json", versionName, versionCode)
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, nil)
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	assertStacktraceMatchesGolden(t, "ndk_sigsegv_stacktrace_golden.txt", events[0].Exception.Stacktrace())
+}
+
+// shiftNativeImage moves a native crash's app library to a new
+// load address, as a second crashed process would load it.
+func shiftNativeImage(t *testing.T, ev event.EventField, delta uint64) {
+	t.Helper()
+	shift := func(hex string) string {
+		value, err := strconv.ParseUint(strings.TrimPrefix(hex, "0x"), 16, 64)
+		if err != nil {
+			t.Fatalf("parse address %q: %v", hex, err)
+		}
+		return "0x" + strconv.FormatUint(value+delta, 16)
+	}
+	for i := range ev.Exception.Exceptions[0].Frames {
+		frame := &ev.Exception.Exceptions[0].Frames[i]
+		if frame.FrameiOS != nil && frame.BinaryName == "libfrank_crash.so" {
+			frame.InstructionAddr = shift(frame.InstructionAddr)
+			frame.BinaryAddress = shift(frame.BinaryAddress)
+		}
+	}
+	for i := range ev.Exception.BinaryImages {
+		image := &ev.Exception.BinaryImages[i]
+		if image.Name == "libfrank_crash.so" {
+			image.BaseAddr = shift(image.BaseAddr)
+			image.StartAddr = shift(image.StartAddr)
+			image.EndAddr = shift(image.EndAddr)
+		}
+	}
+}
+
+func TestNativeCrashSymbolicationBatch(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.1.0"
+	versionCode := "5524"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "elf_debug", nativeMappingKey)
+
+	first := makeNativeCrashEvents(t, "ndk_sigsegv_input.json", versionName, versionCode)
+	second := makeNativeCrashEvents(t, "ndk_sigsegv_input.json", versionName, versionCode)
+	shiftNativeImage(t, second[0], 0x1000000)
+	events := append(first, second...)
+
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, nil)
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	for i, ev := range events {
+		if got := ev.Exception.Exceptions[0].Frames[0].MethodName; got != "write_through_null" {
+			t.Errorf("event %d: expected the crashing frame to be symbolicated, got %q", i, got)
+		}
+	}
+}
+
+func TestNativeMemoryErrorSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.1.0"
+	versionCode := "5524"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "elf_debug", nativeUAFMappingKey)
+
+	events := makeNativeCrashEvents(t, "ndk_gwp_asan_input.json", versionName, versionCode)
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, nil)
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	assertStacktraceMatchesGolden(t, "ndk_gwp_asan_stacktrace_golden.txt", events[0].Exception.Stacktrace())
+
+	report := events[0].Exception.MemoryError
+	wantDeallocation := "#02 pc 0x0000000000000b5c  libfrank_crash.so (use_after_free) (native_crash.c:48)"
+	if got := event.NativeStackLines(report.Deallocation.Frames); got[2] != wantDeallocation {
+		t.Errorf("want deallocation frame %q, got %q", wantDeallocation, got[2])
+	}
+	wantAllocation := "#04 pc 0x0000000000000b50  libfrank_crash.so (use_after_free) (native_crash.c:47)"
+	if got := event.NativeStackLines(report.Allocation.Frames); got[4] != wantAllocation {
+		t.Errorf("want allocation frame %q, got %q", wantAllocation, got[4])
+	}
+}
+
+// makeJVMRealEvents loads a real-world JVM exception fixture from
+// the full event JSON and wraps it into an EventField slice.
+func makeJVMRealEvents(t *testing.T, fixture, versionName, versionCode string) []event.EventField {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(testdataDir, fixture))
+	if err != nil {
+		t.Fatalf("read jvm fixture: %v", err)
+	}
+
+	var raw struct {
+		Exception event.Exception `json:"exception"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal jvm fixture: %v", err)
+	}
+
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			Exception: &raw.Exception,
+		},
+	}
+}
+
+func TestJVMSingleExceptionReal(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.18.0-SNAPSHOT"
+	versionCode := "3987"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", realProguardMappingKey)
+
+	events := makeJVMRealEvents(t, "jvm_single_input.json", versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	// Enable lambda workaround to match production behavior where
+	// SyntheticLambda class names are rewritten from the Classes map.
+	symb.jvmLambdaWorkaround = true
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_single_exception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "jvm_single_exception_stacktrace_golden.txt", stacktrace)
+}
+
+func TestJVMNestedExceptionReal(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.18.0-SNAPSHOT"
+	versionCode := "3987"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", realProguardMappingKey)
+
+	events := makeJVMRealEvents(t, "jvm_nested_input.json", versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	symb.jvmLambdaWorkaround = true
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_nested_exception_golden.json", results)
+
+	stacktrace := events[0].Exception.Stacktrace()
+	assertStacktraceMatchesGolden(t, "jvm_nested_exception_stacktrace_golden.txt", stacktrace)
+}
+
+func TestJVMSQLiteExceptionReal(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "2.0.0"
+	versionCode := "200"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", sqliteProguardMappingKey)
+
+	events := makeJVMRealEvents(t, "jvm_sqlite_input.json", versionName, versionCode)
+	sources := []Source{newS3Source()}
+
+	symb := New(symbolicatorOrigin, "android", sources, []SentrySource{newSentrySource()})
+	err := symb.Symbolicate(ctx, pgPool, appID, events, nil)
+	if err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "jvm_sqlite_exception_golden.json", results)
+}
+
+// makeJSExceptionEvents loads a React Native / JS exception
+// fixture from the full event JSON and wraps it into an
+// EventField slice. The fixture's exception.framework must be
+// "js" for the symbolicator to route it through the JS path.
+func makeJSExceptionEvents(t *testing.T, fixture, versionName, versionCode, osName string) []event.EventField {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(testdataDir, fixture))
+	if err != nil {
+		t.Fatalf("read js fixture: %v", err)
+	}
+
+	var raw struct {
+		Exception event.Exception `json:"exception"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal js fixture: %v", err)
+	}
+
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeException,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     osName,
+			},
+			Exception: &raw.Exception,
+		},
+	}
+}
+
+// TestJSExceptionSymbolicationNonOTA exercises the URL-fallback
+// (non-patch_id) path end-to-end:
+//
+//   - Two build_mappings rows are seeded: one for the bundle
+//     and one for the sourcemap. patch_id is left NULL.
+//   - The ingest-worker symbolicator constructs a /symbolicate-js
+//     request with an empty modules array and a synthesized
+//     `release` of "<version_name>+<version_code>". That release
+//     value unlocks Symbolicator's URL-fallback path
+//     (lookup.rs::query_sentry_for_files short-circuits when
+//     release.is_none()).
+//   - Symbolicator queries our /symbols/js handler with
+//     ?app_id=&version_name=&version_code=&url=/main.jsbundle.
+//     The handler resolves the bundle + sourcemap rows and
+//     returns file entries with abs_path that match the frame's
+//     URL candidates (`~/main.jsbundle`, `~/main.jsbundle.map`).
+//   - Symbolicator fetches both via presigned MinIO URLs,
+//     resolves frame positions through the sourcemap, and our
+//     rewriteException pass copies the resolved positions back
+//     into the event frames.
+//
+// The test requires real fixture files in testdata/:
+//   - main.jsbundle       (the minified RN bundle)
+//   - main.jsbundle.map   (its sourcemap)
+//   - rn_ios_input.json   (the exception event payload)
+//
+// First run requires -update to write the golden file.
+func TestJSExceptionSymbolicationNonOTA(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "1.0"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, symbol.TypeJsBundle.String(), jsBundleMappingKey)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, symbol.TypeJsBundle.String(), jsSourcemapMappingKey)
+
+	events := makeJSExceptionEvents(t, "rn_ios_input.json", versionName, versionCode, "ios")
+
+	// JS path does not consume the Symbolicator-level sources
+	// array or sentry sources — its single source is built from
+	// SymboloaderOrigin inside configureSource. Pass nils.
+	symb := New(symbolicatorOrigin, "ios", nil, nil)
+	symb.SymboloaderOrigin = symboloaderOriginURL
+	// Mirror the self-host wire shape: the static placeholder
+	// bearer. The test symboloader does not validate it.
+	symb.SymboloaderToken = "measure"
+
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	results := extractResult(events)
+	assertMatchesGolden(t, "rn_ios_exception_golden.json", results)
+}
+
+// artDumpFixture is the parser package's real API 33 capture, the only
+// dump with a matching real mapping.
+const artDumpFixture = "../../libs/artdump/testdata/api33_idle_main.txt"
+
+// obfuscatedDumpClasses are every obfuscated class the fixture's managed
+// frames reference. None of them may survive symbolication.
+var obfuscatedDumpClasses = []string{"B0.x", "L0.b", "L0.h", "O.d", "U0.m", "X0.p"}
+
+// deobfuscatedDumpClasses are classes the mapping resolves those frames
+// to. R8 maps a frame by its method and line rather than by its class,
+// so these are not what the mapping's class lines alone would suggest:
+// B0.x, O.d and U0.m all resolve into the exporter.
+var deobfuscatedDumpClasses = []string{
+	"okio.Buffer",
+	"okio.RealBufferedSink",
+	"sh.measure.android.exporter.NetworkClientImpl",
+	"sh.measure.android.exporter.HttpUrlConnectionClient",
+	"sh.measure.android.exporter.ExporterImpl",
+	"sh.measure.android.exporter.ExceptionExporterImpl",
+}
+
+func countLocks(dump *artdump.Dump) (n int) {
+	for _, thread := range dump.Threads {
+		for _, frame := range thread.Frames {
+			n += len(frame.Locks)
+		}
+	}
+	return
+}
+
+func loadArtDump(t *testing.T) string {
+	t.Helper()
+	return readArtDump(t, artDumpFixture)
+}
+
+func readArtDump(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read art dump fixture: %v", err)
+	}
+
+	return string(b)
+}
+
+func makeANRThreadDumpEvents(t *testing.T, dump, versionName, versionCode string) []event.EventField {
+	t.Helper()
+	return []event.EventField{
+		{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Timestamp: time.Now(),
+			Type:      event.TypeANR,
+			Attribute: event.Attribute{
+				AppVersion: versionName,
+				AppBuild:   versionCode,
+				OSName:     "android",
+			},
+			ANR: &event.ANR{
+				Subject:       "user request after error: Input dispatching timed out",
+				RawThreadDump: dump,
+				ThreadDump:    artdump.Parse(dump),
+			},
+		},
+	}
+}
+
+func threadNamed(t *testing.T, dump *artdump.Dump, name string) artdump.Thread {
+	t.Helper()
+	for _, thread := range dump.Threads {
+		if thread.Name == name {
+			return thread
+		}
+	}
+	t.Fatalf("thread %q not found", name)
+	return artdump.Thread{}
+}
+
+func classNames(dump *artdump.Dump) map[string]bool {
+	names := map[string]bool{}
+	for _, thread := range dump.Threads {
+		for _, frame := range thread.Frames {
+			if frame.ClassName != "" {
+				names[frame.ClassName] = true
+			}
+		}
+	}
+	return names
+}
+
+func TestJVMANRThreadDumpSymbolication(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.0.1"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", artdumpProguardMappingKey)
+
+	events := makeANRThreadDumpEvents(t, loadArtDump(t), versionName, versionCode)
+	before := artdump.Parse(loadArtDump(t))
+
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, []SentrySource{newSentrySource()})
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	after := events[0].ANR.ThreadDump
+	got := classNames(after)
+
+	t.Run("Leaves no obfuscated class behind", func(t *testing.T) {
+		for _, obfuscated := range obfuscatedDumpClasses {
+			if got[obfuscated] {
+				t.Errorf("class %q was not deobfuscated", obfuscated)
+			}
+		}
+	})
+
+	t.Run("Resolves the frames the mapping covers", func(t *testing.T) {
+		for _, deobfuscated := range deobfuscatedDumpClasses {
+			if !got[deobfuscated] {
+				t.Errorf("expected class %q in the symbolicated dump", deobfuscated)
+			}
+		}
+	})
+
+	t.Run("Unfurls inlined frames", func(t *testing.T) {
+		exporter := threadNamed(t, after, "msr-export")
+		sent := threadNamed(t, before, "msr-export")
+		if len(exporter.Frames) <= len(sent.Frames) {
+			t.Fatalf("expected the exporter thread to gain inlined frames, %d became %d",
+				len(sent.Frames), len(exporter.Frames))
+		}
+	})
+
+	t.Run("Keeps every lock", func(t *testing.T) {
+		wanted := countLocks(before)
+		if wanted == 0 {
+			t.Fatal("the fixture carries no locks, this test asserts nothing")
+		}
+		if got := countLocks(after); got != wanted {
+			t.Errorf("expected %d locks after symbolication, but got %d", wanted, got)
+		}
+	})
+
+	t.Run("Keeps every thread and every frame in place", func(t *testing.T) {
+		if len(after.Threads) != len(before.Threads) {
+			t.Fatalf("got %d threads, want %d", len(after.Threads), len(before.Threads))
+		}
+		for i := range after.Threads {
+			if after.Threads[i].Header != before.Threads[i].Header {
+				t.Errorf("thread %d header changed to %q", i, after.Threads[i].Header)
+			}
+			if len(after.Threads[i].Frames) < len(before.Threads[i].Frames) {
+				t.Errorf("thread %q lost frames, %d became %d", after.Threads[i].Name,
+					len(before.Threads[i].Frames), len(after.Threads[i].Frames))
+			}
+		}
+	})
+
+	t.Run("Leaves native frames untouched", func(t *testing.T) {
+		for i := range after.Threads {
+			for j, frame := range before.Threads[i].Frames {
+				if frame.ClassName != "" || j >= len(after.Threads[i].Frames) {
+					continue
+				}
+				if after.Threads[i].Frames[j].RawLine != frame.RawLine {
+					t.Errorf("native frame changed:\n got %q\nwant %q",
+						after.Threads[i].Frames[j].RawLine, frame.RawLine)
+				}
+			}
+		}
+	})
+
+	t.Run("Deobfuscates lock class names", func(t *testing.T) {
+		locked := 0
+		for _, thread := range after.Threads {
+			for _, frame := range thread.Frames {
+				for _, lock := range frame.Locks {
+					locked++
+					if slices.Contains(obfuscatedDumpClasses, lock.ClassName) {
+						t.Errorf("lock class %q was not deobfuscated", lock.ClassName)
+					}
+				}
+			}
+		}
+		if locked == 0 {
+			t.Fatal("the fixture carries no locks, this test asserts nothing")
+		}
+	})
+
+	t.Run("Renders to the golden dump", func(t *testing.T) {
+		assertStacktraceMatchesGolden(t, "jvm_anr_thread_dump_golden.txt", after.Render())
+	})
+}
+
+func TestJVMANRThreadDumpWithoutAMapping(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.0.1"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	events := makeANRThreadDumpEvents(t, loadArtDump(t), versionName, versionCode)
+	before := artdump.Parse(loadArtDump(t)).Render()
+
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, []SentrySource{newSentrySource()})
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	if got := events[0].ANR.ThreadDump.Render(); got != before {
+		t.Error("a mapping that matches nothing changed the dump")
+	}
+}
+
+// Android 11 prints a frame without a line number as ":-1", which only
+// the parsed frame's raw line remembers.
+func TestJVMANRThreadDumpKeepsMissingLineAsPrinted(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.New()
+	versionName := "0.0.1"
+	versionCode := "1"
+
+	seedApp(ctx, t, appID)
+	seedBuildMappingRow(ctx, t, appID, versionName, versionCode, "proguard", basicProguardMappingKey)
+
+	dump := readArtDump(t, "../../libs/artdump/testdata/api30_broadcast_lock.txt")
+	events := makeANRThreadDumpEvents(t, dump, versionName, versionCode)
+
+	symb := New(symbolicatorOrigin, "android", []Source{newS3Source()}, []SentrySource{newSentrySource()})
+	if err := symb.Symbolicate(ctx, pgPool, appID, events, nil); err != nil {
+		t.Fatalf("Symbolicate failed: %v", err)
+	}
+
+	want := "  at sh.frankenstein.android.AnrBroadcastReceiver$Companion.$r8$lambda$Yb6899MujJ5j2AwT63qmxH-Evh8(AnrBroadcastReceiver.kt:-1)\n"
+	if got := events[0].ANR.ThreadDump.Render(); !strings.Contains(got, want) {
+		t.Errorf("expected the dump to keep %q", want)
+	}
+}

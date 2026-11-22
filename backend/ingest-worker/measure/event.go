@@ -1,0 +1,1748 @@
+package measure
+
+import (
+	"backend/ingest-worker/server"
+	"backend/ingest-worker/symbolicator"
+	"backend/libs/ambient"
+	"backend/libs/artdump"
+	"backend/libs/chrono"
+	"backend/libs/event"
+	"backend/libs/group"
+	"backend/libs/inet"
+	"backend/libs/opsys"
+	"backend/libs/span"
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"cloud.google.com/go/auth"
+	"cloud.google.com/go/auth/credentials"
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/leporo/sqlf"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/idtoken"
+)
+
+// IngestBatch is a serializable representation
+// of an ingest request batch for publishing
+// to a message bus.
+type IngestBatch struct {
+	BatchID  string             `json:"batch_id"`
+	AppID    string             `json:"app_id"`
+	TeamID   string             `json:"team_id"`
+	OsName   string             `json:"os_name"`
+	ClientIP string             `json:"client_ip"`
+	Size     uint64             `json:"size"`
+	Events   []event.EventField `json:"events"`
+	Spans    []span.SpanField   `json:"spans"`
+}
+
+// eventreq represents the ingest batch
+type eventreq struct {
+	// id is the unique id identifying the request
+	// batch
+	id uuid.UUID
+	// appId is the id of the app
+	appId uuid.UUID
+	// teamId is the id of the team
+	teamId uuid.UUID
+	// seen indicates whether this request batch
+	// was previously ingested
+	seen bool
+	// osName is operating system runtime of the SDK
+	osName string
+	// symbolicateEvents is a look up table to find
+	// the events that need symbolication
+	symbolicateEvents map[uuid.UUID]int
+	// symbolicateSpans is a look up table to find
+	// the spans that need symbolication
+	symbolicateSpans map[string]int
+	// exceptionIds is a list of all exception
+	// event ids
+	exceptionIds []int
+	// anrIds is a list of all ANR event IDs
+	anrIds []int
+	// appHangIds is a list of all app hang
+	// event ids
+	appHangIds []int
+	// events is the list of events in the ingest
+	// batch
+	events []event.EventField
+	// spans is the list of spans in the ingest
+	// batch
+	spans []span.SpanField
+	// size is the byte size of the original
+	// ingest request payload
+	size uint64
+}
+
+// checkSeen checks & remembers if this request batch was
+// previously ingested.
+func (e *eventreq) checkSeen(ctx context.Context) (err error) {
+	stmt := sqlf.From("ingested_batches final").
+		Select("1").
+		Where("team_id = ?", e.teamId).
+		Where("app_id = ?", e.appId).
+		Where("batch_id = ?", e.id).
+		Limit(1)
+
+	defer stmt.Close()
+	var result uint8
+	if err = server.Server.ChPool.QueryRow(ctx, stmt.String(), stmt.Args()...).Scan(&result); err != nil {
+		if err == sql.ErrNoRows {
+			err = nil
+		}
+		return
+	}
+
+	if result == 1 {
+		e.seen = true
+	}
+
+	return
+}
+
+// infuseInet looks up the country code for the IP
+// and infuses the country code and IP info to each event.
+func (e *eventreq) infuseInet(rawIP string) error {
+	ip := net.ParseIP(rawIP)
+	country, err := inet.CountryCode(ip)
+	if err != nil {
+		return err
+	}
+
+	v4 := inet.Isv4(ip)
+
+	for i := range e.events {
+		if v4 {
+			e.events[i].IPv4 = ip
+		} else {
+			e.events[i].IPv6 = ip
+		}
+
+		if country != "" {
+			e.events[i].CountryCode = country
+		} else if inet.IsBogon(ip) {
+			e.events[i].CountryCode = "bogon"
+		} else {
+			e.events[i].CountryCode = "n/a"
+		}
+	}
+
+	for i := range e.spans {
+		if country != "" {
+			e.spans[i].Attributes.CountryCode = country
+		} else if inet.IsBogon(ip) {
+			e.spans[i].Attributes.CountryCode = "bogon"
+		} else {
+			e.spans[i].Attributes.CountryCode = "n/a"
+		}
+	}
+
+	return nil
+}
+
+func (e *eventreq) countMetrics() (sessions, events, spans, attachments uint32) {
+	events = uint32(len(e.events))
+
+	sessions = 0
+	for _, ev := range e.events {
+		if ev.Type == event.TypeSessionStart {
+			sessions++
+		}
+	}
+
+	for _, ev := range e.events {
+		attachments += uint32(len(ev.Attachments))
+	}
+
+	spans = uint32(len(e.spans))
+
+	return sessions, events, spans, attachments
+}
+
+// onboardable determines if the ingest batch
+// meets the conditions for onboarding the app.
+func (e eventreq) onboardable() (ok bool) {
+	if len(e.events) > 0 || len(e.spans) > 0 {
+		ok = true
+	}
+	return
+}
+
+// remember stores the ingest batch record for future idempotency
+func (e eventreq) remember(ctx context.Context) (err error) {
+	stmt := sqlf.InsertInto("ingested_batches").
+		NewRow().
+		Set("team_id", e.teamId).
+		Set("app_id", e.appId).
+		Set("batch_id", e.id).
+		Set("timestamp", time.Now())
+
+	defer stmt.Close()
+
+	return server.Server.ChPool.Exec(ctx, stmt.String(), stmt.Args()...)
+}
+
+// hasExceptions returns true if event payload
+// contains exceptions.
+func (e eventreq) hasExceptions() bool {
+	return len(e.exceptionIds) > 0
+}
+
+// hasANRs returns true if event payload contains
+// ANRs.
+func (e eventreq) hasANRs() bool {
+	return len(e.anrIds) > 0
+}
+
+// hasAppHangs returns true if event payload
+// contains app hangs.
+func (e eventreq) hasAppHangs() bool {
+	return len(e.appHangIds) > 0
+}
+
+// getOSName extracts the operating system name of the app from the ingest
+// batch, taken from the first event (or the first span, for span-only
+// batches). Returns "" if the batch has neither.
+func (e eventreq) getOSName() (osName string) {
+	if len(e.events) > 0 {
+		return strings.ToLower(e.events[0].Attribute.OSName)
+	}
+
+	if len(e.spans) > 0 {
+		return strings.ToLower(e.spans[0].Attributes.OSName)
+	}
+
+	// Unreachable in practice: ingest guarantees every event/span carries a
+	// valid, non-empty os_name, and onboarding only calls this when the batch
+	// has at least one. This guard only avoids an index-out-of-range panic.
+	return ""
+}
+
+// getOSVersion extracts the operating system version
+// of the app from ingest batch.
+func (e eventreq) getOSVersion() (osVersion string) {
+	if len(e.events) > 0 {
+		return strings.ToLower(e.events[0].Attribute.OSVersion)
+	}
+
+	return strings.ToLower(e.spans[0].Attributes.OSVersion)
+}
+
+// getAppUniqueID extracts the app's unique identifier from
+// ingest batch.
+func (e eventreq) getAppUniqueID() (appUniqueID string) {
+	if len(e.events) > 0 {
+		return e.events[0].Attribute.AppUniqueID
+	}
+
+	return e.spans[0].Attributes.AppUniqueID
+}
+
+// getExceptions returns exceptions from the event payload.
+func (e eventreq) getExceptions() (events []event.EventField) {
+	if !e.hasExceptions() {
+		return
+	}
+	for _, v := range e.exceptionIds {
+		events = append(events, e.events[v])
+	}
+	return
+}
+
+// getANRs returns ANRs from the event payload.
+func (e eventreq) getANRs() (events []event.EventField) {
+	if !e.hasANRs() {
+		return
+	}
+	for _, v := range e.anrIds {
+		events = append(events, e.events[v])
+	}
+	return
+}
+
+// getAppHangs returns app hangs from the event payload.
+func (e eventreq) getAppHangs() (events []event.EventField) {
+	if !e.hasAppHangs() {
+		return
+	}
+	for _, v := range e.appHangIds {
+		events = append(events, e.events[v])
+	}
+	return
+}
+
+// bucketExceptions groups exceptions based on similarity.
+func (e eventreq) bucketExceptions(ctx context.Context) (err error) {
+	events := e.getExceptions()
+
+	for i := range events {
+		if events[i].Exception.Fingerprint == "" {
+			msg := fmt.Sprintf("no fingerprint found for event %q, cannot bucket exception", events[i].ID)
+			fmt.Println(msg)
+			continue
+		}
+
+		exceptionGroup := group.NewExceptionGroup(
+			events[i].AppID,
+			events[i].CountryCode,
+			events[i].Attribute,
+			events[i].Exception.Fingerprint,
+			events[i].Exception.GetType(),
+			events[i].Exception.GetMessage(),
+			events[i].Exception.GetMethodName(),
+			events[i].Exception.GetFileName(),
+			events[i].Exception.GetLineNumber(),
+			events[i].Exception.GetSeverity() == event.SeverityHandled,
+			events[i].Exception.GetSeverity() == event.SeverityFatal,
+			events[i].Exception.IsCustom,
+			events[i].Timestamp,
+		)
+
+		if err = exceptionGroup.Insert(ctx, server.Server.ChPool); err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+// anrKillReasons are sometimes present in Android
+// SDKs 30-33 as a prefix to the ANR subject.
+var anrKillReasons = []string{
+	"user request after error",
+	"bg anr",
+	"anr",
+}
+
+// parseANRThreadDumps parses the ART thread
+// dump for symbolication and storage.
+func (e eventreq) parseANRThreadDumps() {
+	for _, i := range e.anrIds {
+		anr := e.events[i].ANR
+		if anr == nil {
+			continue
+		}
+
+		// When the trace has no subject, the SDK sends the exit description
+		// instead: either the kill reason alone or "<reason>: <subject>".
+		for _, reason := range anrKillReasons {
+			if anr.Subject == reason {
+				anr.Subject = ""
+				break
+			}
+			if rest, ok := strings.CutPrefix(anr.Subject, reason+":"); ok {
+				anr.Subject = strings.TrimPrefix(rest, " ")
+				break
+			}
+		}
+
+		if anr.RawThreadDump == "" {
+			continue
+		}
+
+		anr.ThreadDump = artdump.Parse(anr.RawThreadDump)
+	}
+}
+
+// truncateMessages caps exception & ANR messages in place.
+func (e eventreq) truncateMessages() {
+	for _, i := range e.exceptionIds {
+		if exception := e.events[i].Exception; exception != nil {
+			exception.TruncateMessages()
+		}
+	}
+	for _, i := range e.anrIds {
+		if anr := e.events[i].ANR; anr != nil {
+			anr.TruncateMessages()
+		}
+	}
+}
+
+// bucketANRs groups ANRs based on similarity.
+func (e eventreq) bucketANRs(ctx context.Context) (err error) {
+	events := e.getANRs()
+
+	for i := range events {
+		if events[i].ANR.Fingerprint == "" {
+			msg := fmt.Sprintf("no fingerprint found for event %q, cannot bucket ANR", events[i].ID)
+			fmt.Println(msg)
+			continue
+		}
+
+		anrGroup := group.NewANRGroup(
+			events[i].AppID,
+			events[i].CountryCode,
+			events[i].Attribute,
+			events[i].ANR.Fingerprint,
+			events[i].ANR.GetType(),
+			events[i].ANR.GetMessage(),
+			events[i].ANR.GetMethodName(),
+			events[i].ANR.GetFileName(),
+			events[i].ANR.GetLineNumber(),
+			events[i].Timestamp,
+		)
+
+		if err := anrGroup.Insert(ctx, server.Server.ChPool); err != nil {
+			return err
+		}
+	}
+
+	return
+}
+
+// bucketAppHangs groups app hangs based on similarity.
+func (e eventreq) bucketAppHangs(ctx context.Context) (err error) {
+	events := e.getAppHangs()
+
+	for i := range events {
+		appHangGroup := group.NewAppHangGroup(
+			events[i].AppID,
+			events[i].CountryCode,
+			events[i].Attribute,
+			events[i].AppHang.Fingerprint,
+			events[i].AppHang.GetMethodName(),
+			events[i].AppHang.GetFileName(),
+			events[i].AppHang.GetLineNumber(),
+			events[i].Timestamp,
+		)
+
+		if err := appHangGroup.Insert(ctx, server.Server.ChPool); err != nil {
+			return err
+		}
+	}
+
+	return
+}
+
+// needsSymbolication returns true if payload
+// contains events that should be symbolicated.
+func (e eventreq) needsSymbolication() bool {
+	return len(e.symbolicateEvents) > 0 || len(e.symbolicateSpans) > 0
+}
+
+// needsJSSymbolication returns true if any of the events
+// flagged for symbolication contain JavaScript frames.
+func (e eventreq) needsJSSymbolication() bool {
+	for _, i := range e.symbolicateEvents {
+		ev := e.events[i]
+		if ev.IsException() && ev.Exception.HasJSFrames() {
+			return true
+		}
+	}
+	return false
+}
+
+// validate validates the integrity of each event
+// and corresponding attachments.
+func (e eventreq) validate() error {
+	if len(e.events) < 1 && len(e.spans) < 1 {
+		return fmt.Errorf(`payload must contain at least 1 event or 1 span`)
+	}
+
+	for i := range e.events {
+		if err := e.events[i].Validate(); err != nil {
+			return err
+		}
+		if err := e.events[i].Attribute.Validate(); err != nil {
+			return err
+		}
+
+		// only process user defined attributes
+		// if the payload contains any.
+		//
+		// this check is super important to have
+		// because SDKs without support for user
+		// defined attributes won't ever send these.
+		if !e.events[i].UserDefinedAttribute.Empty() {
+			if err := e.events[i].UserDefinedAttribute.Validate(); err != nil {
+				return err
+			}
+		}
+
+		for j := range e.events[i].Attachments {
+			if err := e.events[i].Attachments[j].Validate(); err != nil {
+				return err
+			}
+		}
+	}
+
+	for i := range e.spans {
+		if err := e.spans[i].Validate(); err != nil {
+			return err
+		}
+
+		// only process user defined attributes
+		// if the payload contains any.
+		//
+		// this check is super important to have
+		// because SDKs without support for user
+		// defined attributes won't ever send these.
+		if !e.spans[i].UserDefinedAttribute.Empty() {
+			if err := e.spans[i].UserDefinedAttribute.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// ingestEvents writes the events to database.
+func (e eventreq) ingestEvents(ctx context.Context) error {
+	if len(e.events) == 0 {
+		return nil
+	}
+
+	stmt := sqlf.InsertInto(`events`)
+	defer stmt.Close()
+
+	for i := range e.events {
+		anrExceptions := "[]"
+		anrThreads := "[]"
+		anrThreadDump := ""
+		exceptionExceptions := "[]"
+		exceptionThreads := "[]"
+		appHangExceptions := "[]"
+		appHangBinaryImages := "[]"
+		attachments := "[]"
+		binaryImages := "[]"
+		exceptionMemoryError := ""
+		errorMeta := "{}"
+		var numCode int32
+		anonRSS := int64(-1)
+		swap := int64(-1)
+		availableMemory := int64(-1)
+
+		if e.events[i].IsANR() {
+			// A dump-only ANR has no exceptions or threads. Store
+			// "[]" rather than "null", since the sessions MV checks
+			// for "[]".
+			if len(e.events[i].ANR.Exceptions) > 0 {
+				marshalledExceptions, err := json.Marshal(e.events[i].ANR.Exceptions)
+				if err != nil {
+					return err
+				}
+				anrExceptions = string(marshalledExceptions)
+			}
+			if len(e.events[i].ANR.Threads) > 0 {
+				marshalledThreads, err := json.Marshal(e.events[i].ANR.Threads)
+				if err != nil {
+					return err
+				}
+				anrThreads = string(marshalledThreads)
+			}
+			if dump := e.events[i].ANR.ThreadDump; dump != nil {
+				dump.Populate()
+
+				marshalledDump, err := json.Marshal(dump)
+				if err != nil {
+					return err
+				}
+				anrThreadDump = string(marshalledDump)
+			}
+
+			if err := e.events[i].ANR.ComputeFingerprint(); err != nil {
+				return err
+			}
+		}
+		if e.events[i].IsAppHang() {
+			marshalledExceptions, err := json.Marshal(e.events[i].AppHang.Exceptions)
+			if err != nil {
+				return err
+			}
+			appHangExceptions = string(marshalledExceptions)
+
+			if len(e.events[i].AppHang.BinaryImages) > 0 {
+				marshalledImages, err := json.Marshal(e.events[i].AppHang.BinaryImages)
+				if err != nil {
+					return err
+				}
+				appHangBinaryImages = string(marshalledImages)
+			}
+
+			// The fingerprint falls back to the binary and the frame's
+			// offset within it, so a hang without symbols still groups.
+			// Validation rejects a hang with no frames.
+			if err := e.events[i].AppHang.ComputeFingerprint(); err != nil {
+				return err
+			}
+		}
+		if e.events[i].IsException() {
+			marshalledExceptions, err := json.Marshal(e.events[i].Exception.Exceptions)
+			if err != nil {
+				return err
+			}
+			exceptionExceptions = string(marshalledExceptions)
+
+			marshalledThreads, err := json.Marshal(e.events[i].Exception.Threads)
+			if err != nil {
+				return err
+			}
+			exceptionThreads = string(marshalledThreads)
+			if err := e.events[i].Exception.ComputeFingerprint(); err != nil {
+				return err
+			}
+
+			if len(e.events[i].Exception.BinaryImages) > 0 {
+				marshalledImages, err := json.Marshal(e.events[i].Exception.BinaryImages)
+				if err != nil {
+					return err
+				}
+				binaryImages = string(marshalledImages)
+			}
+
+			if e.events[i].Exception.MemoryError != nil {
+				marshalledMemoryError, err := json.Marshal(e.events[i].Exception.MemoryError)
+				if err != nil {
+					return err
+				}
+				exceptionMemoryError = string(marshalledMemoryError)
+			}
+
+			if e.events[i].Exception.HasError() {
+				metaBytes, err := e.events[i].Exception.GetMetaBytes()
+				if err != nil {
+					return err
+				}
+				errorMeta = string(metaBytes)
+			}
+
+			if e.events[i].Exception.NumCode != nil {
+				numCode = *e.events[i].Exception.NumCode
+			}
+		}
+
+		if e.events[i].HasAttachments() {
+			marshalledAttachments, err := json.Marshal(e.events[i].Attachments)
+			if err != nil {
+				return err
+			}
+			attachments = string(marshalledAttachments)
+		}
+
+		sessionStartTime := e.events[i].Attribute.SessionStartTime.Format(chrono.MSTimeFormat)
+
+		row := stmt.NewRow().
+			Set(`id`, e.events[i].ID).
+			Set(`team_id`, e.teamId).
+			Set(`app_id`, e.events[i].AppID).
+			Set(`session_id`, e.events[i].SessionID).
+			Set(`timestamp`, e.events[i].Timestamp.Format(chrono.MSTimeFormat)).
+			Set(`type`, e.events[i].Type).
+			Set(`user_triggered`, e.events[i].UserTriggered).
+			Set(`inet.ipv4`, e.events[i].IPv4).
+			Set(`inet.ipv6`, e.events[i].IPv6).
+			Set(`inet.country_code`, e.events[i].CountryCode).
+
+			// attribute
+			Set(`attribute.installation_id`, e.events[i].Attribute.InstallationID).
+			Set(`attribute.app_version`, e.events[i].Attribute.AppVersion).
+			Set(`attribute.app_build`, e.events[i].Attribute.AppBuild).
+			Set(`attribute.app_unique_id`, e.events[i].Attribute.AppUniqueID).
+			Set(`attribute.patch_id`, e.events[i].Attribute.PatchID).
+			Set(`attribute.patch_version`, strings.TrimSpace(e.events[i].Attribute.PatchVersion)).
+			Set(`attribute.expo_update_id`, e.events[i].Attribute.ExpoUpdateID).
+			Set(`attribute.expo_runtime_version`, strings.TrimSpace(e.events[i].Attribute.ExpoRuntimeVersion)).
+			Set(`attribute.is_expo_embedded_launch`, e.events[i].Attribute.IsExpoEmbeddedLaunch).
+			Set(`attribute.is_expo_using_embedded_assets`, e.events[i].Attribute.IsExpoUsingEmbeddedAssets).
+			Set(`attribute.expo_automatic_update_policy`, strings.TrimSpace(e.events[i].Attribute.ExpoAutomaticUpdatePolicy)).
+			Set(`attribute.expo_execution_environment`, strings.TrimSpace(e.events[i].Attribute.ExpoExecutionEnvironment)).
+			Set(`attribute.expo_version`, strings.TrimSpace(e.events[i].Attribute.ExpoVersion)).
+			Set(`attribute.expo_sdk_version`, strings.TrimSpace(e.events[i].Attribute.ExpoSDKVersion)).
+			Set(`attribute.expo_eas_project_id`, strings.TrimSpace(e.events[i].Attribute.ExpoEASProjectID)).
+			Set(`attribute.measure_sdk_version`, e.events[i].Attribute.MeasureSDKVersion).
+			Set(`attribute.thread_name`, e.events[i].Attribute.ThreadName).
+			Set(`attribute.user_id`, e.events[i].Attribute.UserID).
+			Set(`attribute.device_name`, e.events[i].Attribute.DeviceName).
+			Set(`attribute.device_model`, e.events[i].Attribute.DeviceModel).
+			Set(`attribute.device_manufacturer`, e.events[i].Attribute.DeviceManufacturer).
+			Set(`attribute.device_type`, e.events[i].Attribute.DeviceType).
+			Set(`attribute.device_is_foldable`, e.events[i].Attribute.DeviceIsFoldable).
+			Set(`attribute.device_is_physical`, e.events[i].Attribute.DeviceIsPhysical).
+			Set(`attribute.device_density_dpi`, e.events[i].Attribute.DeviceDensityDPI).
+			Set(`attribute.device_width_px`, e.events[i].Attribute.DeviceWidthPX).
+			Set(`attribute.device_height_px`, e.events[i].Attribute.DeviceHeightPX).
+			Set(`attribute.device_density`, e.events[i].Attribute.DeviceDensity).
+			Set(`attribute.device_total_memory`, e.events[i].Attribute.DeviceTotalMemory).
+			Set(`attribute.device_locale`, e.events[i].Attribute.DeviceLocale).
+			Set(`attribute.device_low_power_mode`, e.events[i].Attribute.DeviceLowPowerMode).
+			Set(`attribute.device_thermal_throttling_enabled`, e.events[i].Attribute.DeviceThermalThrottlingEnabled).
+			Set(`attribute.device_cpu_arch`, e.events[i].Attribute.DeviceCPUArch).
+			Set(`attribute.os_name`, e.events[i].Attribute.OSName).
+			Set(`attribute.os_version`, e.events[i].Attribute.OSVersion).
+			Set(`attribute.os_page_size`, e.events[i].Attribute.OSPageSize).
+			Set(`attribute.network_type`, e.events[i].Attribute.NetworkType).
+			Set(`attribute.network_generation`, e.events[i].Attribute.NetworkGeneration).
+			Set(`attribute.network_provider`, e.events[i].Attribute.NetworkProvider).
+			Set(`attribute.session_start_time`, sessionStartTime).
+
+			// user defined attribute
+			Set(`user_defined_attribute`, e.events[i].UserDefinedAttribute.Parameterize()).
+
+			// attachments
+			Set(`attachments`, attachments)
+
+		// anr
+		if e.events[i].IsANR() {
+			row.
+				Set(`anr.handled`, e.events[i].ANR.Handled).
+				Set(`anr.fingerprint`, e.events[i].ANR.Fingerprint).
+				Set(`anr.exceptions`, anrExceptions).
+				Set(`anr.threads`, anrThreads).
+				Set(`anr.foreground`, e.events[i].ANR.Foreground).
+				Set(`anr.subject`, e.events[i].ANR.Subject).
+				Set(`anr.thread_dump`, anrThreadDump)
+		} else {
+			row.
+				Set(`anr.handled`, nil).
+				Set(`anr.fingerprint`, nil).
+				Set(`anr.exceptions`, nil).
+				Set(`anr.threads`, nil).
+				Set(`anr.foreground`, nil).
+				Set(`anr.subject`, nil).
+				Set(`anr.thread_dump`, nil)
+		}
+
+		// app hang
+		if e.events[i].IsAppHang() {
+			row.
+				Set(`app_hang.fingerprint`, e.events[i].AppHang.Fingerprint).
+				Set(`app_hang.exceptions`, appHangExceptions).
+				Set(`app_hang.binary_images`, appHangBinaryImages).
+				Set(`app_hang.duration`, e.events[i].AppHang.Duration).
+				Set(`app_hang.state`, e.events[i].AppHang.State).
+				Set(`app_hang.framework`, e.events[i].AppHang.Framework).
+				Set(`app_hang.foreground`, e.events[i].AppHang.Foreground)
+		} else {
+			row.
+				Set(`app_hang.fingerprint`, nil).
+				Set(`app_hang.exceptions`, nil).
+				Set(`app_hang.binary_images`, nil).
+				Set(`app_hang.duration`, nil).
+				Set(`app_hang.state`, nil).
+				Set(`app_hang.framework`, nil).
+				Set(`app_hang.foreground`, nil)
+		}
+
+		// exception
+		if e.events[i].IsException() {
+			row.
+				Set(`exception.handled`, e.events[i].Exception.Handled).
+				Set(`exception.fingerprint`, e.events[i].Exception.Fingerprint).
+				Set(`exception.exceptions`, exceptionExceptions).
+				Set(`exception.threads`, exceptionThreads).
+				Set(`exception.foreground`, e.events[i].Exception.Foreground).
+				Set(`exception.binary_images`, binaryImages).
+				Set(`exception.framework`, e.events[i].Exception.GetFramework()).
+				Set(`exception.num_code`, numCode).
+				Set(`exception.has_num_code`, e.events[i].Exception.NumCode != nil).
+				Set(`exception.code`, e.events[i].Exception.Code).
+				Set(`exception.meta`, errorMeta).
+				Set(`exception.severity`, e.events[i].Exception.GetSeverity()).
+				Set(`exception.is_custom`, e.events[i].Exception.IsCustom).
+				Set(`exception.abort_message`, e.events[i].Exception.AbortMessage).
+				Set(`exception.cause`, e.events[i].Exception.Cause).
+				Set(`exception.memory_error`, exceptionMemoryError)
+		} else {
+			row.
+				Set(`exception.handled`, nil).
+				Set(`exception.fingerprint`, nil).
+				Set(`exception.exceptions`, nil).
+				Set(`exception.threads`, nil).
+				Set(`exception.foreground`, nil).
+				Set(`exception.binary_images`, nil).
+				Set(`exception.framework`, nil).
+				Set(`exception.num_code`, nil).
+				Set(`exception.has_num_code`, nil).
+				Set(`exception.code`, nil).
+				Set(`exception.meta`, nil).
+				Set(`exception.severity`, nil).
+				Set(`exception.is_custom`, nil).
+				Set(`exception.abort_message`, nil).
+				Set(`exception.cause`, nil).
+				Set(`exception.memory_error`, nil)
+		}
+
+		// app exit
+		if e.events[i].IsAppExit() {
+			row.
+				Set(`app_exit.reason`, e.events[i].AppExit.Reason).
+				Set(`app_exit.importance`, e.events[i].AppExit.Importance).
+				Set(`app_exit.trace`, e.events[i].AppExit.Trace).
+				Set(`app_exit.process_name`, e.events[i].AppExit.ProcessName).
+				Set(`app_exit.pid`, e.events[i].AppExit.PID)
+		} else {
+			row.
+				Set(`app_exit.reason`, nil).
+				Set(`app_exit.importance`, nil).
+				Set(`app_exit.trace`, nil).
+				Set(`app_exit.process_name`, nil).
+				Set(`app_exit.pid`, nil)
+		}
+
+		// string
+		if e.events[i].IsString() {
+			row.
+				Set(`string.severity_text`, e.events[i].LogString.SeverityText).
+				Set(`string.string`, e.events[i].LogString.String)
+		} else {
+			row.
+				Set(`string.severity_text`, nil).
+				Set(`string.string`, nil)
+		}
+
+		// log
+		if e.events[i].IsLog() {
+			row.
+				Set(`log.severity_text`, e.events[i].Log.SeverityText).
+				Set(`log.severity_number`, e.events[i].Log.SeverityNumber).
+				Set(`log.body`, e.events[i].Log.Body)
+		} else {
+			row.
+				Set(`log.severity_text`, nil).
+				Set(`log.severity_number`, nil).
+				Set(`log.body`, nil)
+		}
+
+		// gesture long click
+		if e.events[i].IsGestureLongClick() {
+			row.
+				Set(`gesture_long_click.target`, e.events[i].GestureLongClick.Target).
+				Set(`gesture_long_click.target_id`, e.events[i].GestureLongClick.TargetID).
+				Set(`gesture_long_click.label`, e.events[i].GestureLongClick.Label).
+				Set(`gesture_long_click.semantic_label`, e.events[i].GestureLongClick.SemanticLabel).
+				Set(`gesture_long_click.touch_down_time`, e.events[i].GestureLongClick.TouchDownTime).
+				Set(`gesture_long_click.touch_up_time`, e.events[i].GestureLongClick.TouchUpTime).
+				Set(`gesture_long_click.width`, e.events[i].GestureLongClick.Width).
+				Set(`gesture_long_click.height`, e.events[i].GestureLongClick.Height).
+				Set(`gesture_long_click.x`, e.events[i].GestureLongClick.X).
+				Set(`gesture_long_click.y`, e.events[i].GestureLongClick.Y)
+		} else {
+			row.
+				Set(`gesture_long_click.target`, nil).
+				Set(`gesture_long_click.target_id`, nil).
+				Set(`gesture_long_click.label`, nil).
+				Set(`gesture_long_click.semantic_label`, nil).
+				Set(`gesture_long_click.touch_down_time`, nil).
+				Set(`gesture_long_click.touch_up_time`, nil).
+				Set(`gesture_long_click.width`, nil).
+				Set(`gesture_long_click.height`, nil).
+				Set(`gesture_long_click.x`, nil).
+				Set(`gesture_long_click.y`, nil)
+		}
+
+		// gesture click
+		if e.events[i].IsGestureClick() {
+			row.
+				Set(`gesture_click.target`, e.events[i].GestureClick.Target).
+				Set(`gesture_click.target_id`, e.events[i].GestureClick.TargetID).
+				Set(`gesture_click.label`, e.events[i].GestureClick.Label).
+				Set(`gesture_click.semantic_label`, e.events[i].GestureClick.SemanticLabel).
+				Set(`gesture_click.touch_down_time`, e.events[i].GestureClick.TouchDownTime).
+				Set(`gesture_click.touch_up_time`, e.events[i].GestureClick.TouchUpTime).
+				Set(`gesture_click.width`, e.events[i].GestureClick.Width).
+				Set(`gesture_click.height`, e.events[i].GestureClick.Height).
+				Set(`gesture_click.x`, e.events[i].GestureClick.X).
+				Set(`gesture_click.y`, e.events[i].GestureClick.Y)
+		} else {
+			row.
+				Set(`gesture_click.target`, nil).
+				Set(`gesture_click.target_id`, nil).
+				Set(`gesture_click.label`, nil).
+				Set(`gesture_click.semantic_label`, nil).
+				Set(`gesture_click.touch_down_time`, nil).
+				Set(`gesture_click.touch_up_time`, nil).
+				Set(`gesture_click.width`, nil).
+				Set(`gesture_click.height`, nil).
+				Set(`gesture_click.x`, nil).
+				Set(`gesture_click.y`, nil)
+		}
+
+		// gesture scroll
+		if e.events[i].IsGestureScroll() {
+			row.
+				Set(`gesture_scroll.target`, e.events[i].GestureScroll.Target).
+				Set(`gesture_scroll.target_id`, e.events[i].GestureScroll.TargetID).
+				Set(`gesture_scroll.touch_down_time`, e.events[i].GestureScroll.TouchDownTime).
+				Set(`gesture_scroll.touch_up_time`, e.events[i].GestureScroll.TouchUpTime).
+				Set(`gesture_scroll.x`, e.events[i].GestureScroll.X).
+				Set(`gesture_scroll.y`, e.events[i].GestureScroll.Y).
+				Set(`gesture_scroll.end_x`, e.events[i].GestureScroll.EndX).
+				Set(`gesture_scroll.end_y`, e.events[i].GestureScroll.EndY).
+				Set(`gesture_scroll.direction`, e.events[i].GestureScroll.Direction)
+		} else {
+			row.
+				Set(`gesture_scroll.target`, nil).
+				Set(`gesture_scroll.target_id`, nil).
+				Set(`gesture_scroll.touch_down_time`, nil).
+				Set(`gesture_scroll.touch_up_time`, nil).
+				Set(`gesture_scroll.x`, nil).
+				Set(`gesture_scroll.y`, nil).
+				Set(`gesture_scroll.end_x`, nil).
+				Set(`gesture_scroll.end_y`, nil).
+				Set(`gesture_scroll.direction`, nil)
+		}
+
+		// lifecycle activity
+		if e.events[i].IsLifecycleActivity() {
+			row.
+				Set(`lifecycle_activity.type`, e.events[i].LifecycleActivity.Type).
+				Set(`lifecycle_activity.class_name`, e.events[i].LifecycleActivity.ClassName).
+				Set(`lifecycle_activity.intent`, e.events[i].LifecycleActivity.Intent).
+				Set(`lifecycle_activity.saved_instance_state`, e.events[i].LifecycleActivity.SavedInstanceState)
+		} else {
+			row.
+				Set(`lifecycle_activity.type`, nil).
+				Set(`lifecycle_activity.class_name`, nil).
+				Set(`lifecycle_activity.intent`, nil).
+				Set(`lifecycle_activity.saved_instance_state`, nil)
+		}
+
+		// lifecycle fragment
+		if e.events[i].IsLifecycleFragment() {
+			row.
+				Set(`lifecycle_fragment.type`, e.events[i].LifecycleFragment.Type).
+				Set(`lifecycle_fragment.class_name`, e.events[i].LifecycleFragment.ClassName).
+				Set(`lifecycle_fragment.parent_activity`, e.events[i].LifecycleFragment.ParentActivity).
+				Set(`lifecycle_fragment.parent_fragment`, e.events[i].LifecycleFragment.ParentFragment).
+				Set(`lifecycle_fragment.tag`, e.events[i].LifecycleFragment.Tag)
+		} else {
+			row.
+				Set(`lifecycle_fragment.type`, nil).
+				Set(`lifecycle_fragment.class_name`, nil).
+				Set(`lifecycle_fragment.parent_activity`, nil).
+				Set(`lifecycle_fragment.parent_fragment`, nil).
+				Set(`lifecycle_fragment.tag`, nil)
+		}
+
+		// lifecycle view controller
+		if e.events[i].IsLifecycleViewController() {
+			row.
+				Set(`lifecycle_view_controller.type`, e.events[i].LifecycleViewController.Type).
+				Set(`lifecycle_view_controller.class_name`, e.events[i].LifecycleViewController.ClassName)
+		} else {
+			row.
+				Set(`lifecycle_view_controller.type`, nil).
+				Set(`lifecycle_view_controller.class_name`, nil)
+		}
+
+		// lifecycle swift ui
+		if e.events[i].IsLifecycleSwiftUI() {
+			row.
+				Set(`lifecycle_swift_ui.type`, e.events[i].LifecycleSwiftUI.Type).
+				Set(`lifecycle_swift_ui.class_name`, e.events[i].LifecycleSwiftUI.ClassName)
+		} else {
+			row.
+				Set(`lifecycle_swift_ui.type`, nil).
+				Set(`lifecycle_swift_ui.class_name`, nil)
+		}
+
+		// lifecycle app
+		if e.events[i].IsLifecycleApp() {
+			row.
+				Set(`lifecycle_app.type`, e.events[i].LifecycleApp.Type)
+		} else {
+			row.
+				Set(`lifecycle_app.type`, nil)
+		}
+
+		// cold launch
+		if e.events[i].IsColdLaunch() {
+			row.
+				Set(`cold_launch.process_start_uptime`, e.events[i].ColdLaunch.ProcessStartUptime).
+				Set(`cold_launch.process_start_requested_uptime`, e.events[i].ColdLaunch.ProcessStartRequestedUptime).
+				Set(`cold_launch.content_provider_attach_uptime`, e.events[i].ColdLaunch.ContentProviderAttachUptime).
+				Set(`cold_launch.on_next_draw_uptime`, e.events[i].ColdLaunch.OnNextDrawUptime).
+				Set(`cold_launch.launched_activity`, e.events[i].ColdLaunch.LaunchedActivity).
+				Set(`cold_launch.has_saved_state`, e.events[i].ColdLaunch.HasSavedState).
+				Set(`cold_launch.intent_data`, e.events[i].ColdLaunch.IntentData).
+				Set(`cold_launch.duration`, e.events[i].ColdLaunch.Duration.Milliseconds())
+		} else {
+			row.
+				Set(`cold_launch.process_start_uptime`, nil).
+				Set(`cold_launch.process_start_requested_uptime`, nil).
+				Set(`cold_launch.content_provider_attach_uptime`, nil).
+				Set(`cold_launch.on_next_draw_uptime`, nil).
+				Set(`cold_launch.launched_activity`, nil).
+				Set(`cold_launch.has_saved_state`, nil).
+				Set(`cold_launch.intent_data`, nil).
+				Set(`cold_launch.duration`, nil)
+
+		}
+
+		// warm launch
+		if e.events[i].IsWarmLaunch() {
+			row.
+				Set(`warm_launch.app_visible_uptime`, e.events[i].WarmLaunch.AppVisibleUptime).
+				Set(`warm_launch.process_start_uptime`, e.events[i].WarmLaunch.ProcessStartUptime).
+				Set(`warm_launch.process_start_requested_uptime`, e.events[i].WarmLaunch.ProcessStartRequestedUptime).
+				Set(`warm_launch.content_provider_attach_uptime`, e.events[i].WarmLaunch.ContentProviderAttachUptime).
+				Set(`warm_launch.on_next_draw_uptime`, e.events[i].WarmLaunch.OnNextDrawUptime).
+				Set(`warm_launch.launched_activity`, e.events[i].WarmLaunch.LaunchedActivity).
+				Set(`warm_launch.has_saved_state`, e.events[i].WarmLaunch.HasSavedState).
+				Set(`warm_launch.intent_data`, e.events[i].WarmLaunch.IntentData).
+				Set(`warm_launch.duration`, e.events[i].WarmLaunch.Duration.Milliseconds()).
+				Set(`warm_launch.is_lukewarm`, e.events[i].WarmLaunch.IsLukewarm)
+		} else {
+			row.
+				Set(`warm_launch.app_visible_uptime`, nil).
+				Set(`warm_launch.process_start_uptime`, nil).
+				Set(`warm_launch.process_start_requested_uptime`, nil).
+				Set(`warm_launch.content_provider_attach_uptime`, nil).
+				Set(`warm_launch.on_next_draw_uptime`, nil).
+				Set(`warm_launch.launched_activity`, nil).
+				Set(`warm_launch.has_saved_state`, nil).
+				Set(`warm_launch.intent_data`, nil).
+				Set(`warm_launch.duration`, nil).
+				Set(`warm_launch.is_lukewarm`, nil)
+		}
+
+		// hot launch
+		if e.events[i].IsHotLaunch() {
+			row.
+				Set(`hot_launch.app_visible_uptime`, e.events[i].HotLaunch.AppVisibleUptime).
+				Set(`hot_launch.on_next_draw_uptime`, e.events[i].HotLaunch.OnNextDrawUptime).
+				Set(`hot_launch.launched_activity`, e.events[i].HotLaunch.LaunchedActivity).
+				Set(`hot_launch.has_saved_state`, e.events[i].HotLaunch.HasSavedState).
+				Set(`hot_launch.intent_data`, e.events[i].HotLaunch.IntentData).
+				Set(`hot_launch.duration`, e.events[i].HotLaunch.Duration.Milliseconds())
+		} else {
+			row.
+				Set(`hot_launch.app_visible_uptime`, nil).
+				Set(`hot_launch.on_next_draw_uptime`, nil).
+				Set(`hot_launch.launched_activity`, nil).
+				Set(`hot_launch.has_saved_state`, nil).
+				Set(`hot_launch.intent_data`, nil).
+				Set(`hot_launch.duration`, nil)
+		}
+
+		// network change
+		if e.events[i].IsNetworkChange() {
+			row.
+				Set(`network_change.network_type`, e.events[i].NetworkChange.NetworkType).
+				Set(`network_change.previous_network_type`, e.events[i].NetworkChange.PreviousNetworkType).
+				Set(`network_change.network_generation`, e.events[i].NetworkChange.NetworkGeneration).
+				Set(`network_change.previous_network_generation`, e.events[i].NetworkChange.PreviousNetworkGeneration)
+		} else {
+			row.
+				Set(`network_change.network_type`, nil).
+				Set(`network_change.previous_network_type`, nil).
+				Set(`network_change.network_generation`, nil).
+				Set(`network_change.previous_network_generation`, nil)
+		}
+
+		// http
+		if e.events[i].IsHttp() {
+			row.
+				Set(`http.url`, e.events[i].Http.URL).
+				Set(`http.method`, e.events[i].Http.Method).
+				Set(`http.status_code`, e.events[i].Http.StatusCode).
+				Set(`http.start_time`, e.events[i].Http.StartTime).
+				Set(`http.end_time`, e.events[i].Http.EndTime).
+				Set(`http_request_headers`, e.events[i].Http.RequestHeaders).
+				Set(`http_response_headers`, e.events[i].Http.ResponseHeaders).
+				Set(`http.request_body`, e.events[i].Http.RequestBody).
+				Set(`http.response_body`, e.events[i].Http.ResponseBody).
+				Set(`http.failure_reason`, e.events[i].Http.FailureReason).
+				Set(`http.failure_description`, e.events[i].Http.FailureDescription).
+				Set(`http.client`, e.events[i].Http.Client)
+		} else {
+			row.
+				Set(`http.url`, nil).
+				Set(`http.method`, nil).
+				Set(`http.status_code`, nil).
+				Set(`http.start_time`, nil).
+				Set(`http.end_time`, nil).
+				Set(`http_request_headers`, nil).
+				Set(`http_response_headers`, nil).
+				Set(`http.request_body`, nil).
+				Set(`http.response_body`, nil).
+				Set(`http.failure_reason`, nil).
+				Set(`http.failure_description`, nil).
+				Set(`http.client`, nil)
+
+		}
+
+		// memory usage
+		if e.events[i].IsMemoryUsage() {
+			if e.events[i].MemoryUsage.AnonRSS != nil {
+				anonRSS = int64(*e.events[i].MemoryUsage.AnonRSS)
+			}
+			if e.events[i].MemoryUsage.Swap != nil {
+				swap = int64(*e.events[i].MemoryUsage.Swap)
+			}
+			row.
+				Set(`memory_usage.java_max_heap`, e.events[i].MemoryUsage.JavaMaxHeap).
+				Set(`memory_usage.java_total_heap`, e.events[i].MemoryUsage.JavaTotalHeap).
+				Set(`memory_usage.java_free_heap`, e.events[i].MemoryUsage.JavaFreeHeap).
+				Set(`memory_usage.total_pss`, e.events[i].MemoryUsage.TotalPSS).
+				Set(`memory_usage.rss`, e.events[i].MemoryUsage.RSS).
+				Set(`memory_usage.anon_rss`, anonRSS).
+				Set(`memory_usage.swap`, swap).
+				Set(`memory_usage.app_importance`, e.events[i].MemoryUsage.AppImportance).
+				Set(`memory_usage.native_total_heap`, e.events[i].MemoryUsage.NativeTotalHeap).
+				Set(`memory_usage.native_free_heap`, e.events[i].MemoryUsage.NativeFreeHeap).
+				Set(`memory_usage.interval`, e.events[i].MemoryUsage.Interval)
+		} else {
+			row.
+				Set(`memory_usage.java_max_heap`, nil).
+				Set(`memory_usage.java_total_heap`, nil).
+				Set(`memory_usage.java_free_heap`, nil).
+				Set(`memory_usage.total_pss`, nil).
+				Set(`memory_usage.rss`, nil).
+				Set(`memory_usage.anon_rss`, nil).
+				Set(`memory_usage.swap`, nil).
+				Set(`memory_usage.app_importance`, nil).
+				Set(`memory_usage.native_total_heap`, nil).
+				Set(`memory_usage.native_free_heap`, nil).
+				Set(`memory_usage.interval`, nil)
+		}
+
+		// memory usage absolute
+		if e.events[i].IsMemoryUsageAbs() {
+			if e.events[i].MemoryUsageAbs.AvailableMemory != nil {
+				availableMemory = int64(*e.events[i].MemoryUsageAbs.AvailableMemory)
+			}
+			row.
+				Set(`memory_usage_absolute.max_memory`, e.events[i].MemoryUsageAbs.MaxMemory).
+				Set(`memory_usage_absolute.used_memory`, e.events[i].MemoryUsageAbs.UsedMemory).
+				Set(`memory_usage_absolute.available_memory`, availableMemory).
+				Set(`memory_usage_absolute.interval`, e.events[i].MemoryUsageAbs.Interval)
+		} else {
+			row.
+				Set(`memory_usage_absolute.max_memory`, nil).
+				Set(`memory_usage_absolute.used_memory`, nil).
+				Set(`memory_usage_absolute.available_memory`, nil).
+				Set(`memory_usage_absolute.interval`, nil)
+		}
+
+		// trim memory
+		if e.events[i].IsTrimMemory() {
+			row.
+				Set(`trim_memory.level`, e.events[i].TrimMemory.Level)
+		} else {
+			row.
+				Set(`trim_memory.level`, nil)
+		}
+
+		// cpu usage
+		if e.events[i].IsCPUUsage() {
+			row.
+				Set(`cpu_usage.num_cores`, e.events[i].CPUUsage.NumCores).
+				Set(`cpu_usage.clock_speed`, e.events[i].CPUUsage.ClockSpeed).
+				Set(`cpu_usage.uptime`, e.events[i].CPUUsage.Uptime).
+				Set(`cpu_usage.utime`, e.events[i].CPUUsage.UTime).
+				Set(`cpu_usage.cutime`, e.events[i].CPUUsage.CUTime).
+				Set(`cpu_usage.stime`, e.events[i].CPUUsage.STime).
+				Set(`cpu_usage.cstime`, e.events[i].CPUUsage.CSTime).
+				Set(`cpu_usage.interval`, e.events[i].CPUUsage.Interval).
+				Set(`cpu_usage.percentage_usage`, e.events[i].CPUUsage.PercentageUsage)
+		} else {
+			row.
+				Set(`cpu_usage.num_cores`, nil).
+				Set(`cpu_usage.clock_speed`, nil).
+				Set(`cpu_usage.uptime`, nil).
+				Set(`cpu_usage.utime`, nil).
+				Set(`cpu_usage.cutime`, nil).
+				Set(`cpu_usage.stime`, nil).
+				Set(`cpu_usage.cstime`, nil).
+				Set(`cpu_usage.interval`, nil).
+				Set(`cpu_usage.percentage_usage`, nil)
+
+		}
+
+		// navigation
+		if e.events[i].IsNavigation() {
+			row.
+				Set(`navigation.to`, e.events[i].Navigation.To).
+				Set(`navigation.from`, e.events[i].Navigation.From).
+				Set(`navigation.source`, e.events[i].Navigation.Source)
+		} else {
+			row.
+				Set(`navigation.to`, nil).
+				Set(`navigation.from`, nil).
+				Set(`navigation.source`, nil)
+		}
+
+		// screen view
+		if e.events[i].IsScreenView() {
+			row.
+				Set(`screen_view.name`, e.events[i].ScreenView.Name)
+		} else {
+			row.
+				Set(`screen_view.name`, nil)
+		}
+
+		// bug report
+		if e.events[i].IsBugReport() {
+			row.
+				Set(`bug_report.description`, e.events[i].BugReport.Description)
+		} else {
+			row.
+				Set(`bug_report.description`, nil)
+		}
+
+		// custom
+		if e.events[i].IsCustom() {
+			row.
+				Set(`custom.name`, e.events[i].Custom.Name)
+		} else {
+			row.
+				Set(`custom.name`, nil)
+		}
+
+		// profile
+		if e.events[i].IsProfile() {
+			row.
+				Set(`profile.trigger`, e.events[i].Profile.Trigger).
+				Set(`profile.format`, e.events[i].Profile.Format)
+		} else {
+			row.
+				Set(`profile.trigger`, nil).
+				Set(`profile.format`, nil)
+		}
+	}
+
+	return server.Server.ChPool.Exec(ctx, stmt.String(), stmt.Args()...)
+}
+
+// ingestSpans writes the spans to database.
+func (e eventreq) ingestSpans(ctx context.Context) error {
+	if len(e.spans) == 0 {
+		return nil
+	}
+
+	stmt := sqlf.InsertInto(`spans`)
+	defer stmt.Close()
+
+	for i := range e.spans {
+		appVersionTuple := fmt.Sprintf("('%s', '%s')", e.spans[i].Attributes.AppVersion, e.spans[i].Attributes.AppBuild)
+		osVersionTuple := fmt.Sprintf("('%s', '%s')", e.spans[i].Attributes.OSName, e.spans[i].Attributes.OSVersion)
+
+		var b strings.Builder
+		var checkpoints []string
+		b.WriteString("[")
+		for _, cp := range e.spans[i].CheckPoints {
+			checkpoints = append(checkpoints, fmt.Sprintf("('%s','%s')", cp.Name, cp.Timestamp.Format(chrono.MSTimeFormat)))
+		}
+		b.WriteString(strings.Join(checkpoints, ","))
+		b.WriteString("]")
+		formattedCheckpoints := b.String()
+
+		spanSessionStartTime := e.spans[i].Attributes.SessionStartTime.Format(chrono.MSTimeFormat)
+
+		stmt.NewRow().
+			Set(`team_id`, e.teamId).
+			Set(`app_id`, e.spans[i].AppID).
+			Set(`span_name`, e.spans[i].SpanName).
+			Set(`span_id`, e.spans[i].SpanID).
+			Set(`parent_id`, e.spans[i].ParentID).
+			Set(`trace_id`, e.spans[i].TraceID).
+			Set(`session_id`, e.spans[i].SessionID).
+			Set(`status`, e.spans[i].Status).
+			Set(`start_time`, e.spans[i].StartTime.Format(chrono.MSTimeFormat)).
+			Set(`end_time`, e.spans[i].EndTime.Format(chrono.MSTimeFormat)).
+			Set(`checkpoints`, formattedCheckpoints).
+			Set(`attribute.app_unique_id`, e.spans[i].Attributes.AppUniqueID).
+			Set(`attribute.patch_id`, e.spans[i].Attributes.PatchID).
+			Set(`attribute.patch_version`, strings.TrimSpace(e.spans[i].Attributes.PatchVersion)).
+			Set(`attribute.expo_update_id`, e.spans[i].Attributes.ExpoUpdateID).
+			Set(`attribute.expo_runtime_version`, strings.TrimSpace(e.spans[i].Attributes.ExpoRuntimeVersion)).
+			Set(`attribute.is_expo_embedded_launch`, e.spans[i].Attributes.IsExpoEmbeddedLaunch).
+			Set(`attribute.is_expo_using_embedded_assets`, e.spans[i].Attributes.IsExpoUsingEmbeddedAssets).
+			Set(`attribute.expo_automatic_update_policy`, strings.TrimSpace(e.spans[i].Attributes.ExpoAutomaticUpdatePolicy)).
+			Set(`attribute.expo_execution_environment`, strings.TrimSpace(e.spans[i].Attributes.ExpoExecutionEnvironment)).
+			Set(`attribute.expo_version`, strings.TrimSpace(e.spans[i].Attributes.ExpoVersion)).
+			Set(`attribute.expo_sdk_version`, strings.TrimSpace(e.spans[i].Attributes.ExpoSDKVersion)).
+			Set(`attribute.expo_eas_project_id`, strings.TrimSpace(e.spans[i].Attributes.ExpoEASProjectID)).
+			Set(`attribute.installation_id`, e.spans[i].Attributes.InstallationID).
+			Set(`attribute.user_id`, e.spans[i].Attributes.UserID).
+			Set(`attribute.measure_sdk_version`, e.spans[i].Attributes.MeasureSDKVersion).
+			Set(`attribute.app_version`, appVersionTuple).
+			Set(`attribute.os_version`, osVersionTuple).
+			Set(`attribute.thread_name`, e.spans[i].Attributes.ThreadName).
+			Set(`attribute.country_code`, e.spans[i].Attributes.CountryCode).
+			Set(`attribute.network_provider`, e.spans[i].Attributes.NetworkProvider).
+			Set(`attribute.network_type`, e.spans[i].Attributes.NetworkType).
+			Set(`attribute.network_generation`, e.spans[i].Attributes.NetworkGeneration).
+			Set(`attribute.device_name`, e.spans[i].Attributes.DeviceName).
+			Set(`attribute.device_model`, e.spans[i].Attributes.DeviceModel).
+			Set(`attribute.device_manufacturer`, e.spans[i].Attributes.DeviceManufacturer).
+			Set(`attribute.device_locale`, e.spans[i].Attributes.DeviceLocale).
+			Set(`attribute.device_low_power_mode`, e.spans[i].Attributes.LowPowerModeEnabled).
+			Set(`attribute.device_thermal_throttling_enabled`, e.spans[i].Attributes.ThermalThrottlingEnabled).
+			Set(`attribute.session_start_time`, spanSessionStartTime).
+			// user defined attribute
+			Set(`user_defined_attribute`, e.spans[i].UserDefinedAttribute.Parameterize())
+	}
+
+	return server.Server.ChPool.Exec(ctx, stmt.String(), stmt.Args()...)
+}
+
+var gcsCreds struct {
+	sync.Once
+	creds *auth.Credentials
+}
+
+func getGCSCreds() (*auth.Credentials, error) {
+	gcsCreds.Do(func() {
+		creds, err := credentials.DetectDefault(&credentials.DetectOptions{})
+		if err != nil {
+			fmt.Printf("failed to detect GCS credentials: %v\n", err)
+			return
+		}
+		gcsCreds.creds = creds
+	})
+	if gcsCreds.creds == nil {
+		return nil, fmt.Errorf("GCS credentials unavailable")
+	}
+	return gcsCreds.creds, nil
+}
+
+// mintSymboloaderToken returns the bearer credential used for
+// requests to symboloader's /symbols and /symbols/js endpoints.
+//
+// On cloud it mints a Google OIDC ID token scoped to the
+// symboloader origin, satisfying symboloader's Cloud Run IAM
+// invoker check. The token is audience-scoped to the service, so
+// a single value authorizes both the ProGuard and JS lookups
+// regardless of the app's OS. On self-host it returns the static
+// placeholder symboloader currently accepts.
+//
+// Callers must guard on a non-empty SymboloaderOrigin before
+// calling; the cloud path needs it as the token audience.
+func mintSymboloaderToken(ctx context.Context, config *server.ServerConfig) (token string, err error) {
+	if !config.IsCloud() {
+		return "measure", nil
+	}
+	ts, err := idtoken.NewTokenSource(ctx, config.SymboloaderOrigin)
+	if err != nil {
+		return
+	}
+	tok, err := ts.Token()
+	if err != nil {
+		return
+	}
+	return tok.AccessToken, nil
+}
+
+// PushHandler handles incoming Pub/Sub push messages containing
+// ingest batches published by the ingest service.
+func PushHandler(c *gin.Context) {
+	var envelope struct {
+		Message struct {
+			Data string `json:"data"`
+		} `json:"message"`
+	}
+	if err := c.BindJSON(&envelope); err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(envelope.Message.Data)
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	var batch IngestBatch
+	if err := json.Unmarshal(raw, &batch); err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	if err := processIngestBatchSync(c.Request.Context(), batch); err != nil {
+		fmt.Println("failed to process ingest batch:", err)
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	c.Status(http.StatusOK)
+}
+
+// ConsumeHandler is the bus.Consumer handler for message-based ingestion.
+// It processes the batch synchronously so that returning an error causes the
+// consumer to nack/skip-commit the message for redelivery.
+func ConsumeHandler(ctx context.Context, data []byte) error {
+	var batch IngestBatch
+	if err := json.Unmarshal(data, &batch); err != nil {
+		return fmt.Errorf("failed to unmarshal ingest batch: %w", err)
+	}
+	return processIngestBatchSync(ctx, batch)
+}
+
+var ingestBatchUnackCount metric.Int64Counter
+var ingestBatchAckCount metric.Int64Counter
+
+func init() {
+	meter := otel.Meter("measure/ingest-worker")
+
+	unackCounter, err := meter.Int64Counter(
+		"ingest_batch_unack_count",
+		metric.WithDescription("Number of ingest batches received for processing"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	ingestBatchUnackCount = unackCounter
+
+	ackCounter, err := meter.Int64Counter(
+		"ingest_batch_ack_count",
+		metric.WithDescription("Number of ingest batches successfully processed"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	ingestBatchAckCount = ackCounter
+}
+
+// processIngestBatchSync runs the full ingestion processing pipeline
+// synchronously and returns any error encountered. Used by ConsumeHandler
+// and PushHandler so that failed batches can be retried.
+func processIngestBatchSync(ctx context.Context, batch IngestBatch) error {
+	ingestBatchUnackCount.Add(ctx, 1)
+	batchID, err := uuid.Parse(batch.BatchID)
+	if err != nil {
+		return fmt.Errorf("failed to parse batch id: %w", err)
+	}
+	appID, err := uuid.Parse(batch.AppID)
+	if err != nil {
+		return fmt.Errorf("failed to parse app id: %w", err)
+	}
+	teamID, err := uuid.Parse(batch.TeamID)
+	if err != nil {
+		return fmt.Errorf("failed to parse team id: %w", err)
+	}
+
+	app, err := SelectApp(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("failed to lookup app: %w", err)
+	}
+	if app == nil {
+		return fmt.Errorf("failed to lookup app: not found")
+	}
+
+	eventReq := &eventreq{
+		id:                batchID,
+		appId:             appID,
+		teamId:            teamID,
+		osName:            batch.OsName,
+		size:              batch.Size,
+		events:            batch.Events,
+		spans:             batch.Spans,
+		symbolicateEvents: make(map[uuid.UUID]int),
+		symbolicateSpans:  make(map[string]int),
+	}
+
+	// Rebuild exceptionIds, anrIds, appHangIds and symbolication lookups by
+	// scanning events.
+	for i := range eventReq.events {
+		eventReq.events[i].AppID = appID
+		if eventReq.events[i].NeedsSymbolication() {
+			eventReq.symbolicateEvents[eventReq.events[i].ID] = i
+		}
+		if eventReq.events[i].IsException() {
+			eventReq.exceptionIds = append(eventReq.exceptionIds, i)
+		}
+		if eventReq.events[i].IsANR() {
+			eventReq.anrIds = append(eventReq.anrIds, i)
+		}
+		if eventReq.events[i].IsAppHang() {
+			eventReq.appHangIds = append(eventReq.appHangIds, i)
+		}
+	}
+
+	for i := range eventReq.spans {
+		if eventReq.spans[i].NeedsSymbolication() {
+			eventReq.symbolicateSpans[eventReq.spans[i].SpanName] = i
+		}
+	}
+
+	// Validate re-populates UDAttribute.keyTypes for all events and spans.
+	// keyTypes is not serialized in JSON, so it must be rebuilt after
+	// deserializing the IngestBatch from the message bus.
+	//
+	// FIXME: This should be refactored, validate should not have such
+	// side effects.
+	if err := eventReq.validate(); err != nil {
+		return fmt.Errorf("failed to validate batch: %w", err)
+	}
+
+	// Check idempotency — both Pub/Sub and Iggy deliver at-least-once.
+	if err := eventReq.checkSeen(ctx); err != nil {
+		return fmt.Errorf("failed to check seen status: %w", err)
+	}
+	if eventReq.seen {
+		return nil
+	}
+
+	ingestCtx := ambient.WithTeamId(context.Background(), eventReq.teamId)
+	ingestTracer := otel.Tracer("ingest-tracer")
+	ingestCtx, ingestSpan := ingestTracer.Start(ingestCtx, "ingest")
+	defer ingestSpan.End()
+
+	var infuseInetGroup errgroup.Group
+	infuseInetGroup.Go(func() error {
+		_, infuseInetSpan := ingestTracer.Start(ingestCtx, "infuse-inet")
+		defer infuseInetSpan.End()
+		if err := eventReq.infuseInet(batch.ClientIP); err != nil {
+			msg := fmt.Sprintf(`failed to lookup country info for IP: %q`, batch.ClientIP)
+			fmt.Println(msg, err)
+			return err
+		}
+		return nil
+	})
+
+	_, parseANRThreadDumpsSpan := ingestTracer.Start(ingestCtx, "parse-anr-thread-dumps")
+	eventReq.parseANRThreadDumps()
+	parseANRThreadDumpsSpan.End()
+
+	var symbolicationGroup errgroup.Group
+	symbolicationGroup.Go(func() error {
+		if !eventReq.needsSymbolication() {
+			return nil
+		}
+
+		config := server.Server.Config
+		origin := config.SymbolicatorOrigin
+		osName := eventReq.osName
+		sources := []symbolicator.Source{}
+		var sentrySources []symbolicator.SentrySource
+
+		// Mint the symboloader bearer token once per batch. The same
+		// audience-scoped token authorizes both the ProGuard (/symbols)
+		// and JS (/symbols/js) lookups, so it is computed here rather
+		// than per-OS. Stays empty on a cloud minting failure; the
+		// sources below skip rather than send an invalid token.
+		var symboloaderTok string
+		if config.SymboloaderOrigin != "" {
+			if tok, tokErr := mintSymboloaderToken(ingestCtx, config); tokErr != nil {
+				fmt.Printf("failed to obtain symboloader token: %v\n", tokErr)
+			} else {
+				symboloaderTok = tok
+			}
+		}
+
+		switch opsys.ToFamily(osName) {
+		case opsys.Android:
+			if config.IsCloud() {
+				creds, err := getGCSCreds()
+				if err != nil {
+					fmt.Printf("failed to obtain credentials for GCS Android source: %v\n", err)
+				} else if tok, err := creds.Token(ingestCtx); err != nil {
+					fmt.Printf("failed to generate token for GCS Android source: %v\n", err)
+				} else {
+					sources = append(sources, symbolicator.NewGCSSourceAndroid("msr-symbols", config.SymbolsBucket, tok.Value))
+				}
+			} else {
+				sources = append(sources, symbolicator.NewS3SourceAndroid("msr-symbols", config.SymbolsBucket, config.SymbolsBucketRegion, config.AWSEndpoint, config.SymbolsAccessKey, config.SymbolsSecretAccessKey))
+			}
+			if symboloaderTok != "" {
+				sentrySources = append(sentrySources, symbolicator.NewSentrySource("msr-symbols-sentry", config.SymboloaderOrigin+"/symbols", symboloaderTok))
+			}
+		case opsys.AppleFamily:
+			if config.IsCloud() {
+				creds, err := getGCSCreds()
+				if err != nil {
+					fmt.Printf("failed to obtain credentials for GCS Apple source: %v\n", err)
+				} else if tok, err := creds.Token(ingestCtx); err != nil {
+					fmt.Printf("failed to generate token for GCS Apple source: %v\n", err)
+				} else {
+					sources = append(sources, symbolicator.NewGCSSourceApple("msr-symbols", config.SymbolsBucket, tok.Value))
+					if config.SystemSymbolsBucket != "" {
+						sources = append(sources, symbolicator.NewGCSSourceApple("msr-system-symbols", config.SystemSymbolsBucket, tok.Value))
+					}
+				}
+			} else {
+				sources = append(sources, symbolicator.NewS3SourceApple("msr-symbols", config.SymbolsBucket, config.SymbolsBucketRegion, config.AWSEndpoint, config.SymbolsAccessKey, config.SymbolsSecretAccessKey))
+				if config.SystemSymbolsBucket != "" {
+					sources = append(sources, symbolicator.NewS3SourceApple("msr-system-symbols", config.SystemSymbolsBucket, config.SymbolsBucketRegion, config.AWSEndpoint, config.SymbolsAccessKey, config.SymbolsSecretAccessKey))
+				}
+			}
+		}
+
+		symblctr := symbolicator.New(origin, osName, sources, sentrySources)
+		symblctr.SymboloaderOrigin = config.SymboloaderOrigin
+		symblctr.SymboloaderToken = symboloaderTok
+
+		_, symbolicationSpan := ingestTracer.Start(ingestCtx, "symbolicate-events")
+		defer symbolicationSpan.End()
+
+		if err := symblctr.Symbolicate(ingestCtx, server.Server.PgPool, eventReq.appId, eventReq.events, eventReq.spans); err != nil {
+			fmt.Printf("failed to symbolicate batch %q containing %d events & %d spans: %v\n", eventReq.id, len(eventReq.events), len(eventReq.spans), err.Error())
+			return err
+		}
+
+		return nil
+	})
+
+	if err := infuseInetGroup.Wait(); err != nil {
+		fmt.Println("failed to lookup IP info")
+	}
+	if err := symbolicationGroup.Wait(); err != nil {
+		fmt.Println("failed to symbolicate", err)
+	}
+
+	eventReq.truncateMessages()
+
+	var ingestGroup errgroup.Group
+	ingestGroup.Go(func() error {
+		_, ingestEventsSpan := ingestTracer.Start(ingestCtx, "ingest-events")
+		defer ingestEventsSpan.End()
+		if err := eventReq.ingestEvents(ingestCtx); err != nil {
+			fmt.Println(`failed to ingest events`, err)
+			return err
+		}
+		return nil
+	})
+	ingestGroup.Go(func() error {
+		_, ingestSpansSpan := ingestTracer.Start(ingestCtx, "ingest-spans")
+		defer ingestSpansSpan.End()
+		if err := eventReq.ingestSpans(ingestCtx); err != nil {
+			fmt.Println(`failed to ingest spans`, err)
+			return err
+		}
+		return nil
+	})
+	if err := ingestGroup.Wait(); err != nil {
+		return fmt.Errorf("failed to ingest: %w", err)
+	}
+
+	var bucketGroup errgroup.Group
+	bucketGroup.Go(func() error {
+		_, bucketExceptionsSpan := ingestTracer.Start(ingestCtx, "bucket-exceptions")
+		defer bucketExceptionsSpan.End()
+		if err := eventReq.bucketExceptions(ingestCtx); err != nil {
+			fmt.Println(`failed to bucket exceptions`, err)
+			return err
+		}
+		return nil
+	})
+	bucketGroup.Go(func() error {
+		_, bucketAnrsSpan := ingestTracer.Start(ingestCtx, "bucket-anrs")
+		defer bucketAnrsSpan.End()
+		if err := eventReq.bucketANRs(ingestCtx); err != nil {
+			fmt.Println(`failed to bucket anrs`, err)
+			return err
+		}
+		return nil
+	})
+	bucketGroup.Go(func() error {
+		_, bucketAppHangsSpan := ingestTracer.Start(ingestCtx, "bucket-app-hangs")
+		defer bucketAppHangsSpan.End()
+		if err := eventReq.bucketAppHangs(ingestCtx); err != nil {
+			fmt.Println(`failed to bucket app hangs`, err)
+			return err
+		}
+		return nil
+	})
+	if err := bucketGroup.Wait(); err != nil {
+		return fmt.Errorf("failed to bucket issues: %w", err)
+	}
+
+	var metricsGroup errgroup.Group
+	metricsGroup.Go(func() error {
+		_, ingestMetricsSpan := ingestTracer.Start(ingestCtx, "ingest-metrics")
+		defer ingestMetricsSpan.End()
+
+		sessions, events, spans, attachments := eventReq.countMetrics()
+
+		insertMetricsIngestionSelectStmt := sqlf.
+			Select("? AS team_id", eventReq.teamId).
+			Select("? AS app_id", app.ID).
+			Select("? AS timestamp", time.Now()).
+			Select("sumState(CAST(? AS UInt32)) AS sessions", sessions).
+			Select("sumState(CAST(? AS UInt32)) AS events", events).
+			Select("sumState(CAST(? AS UInt32)) AS spans", spans).
+			Select("sumState(CAST(? AS UInt32)) AS attachments", attachments).
+			Select("sumState(CAST(? AS UInt32)) AS metrics", 0).
+			Select("sumState(CAST(? AS UInt64)) AS bytes_in", eventReq.size)
+		selectSQL := insertMetricsIngestionSelectStmt.String()
+		args := insertMetricsIngestionSelectStmt.Args()
+		defer insertMetricsIngestionSelectStmt.Close()
+		insertMetricsIngestionFullStmt := "INSERT INTO ingestion_metrics " + selectSQL
+
+		asyncCtx := clickhouse.Context(ingestCtx, clickhouse.WithAsync(true))
+		if err := server.Server.ChPool.Exec(asyncCtx, insertMetricsIngestionFullStmt, args...); err != nil {
+			fmt.Println(`failed to insert ingestion metrics`, err)
+			return err
+		}
+		return nil
+	})
+	if err := metricsGroup.Wait(); err != nil {
+		return fmt.Errorf("failed to count ingestion metrics: %w", err)
+	}
+
+	_, rememberIngestSpan := ingestTracer.Start(ingestCtx, "remember-ingest")
+	defer rememberIngestSpan.End()
+
+	if err := eventReq.remember(ingestCtx); err != nil {
+		return fmt.Errorf("failed to remember event request: %w", err)
+	}
+
+	if eventReq.onboardable() && !app.Onboarded {
+		_, onboardAppSpan := ingestTracer.Start(ingestCtx, "onboard-app")
+		defer onboardAppSpan.End()
+
+		tx, err := server.Server.PgPool.BeginTx(ingestCtx, pgx.TxOptions{
+			IsoLevel: pgx.ReadCommitted,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to acquire transaction while onboarding app: %w", err)
+		}
+		defer tx.Rollback(ingestCtx)
+
+		uniqueID := eventReq.getAppUniqueID()
+		osName := eventReq.getOSName()
+		version := eventReq.getOSVersion()
+
+		if err := app.Onboard(ingestCtx, &tx, uniqueID, version); err != nil {
+			return fmt.Errorf("failed to onboard app: %w", err)
+		}
+
+		if err := tx.Commit(ingestCtx); err != nil {
+			return fmt.Errorf("failed to commit app onboard transaction: %w", err)
+		}
+
+		fireFirstIngestionEvents(ingestCtx, *app.ID, app.TeamId, osName)
+	}
+
+	// Keep the app's recorded os_names current on every batch (not just at
+	// onboarding) so an app that later reports another OS of the same family
+	// — e.g. ipados in addition to ios — is captured. The in-memory guard
+	// means a write happens only when a genuinely new OS appears. The set is
+	// kept single-family here; cross-family values are skipped. Best-effort:
+	// a failure must not fail ingestion — a later batch with the OS retries.
+	if eventReq.onboardable() {
+		batchOS := eventReq.getOSName()
+		if batchOS != "" && !slices.Contains(app.OSNames, batchOS) {
+			if len(app.OSNames) == 0 || opsys.SameFamily(batchOS, app.OSNames[0]) {
+				if err := app.AddOSName(ingestCtx, batchOS); err != nil {
+					fmt.Printf("failed to update os_names for app %s: %v\n", app.ID, err)
+				}
+			} else {
+				fmt.Printf("ignoring cross-family os_name %q for app %s (existing family %q)\n", batchOS, app.ID, app.OSNames[0])
+			}
+		}
+	}
+
+	// Track usage with Autumn as the very last step. Must come after
+	// eventReq.remember() — a Track without a recorded ingestion would be
+	// re-fired on retry and double-bill the customer. Anything inserted
+	// after this would also re-run on retry, so don't add steps below.
+	trackBatchBytes(eventReq.teamId, eventReq.size)
+
+	ingestBatchAckCount.Add(ctx, 1)
+	return nil
+}

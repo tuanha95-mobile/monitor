@@ -1,0 +1,94 @@
+appId: ${APP_ID}
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "Native iOS"
+    timeout: 5000
+- tapOn: "Native iOS"
+
+- scrollUntilVisible:
+    element:
+      text: "Set User ID"
+- tapOn: "Set User ID"
+
+- scrollUntilVisible:
+    direction: UP
+    element:
+      text: ".*200 OK.*"
+- tapOn: ".*200 OK.*"
+
+- scrollUntilVisible:
+    element:
+      text: "Custom Event"
+- tapOn: "Custom Event"
+
+- scrollUntilVisible:
+    element:
+      text: ".*Track Logs.*"
+- tapOn: ".*Track Logs.*"
+- runFlow:
+    file: ../send_logs.yaml
+- tapOn: "Close"
+
+- scrollUntilVisible:
+    element:
+      text: "Track Error"
+- tapOn: "Track Error"
+
+- scrollUntilVisible:
+    element:
+      text: "Create Span"
+- tapOn: "Create Span"
+
+- tapOn: "Back"
+
+- extendedWaitUntil:
+    visible: "React Native"
+    timeout: 10000
+- tapOn: "React Native"
+- scrollUntilVisible:
+    element:
+      text: ".*Track Logs.*"
+- tapOn: ".*Track Logs.*"
+- runFlow:
+    file: ../send_logs.yaml
+- tapOn: "Info"
+- tapOn: "Track Console Log"
+# Close the log modal, then leave the React Native screen. On iOS the first
+# Back tap off the RN screen is absorbed by the RN view; the second navigates.
+- tapOn: "Back"
+- tapOn: "Back"
+- tapOn: "Back"
+
+- extendedWaitUntil:
+    visible: "Flutter"
+    timeout: 10000
+- tapOn: "Flutter"
+- scrollUntilVisible:
+    element:
+      text: ".*Track Logs.*"
+- tapOn: ".*Track Logs.*"
+- runFlow:
+    file: ../send_logs.yaml
+- tapOn: "Back"
+
+- extendedWaitUntil:
+    visible: "Compose Multiplatform"
+    timeout: 10000
+- tapOn: "Compose Multiplatform"
+- scrollUntilVisible:
+    element:
+      text: ".*Track Logs.*"
+    centerElement: true
+- tapOn: ".*Track Logs.*"
+- runFlow:
+    file: ../send_logs.yaml
+- tapOn: "Back"
+- tapOn: "Back"
+
+- pressKey: Home
+- launchApp:
+    stopApp: false
+- extendedWaitUntil:
+    visible: "Native iOS"
+    timeout: 5000

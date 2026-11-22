@@ -1,0 +1,191 @@
+package email
+
+import (
+	"fmt"
+	"html"
+	"time"
+
+	"backend/libs/alertmsg"
+)
+
+// escape turns a value that came from a person into text the mail client
+// renders literally instead of parsing as markup. Team names, roles and
+// email addresses all reach these builders as raw input, so a team named
+// `<img src=...>` would otherwise place that tag inside the HTML body of
+// every invite and membership email sent about the team.
+func escape(s string) string {
+	return html.EscapeString(s)
+}
+
+// AddedToTeamEmail builds the email sent when a user is added to a team.
+func AddedToTeamEmail(teamName, role, addedByEmail, siteOrigin, teamId string) (subject, body string) {
+	subject = "Added to Measure team"
+	msg := fmt.Sprintf("You have been added to team <b>%s</b> as <b>%s</b> by <b>%s</b>", escape(teamName), escape(role), escape(addedByEmail))
+	url := siteOrigin + "/" + teamId + "/overview"
+	body = RenderEmailBody(subject, MessageContent(msg), "Go to Dashboard", url)
+	return
+}
+
+// InviteNewUserEmail builds the email sent when a new user is invited to a team.
+func InviteNewUserEmail(inviterEmail, role, teamName string, validityDays int, siteOrigin, inviteId string) (subject, body string) {
+	subject = "Invitation to join Measure"
+	dayStr := "day"
+	if validityDays != 1 {
+		dayStr = "days"
+	}
+	msg := fmt.Sprintf("You have been invited by <b>%s</b> as <b>%s</b> in team <b>%s</b>! <br/><br/>This invite is valid for <b>%d %s</b>.", escape(inviterEmail), escape(role), escape(teamName), validityDays, dayStr)
+	url := siteOrigin + "/auth/login?inviteId=" + inviteId
+	body = RenderEmailBody(subject, MessageContent(msg), "Join Team", url)
+	return
+}
+
+// InviteExistingUserEmail builds the email sent when an existing user is invited to a team.
+func InviteExistingUserEmail(inviterEmail, role, teamName, siteOrigin string) (subject, body string) {
+	subject = "Invitation to join Measure"
+	msg := fmt.Sprintf("You have been invited by <b>%s</b> as <b>%s</b> in team <b>%s</b>!", escape(inviterEmail), escape(role), escape(teamName))
+	url := siteOrigin + "/auth/login"
+	body = RenderEmailBody(subject, MessageContent(msg), "Join Team", url)
+	return
+}
+
+// RemovedFromTeamEmail builds the email sent when a user is removed from a team.
+// memberTeamId is the member's remaining default team; pass an empty string
+// when the member has no team left, which links to the dashboard root.
+func RemovedFromTeamEmail(teamName, removedByEmail, siteOrigin, memberTeamId string) (subject, body string) {
+	subject = "Removed from Measure team"
+	msg := fmt.Sprintf("You have been removed from team <b>%s</b> by <b>%s</b>", escape(teamName), escape(removedByEmail))
+	url := siteOrigin
+	if memberTeamId != "" {
+		url = siteOrigin + "/" + memberTeamId + "/overview"
+	}
+	body = RenderEmailBody(subject, MessageContent(msg), "Go to Dashboard", url)
+	return
+}
+
+// RoleChangedEmail builds the email sent when a user's role is changed.
+func RoleChangedEmail(newRole, changedByEmail, teamName, siteOrigin, teamId string) (subject, body string) {
+	subject = "Role changed in Measure team"
+	msg := fmt.Sprintf("Your role has been changed to <b>%s</b> by <b>%s</b> in team <b>%s</b>", escape(newRole), escape(changedByEmail), escape(teamName))
+	url := siteOrigin + "/" + teamId + "/overview"
+	body = RenderEmailBody(subject, MessageContent(msg), "Go to Dashboard", url)
+	return
+}
+
+// CrashSpikeAlertEmail builds the crash spike alert email from the plain
+// text alert message.
+func CrashSpikeAlertEmail(appName, alertMsg, alertURL string) (subject, body string) {
+	subject = appName + " - Crash Spike Alert"
+	body = RenderEmailBody(escape(appName), PlainTextContent(alertMsg), "View in Dashboard", alertURL)
+	return
+}
+
+// AnrSpikeAlertEmail builds the ANR spike alert email from the plain
+// text alert message.
+func AnrSpikeAlertEmail(appName, alertMsg, alertURL string) (subject, body string) {
+	subject = appName + " - ANR Spike Alert"
+	body = RenderEmailBody(escape(appName), PlainTextContent(alertMsg), "View in Dashboard", alertURL)
+	return
+}
+
+// BugReportAlertEmail builds the bug report alert email from the plain
+// text alert message. A non-empty userId is named in the subject.
+func BugReportAlertEmail(appName, userId, alertMsg, alertURL string) (subject, body string) {
+	subject = alertmsg.BugReportTitle(appName, userId)
+	body = RenderEmailBody(escape(appName), PlainTextContent(alertMsg), "View in Dashboard", alertURL)
+	return
+}
+
+// TeamDailySummaryEmail builds the daily summary email for a team,
+// covering all of the team's apps that recorded data.
+func TeamDailySummaryEmail(teamName string, date time.Time, apps []AppDailySummary, siteOrigin, teamId string) (subject, body string) {
+	subject = teamName + " Daily Summary"
+	dashboardURL := fmt.Sprintf("%s/%s/overview", siteOrigin, teamId)
+	body = RenderEmailBody(escape(subject), TeamDailySummaryContent(date, apps), "View Full Dashboard", dashboardURL)
+	return
+}
+
+// UsageLimitEmail builds the usage limit threshold notification email.
+// Percentages are safe to include (they're plan-agnostic); absolute byte
+// counts are not, since the dashboard is the source of truth for plan limits.
+// isEnterprise swaps the Pro upgrade CTA for a contact-us mailto link and
+// drops the monthly framing, since an enterprise plan buys data for a term
+// rather than per month. The free allowance the team falls back on afterwards
+// is the monthly one the message at 100 names.
+func UsageLimitEmail(teamName, teamId, siteOrigin string, threshold int, isEnterprise bool) (subject, body string) {
+	ctaText := "Upgrade to Measure Pro"
+	ctaURL := fmt.Sprintf("%s/%s/usage", siteOrigin, teamId)
+	if isEnterprise {
+		ctaText = "Contact Us"
+		ctaURL = "mailto:hello@measure.sh"
+	}
+
+	var title, message string
+	switch threshold {
+	case 100:
+		subject = fmt.Sprintf("%s - Usage Limit Reached", teamName)
+		title = "Usage Limit Reached"
+		if isEnterprise {
+			message = fmt.Sprintf(`Your team <strong>%s</strong> has ingested all the data its plan allows.<br><br>Ingestion is paused and will resume when the monthly free allowance resets. Contact us if you need a higher limit.`, escape(teamName))
+		} else {
+			message = fmt.Sprintf(`Your team <strong>%s</strong> has reached its plan's data limit this month.<br><br>Data ingestion has been paused. Upgrade to Measure Pro to resume.`, escape(teamName))
+		}
+	default:
+		subject = fmt.Sprintf("%s - %d%% of Usage Limit Reached", teamName, threshold)
+		title = fmt.Sprintf("%d%% Usage Limit Reached", threshold)
+		if isEnterprise {
+			message = fmt.Sprintf(`Your team <strong>%s</strong> has used <strong>%d%%</strong> of its plan's data limit.<br><br>Contact us if you need a higher limit.`, escape(teamName), threshold)
+		} else {
+			message = fmt.Sprintf(`Your team <strong>%s</strong> has used <strong>%d%%</strong> of its plan's data limit this month.<br><br>Consider upgrading to Measure Pro for unlimited usage!`, escape(teamName), threshold)
+		}
+	}
+
+	body = RenderEmailBody(title, UsageLimitContent(message, threshold), ctaText, ctaURL)
+	return
+}
+
+// UpgradeEmail builds the upgrade notification email.
+func UpgradeEmail(teamName, teamId, siteOrigin string) (subject, body string) {
+	subject = fmt.Sprintf("%s - Upgraded to Measure Pro", teamName)
+	title := "Upgraded to Measure Pro"
+	dashboardURL := fmt.Sprintf("%s/%s/usage", siteOrigin, teamId)
+	message := fmt.Sprintf(`Your team <strong>%s</strong> has been upgraded to Measure Pro!`, escape(teamName))
+	body = RenderEmailBody(title, MessageContent(message), "Go to Dashboard", dashboardURL)
+	return
+}
+
+// ManualDowngradeEmail builds the manual downgrade notification email.
+func ManualDowngradeEmail(teamName, teamId, siteOrigin string) (subject, body string) {
+	subject = fmt.Sprintf("%s - Downgraded to Free Plan", teamName)
+	title := "Downgraded to Free Plan"
+	dashboardURL := fmt.Sprintf("%s/%s/usage", siteOrigin, teamId)
+	message := fmt.Sprintf(`Your team <strong>%s</strong> has been downgraded to the free plan.<br><br>Check your dashboard for the new usage and retention limits.`, escape(teamName))
+	body = RenderEmailBody(title, MessageContent(message), "Go to Dashboard", dashboardURL)
+	return
+}
+
+// FormatNumber formats a number into a human-readable abbreviated string.
+// For example: 1000 -> "1K", 1000000 -> "1M", 1500000 -> "1.5M".
+func FormatNumber(n uint64) string {
+	if n >= 1000000000 {
+		val := float64(n) / 1000000000
+		if val == float64(int(val)) {
+			return fmt.Sprintf("%dB", int(val))
+		}
+		return fmt.Sprintf("%.1fB", val)
+	}
+	if n >= 1000000 {
+		val := float64(n) / 1000000
+		if val == float64(int(val)) {
+			return fmt.Sprintf("%dM", int(val))
+		}
+		return fmt.Sprintf("%.1fM", val)
+	}
+	if n >= 1000 {
+		val := float64(n) / 1000
+		if val == float64(int(val)) {
+			return fmt.Sprintf("%dK", int(val))
+		}
+		return fmt.Sprintf("%.1fK", val)
+	}
+	return fmt.Sprintf("%d", n)
+}

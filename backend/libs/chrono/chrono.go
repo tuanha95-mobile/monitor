@@ -1,0 +1,44 @@
+package chrono
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+const ISOFormatJS = "2006-01-02T15:04:05.999Z"
+
+// MSTimeFormat is the format of datetime in milliseconds when
+// converting datetime values before inserting into database
+const MSTimeFormat = "2006-01-02 15:04:05.999"
+
+type ISOTime time.Time
+
+func (t *ISOTime) MarshalJSON() ([]byte, error) {
+	time := time.Time(*t).Format(ISOFormatJS)
+	return json.Marshal(time)
+}
+
+func (i *ISOTime) Scan(src any) error {
+	switch t := src.(type) {
+	case time.Time:
+		*i = ISOTime(t)
+		return nil
+	default:
+		return fmt.Errorf("failed to convert to ISOTime type from %T", t)
+	}
+}
+
+// Sleep sleeps for d duration.
+func Sleep(d time.Duration) {
+	time.Sleep(d)
+}
+
+// JitterySleep sleeps with randomly
+// added jitter. Prefer this sleep
+// to avoid thundering herd problems.
+func JitterySleep(d time.Duration) {
+	jitter := time.Duration(rand.IntN(10)) * time.Second
+	Sleep(d + jitter)
+}

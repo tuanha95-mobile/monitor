@@ -1,0 +1,69 @@
+---
+title: Open Source Sentry Alternative
+description: Mobile focused, open source alternative to Sentry. Crashes, ANRs, performance, network and full session replays for mobile engineering teams with simple pricing.
+canonical: /sentry-alternative
+---
+
+# Looking for Sentry alternatives?
+
+Sentry is a popular error monitoring tool with roots in the web dev world. Mobile support is a more recent expansion to the core error monitoring platform.
+
+Measure is a mobile first, open source Sentry alternative.
+
+## Full session context on every issue
+
+Sentry gives you stack traces and breadcrumbs out of the box with Session Replays billed separately. If you want full context on every error, you will need to turn on Session Replays for all of them and accommodate the considerable cost increase.
+
+Measure attaches a full [Session Replay](/product/session-replays) with gestures, navigation, network calls, lifecycle events and custom spans to every crash, ANR and error and you only pay for the data used as a whole.
+
+You see exactly what the user did and what the app did, on every issue, without any compromise on the context.
+
+## Adaptive capture, not fixed sampling
+
+Sentry uses client-side sampling. You set a sample rate for traces and replays and decide up front what fraction to keep.
+
+Measure captures full session context by default, and with [Adaptive Capture](/product/adaptive-capture) you can tune what you collect remotely, without shipping an app update.
+
+Dial up sample rates on new releases or when chasing tricky production issues, dial down whenever you need to.
+
+## Fully open source
+
+Sentry uses a custom source-available rather than OSI open source: its main application and dashboard ship under the Functional Source License (FSL) with only the SDKs being MIT and the main application only going Apache 2.0 after 2 years.
+
+Measure is [fully open source](https://github.com/measure-sh/measure). Read it, run it, self-host it, audit the pipeline and if you think something can be done better, send a pull request.
+
+## Simple, predictable pricing
+
+Sentry bills across a range of separate features: errors, spans, replays all cost different amounts across various tiers which makes it harder to predict costs as your app scales up.
+
+Measure has a single, transparent [price](/pricing) based on how much data you use. No per-seat fees, no separate product meters. With [Adaptive Capture](/product/adaptive-capture) you can dial collection up or down without rolling out app updates to control your costs even better.
+
+## Built for mobile, by mobile devs
+
+Sentry monitors servers, cloud, serverless, frontend, games and mobile across dozens of SDKs. Mobile is one platform among many, and the defaults, platform decisions, dashboards and product roadmap are shaped by the whole platform rather than by the needs of mobile devs alone.
+
+Measure is built only for mobile. [Crashes & ANRs](/product/crashes-and-anrs), [App Health](/product/app-health), [Performance Traces](/product/performance-traces), [Network Performance](/product/network-performance), [Bug Reports](/product/bug-reports), [User Journeys](/product/user-journeys) and [Funnels](/product/funnels) are all designed around how mobile apps actually break in production.
+
+Mobile is not a part of our product, it is the whole product.
+
+## Measure vs Sentry
+
+| Capability | Measure | Sentry |
+| --- | --- | --- |
+| Crash reporting with full session replays | ✓ | Crash reports with breadcrumbs, Session replay billed separately |
+| ANR detection with full session replays | ✓ | ANRs with breadcrumbs, Session replay billed separately |
+| Performance traces | ✓ | ✓ |
+| Network monitoring | ✓ | ✓ |
+| User journeys | ✓ | ✗ |
+| Funnels with drop-off analysis | ✓ | ✗ |
+| In-app bug reports | ✓ | ✓ |
+| Session replay on every issue | ✓ | Session Replay billed separately |
+| Dynamic Sampling with Adaptive Capture | ✓ | Client side only sampling |
+| Auto-captured context | Gestures, navigation, network, lifecycle | Breadcrumbs, deeper context via Replay |
+| Pricing | Simple pricing based on data usage | Separate quotas for errors, spans, replays, profiling, cron, uptime & logs |
+| Open Source | Apache 2.0 (OSI open source) | FSL — source-available, Apache 2.0 after 2 years |
+| Self-hostable | ✓ | ✓ |
+| Public roadmap & issue tracker | ✓ | ✓ |
+| Mobile focus | ✓ | One of many Sentry platforms |
+
+Get started: <https://measure.sh/auth/login>

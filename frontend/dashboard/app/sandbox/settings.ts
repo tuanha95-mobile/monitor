@@ -1,0 +1,515 @@
+import { SANDBOX_TEAM_ID } from "../utils/sandbox";
+import { catalog } from "./catalog";
+import {
+  isWithinRange,
+  jsonResponse,
+  notAvailable,
+  paginate,
+  parseRange,
+  SandboxRoute,
+  SandboxRouteContext,
+} from "./query";
+import { matchesFilterExpr } from "./filter";
+import { SANDBOX_ADMIN, SANDBOX_OWNER } from "./team";
+
+export const SANDBOX_APP_ID = catalog().apps[0].id;
+
+const SANDBOX_USER_ID = "00000000-0000-4000-8000-000000000001";
+
+function daysAgoIso(days: number): string {
+  return catalog().builtAt.minus({ days }).toISO()!;
+}
+
+function memberSinceDays(): number {
+  const oldest = Math.max(
+    ...Array.from(catalog().appById.values()).map(
+      (bundle) => bundle.scenario.app.createdDaysAgo,
+    ),
+  );
+  return oldest + 30;
+}
+
+function sandboxSessionUser() {
+  const since = daysAgoIso(memberSinceDays());
+  return {
+    id: SANDBOX_USER_ID,
+    own_team_id: SANDBOX_TEAM_ID,
+    name: "Acme Developer",
+    email: "developer@acme.shop",
+    avatar_url: "",
+    confirmed_at: since,
+    last_sign_in_at: daysAgoIso(0),
+    created_at: since,
+    updated_at: daysAgoIso(1),
+  };
+}
+
+function sandboxTeams() {
+  return [catalog().team];
+}
+
+function sandboxApps() {
+  return catalog().apps;
+}
+
+function sandboxAuthzAndMembers() {
+  const user = sandboxSessionUser();
+  return {
+    can_invite_roles: ["developer", "viewer"],
+    can_update_bug_reports: false,
+    // The sandbox keeps pins in memory, so visitors can pin and reorder funnels.
+    can_change_funnels: true,
+    can_change_billing: false,
+    can_create_app: false,
+    can_rename_app: false,
+    can_change_retention: false,
+    can_rotate_api_key: false,
+    can_write_sdk_config: false,
+    can_rename_team: false,
+    can_manage_slack: false,
+    can_change_app_threshold_prefs: false,
+    members: [
+      {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: "developer",
+        last_sign_in_at: user.last_sign_in_at,
+        created_at: user.created_at,
+        authz: {
+          current_user_assignable_roles_for_member: [],
+          current_user_can_remove_member: false,
+        },
+      },
+      ...[SANDBOX_OWNER, SANDBOX_ADMIN].map((member) => ({
+        ...member,
+        last_sign_in_at: daysAgoIso(1),
+        created_at: user.created_at,
+        authz: {
+          current_user_assignable_roles_for_member: [],
+          current_user_can_remove_member: false,
+        },
+      })),
+    ],
+  };
+}
+
+export const teamRoutes: SandboxRoute[] = [
+  {
+    method: "GET",
+    path: "/api/auth/session",
+    handle: () => jsonResponse({ user: sandboxSessionUser() }),
+  },
+  {
+    method: "GET",
+    path: "/api/teams",
+    handle: () => jsonResponse(sandboxTeams()),
+  },
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/apps",
+    handle: () => jsonResponse(sandboxApps()),
+  },
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/authz",
+    handle: () => jsonResponse(sandboxAuthzAndMembers()),
+  },
+];
+
+function handleAlerts(ctx: SandboxRouteContext, appId: string): Response {
+  const bundle = catalog().appById.get(appId);
+  const range = parseRange(ctx.url);
+  const inRange = (bundle?.alerts ?? []).filter((alert) =>
+    isWithinRange(alert.created_at, range),
+  );
+  const { items, hasNext, hasPrev } = paginate(inRange, ctx.url);
+  return jsonResponse({
+    meta: { next: hasNext, previous: hasPrev },
+    results: items,
+  });
+}
+
+const SANDBOX_SDK_CONFIG = {
+  trace_sampling_rate: 100,
+  error_replay_duration: 30,
+  error_fatal_take_screenshot: true,
+  error_fatal_replay_enabled: true,
+  error_unhandled_replay_enabled: true,
+  error_handled_replay_enabled: false,
+  error_fatal_sampling_rate: 100,
+  error_unhandled_sampling_rate: 100,
+  error_handled_sampling_rate: 10,
+  anr_timeline_duration: 30,
+  anr_take_screenshot: true,
+  app_hang_threshold_millis: 2000,
+  app_hang_timeline_duration: 30,
+  app_hang_sampling_rate: 100,
+  app_hang_replay_enabled: true,
+  bug_report_timeline_duration: 30,
+  launch_sampling_rate: 100,
+  journey_sampling_rate: 100,
+  http_sampling_rate: 100,
+  http_disable_event_for_urls: [] as string[],
+  http_track_request_for_urls: [] as string[],
+  http_track_response_for_urls: [] as string[],
+  http_blocked_headers: [] as string[],
+  screenshot_mask_level: "all_text_and_media",
+  profile_sampling_rate: 10,
+  memory_usage_interval: 5,
+  memory_usage_background_interval: 10,
+  memory_usage_session_sampling_rate: 100,
+  log_autocollect_enabled: true,
+  log_min_severity: 12,
+  log_ignore_patterns: [] as string[],
+};
+
+type SandboxSdkConfig = typeof SANDBOX_SDK_CONFIG;
+
+type ConfigHistoryStep = {
+  by: typeof SANDBOX_OWNER;
+  androidOnly?: boolean;
+  before: Partial<SandboxSdkConfig>;
+};
+
+// Oldest first. A step's new values come from the next step that changes the
+// same setting, or from SANDBOX_SDK_CONFIG for the newest change. Only owners
+// and admins can change data collection settings, so every step is made by
+// SANDBOX_OWNER or SANDBOX_ADMIN.
+const CONFIG_HISTORY_STEPS: ConfigHistoryStep[] = [
+  { by: SANDBOX_OWNER, before: { trace_sampling_rate: 10 } },
+  {
+    by: SANDBOX_OWNER,
+    before: { error_handled_sampling_rate: 100, error_replay_duration: 60 },
+  },
+  { by: SANDBOX_ADMIN, before: { http_track_request_for_urls: [] } },
+  {
+    by: SANDBOX_ADMIN,
+    before: { screenshot_mask_level: "sensitive_fields_only" },
+  },
+  {
+    by: SANDBOX_ADMIN,
+    androidOnly: true,
+    before: { anr_take_screenshot: false, anr_timeline_duration: 15 },
+  },
+  {
+    by: SANDBOX_OWNER,
+    before: { trace_sampling_rate: 50, profile_sampling_rate: 1 },
+  },
+  {
+    by: SANDBOX_ADMIN,
+    before: { log_min_severity: 8, log_ignore_patterns: ["^\\[analytics\\]"] },
+  },
+  {
+    by: SANDBOX_ADMIN,
+    before: {
+      http_track_request_for_urls: ["https://api.acme.shop/v2/checkout/*"],
+    },
+  },
+  {
+    by: SANDBOX_OWNER,
+    before: {
+      error_handled_sampling_rate: 25,
+      error_replay_duration: 45,
+      memory_usage_interval: 2,
+    },
+  },
+];
+
+// Younger apps have fewer changes, keeping the most recent steps, and the
+// changes are spread from a few days after the app was created to a few days
+// ago.
+function sandboxConfigHistory(appId: string) {
+  const appIndex = catalog().apps.findIndex((app) => app.id === appId);
+  const bundle = catalog().appById.get(appId);
+  if (!bundle) {
+    return [];
+  }
+  const app = bundle.scenario.app;
+  const count =
+    app.createdDaysAgo >= 200 ? 8 : app.createdDaysAgo >= 170 ? 7 : 6;
+  const steps = CONFIG_HISTORY_STEPS.filter(
+    (step) => !step.androidOnly || app.os === "android",
+  ).slice(-count);
+
+  const firstDaysAgo = app.createdDaysAgo - 3;
+  const lastDaysAgo = 3;
+  const state: SandboxSdkConfig = { ...SANDBOX_SDK_CONFIG };
+  const entries = [];
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    const changes: Record<string, { old: unknown; new: unknown }> = {};
+    for (const [field, before] of Object.entries(step.before)) {
+      const key = field as keyof SandboxSdkConfig;
+      changes[key] = { old: before, new: state[key] };
+      (state as Record<string, unknown>)[key] = before;
+    }
+    const daysAgo = Math.round(
+      firstDaysAgo - ((firstDaysAgo - lastDaysAgo) * i) / (steps.length - 1),
+    );
+    const changedAt = catalog()
+      .builtAt.minus({ days: daysAgo })
+      .set({
+        hour: 9 + ((i * 5 + appIndex * 3) % 9),
+        minute: (i * 17 + appIndex * 11) % 60,
+        second: 0,
+        millisecond: 0,
+      });
+    entries.push({
+      id: `00000000-0000-4000-9000-${String(appIndex * 100 + i).padStart(12, "0")}`,
+      changed_at: changedAt.toISO()!,
+      changed_by_email: step.by.email,
+      changes,
+    });
+  }
+  return entries;
+}
+
+function sandboxThresholdPrefs(appId: string) {
+  return {
+    app_id: appId,
+    error_good_threshold: 99.0,
+    error_caution_threshold: 97.0,
+    error_spike_min_count_threshold: 2,
+    error_spike_min_rate_threshold: 2.0,
+    created_at: daysAgoIso(30),
+    updated_at: daysAgoIso(5),
+  };
+}
+
+const SANDBOX_APP_RETENTION = { retention: 90 };
+
+function handleBuilds(ctx: SandboxRouteContext, appId: string): Response {
+  const bundle = catalog().appById.get(appId);
+  const range = parseRange(ctx.url);
+  const filterExpr = ctx.url.searchParams.get("filter_expr");
+  const inRange = (bundle?.builds ?? [])
+    .map((build) => {
+      const files = build.files.filter(
+        (file) =>
+          isWithinRange(file.last_updated, range) &&
+          matchesFilterExpr(
+            {
+              version_name: build.version_name,
+              version_code: build.version_code,
+              mapping_type: file.mapping_type,
+            },
+            filterExpr,
+          ),
+      );
+      const last_updated = files.reduce(
+        (latest, file) =>
+          file.last_updated > latest ? file.last_updated : latest,
+        "",
+      );
+      return { ...build, last_updated, files };
+    })
+    .filter((build) => build.files.length > 0);
+  const { items, hasNext, hasPrev } = paginate(inRange, ctx.url);
+  return jsonResponse({
+    meta: { next: hasNext, previous: hasPrev },
+    results: items,
+  });
+}
+
+const SANDBOX_NOTIF_PREFS = {
+  error_spike: true,
+  app_hang_spike: true,
+  bug_report: true,
+  daily_summary: true,
+};
+
+function sandboxUsage(appId: string) {
+  const bundle = catalog().appById.get(appId);
+  return bundle ? [bundle.usage] : [];
+}
+
+function sandboxBillingInfo() {
+  const bytesUsed = catalog()
+    .apps.map((app) => catalog().appById.get(app.id)?.usage)
+    .reduce(
+      (sum, usage) =>
+        sum + (usage?.monthly_app_usage.slice(-1)[0]?.bytes_in ?? 0),
+      0,
+    );
+  const granted = Math.ceil((bytesUsed * 1.6) / 1_000_000_000_000);
+  const periodStart = catalog().builtAt.startOf("month");
+  return {
+    team_id: SANDBOX_TEAM_ID,
+    plan: "pro",
+    bytes_granted: granted * 1_000_000_000_000,
+    bytes_used: bytesUsed,
+    bytes_unlimited: false,
+    bytes_overage_allowed: true,
+    status: "active",
+    current_period_start: Math.floor(periodStart.toSeconds()),
+    current_period_end: Math.floor(periodStart.plus({ months: 1 }).toSeconds()),
+    canceled_at: 0,
+    token_credits_used: 0,
+    token_credits_granted: 0,
+  };
+}
+
+export const settingsRoutes: SandboxRoute[] = [
+  {
+    method: "GET",
+    path: "/api/apps/:appId/alerts",
+    handle: (ctx) => handleAlerts(ctx, ctx.params.appId),
+  },
+
+  {
+    method: "GET",
+    path: "/api/apps/:appId/config",
+    handle: () => jsonResponse(SANDBOX_SDK_CONFIG),
+  },
+  {
+    method: "PATCH",
+    path: "/api/apps/:appId/config",
+    handle: notAvailable,
+  },
+  {
+    method: "GET",
+    path: "/api/apps/:appId/config/history",
+    handle: (ctx) => {
+      const { items, hasNext, hasPrev } = paginate(
+        sandboxConfigHistory(ctx.params.appId),
+        ctx.url,
+      );
+      return jsonResponse({
+        meta: { next: hasNext, previous: hasPrev },
+        results: items,
+      });
+    },
+  },
+
+  {
+    method: "GET",
+    path: "/api/apps/:appId/thresholdPrefs",
+    handle: (ctx) => jsonResponse(sandboxThresholdPrefs(ctx.params.appId)),
+  },
+  {
+    method: "PATCH",
+    path: "/api/apps/:appId/thresholdPrefs",
+    handle: notAvailable,
+  },
+
+  {
+    method: "GET",
+    path: "/api/apps/:appId/retention",
+    handle: () => jsonResponse(SANDBOX_APP_RETENTION),
+  },
+  { method: "PATCH", path: "/api/apps/:appId/retention", handle: notAvailable },
+
+  { method: "PATCH", path: "/api/apps/:appId/rename", handle: notAvailable },
+  { method: "PATCH", path: "/api/apps/:appId/apiKey", handle: notAvailable },
+
+  {
+    method: "GET",
+    path: "/api/apps/:appId/builds",
+    handle: (ctx) => handleBuilds(ctx, ctx.params.appId),
+  },
+  {
+    method: "GET",
+    path: "/api/apps/:appId/builds/:fileId/download",
+    handle: notAvailable,
+  },
+
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/invites",
+    handle: () => jsonResponse([]),
+  },
+  { method: "POST", path: "/api/teams/:teamId/invite", handle: notAvailable },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/invite/:inviteId",
+    handle: notAvailable,
+  },
+  {
+    method: "DELETE",
+    path: "/api/teams/:teamId/invite/:inviteId",
+    handle: notAvailable,
+  },
+  {
+    method: "DELETE",
+    path: "/api/teams/:teamId/members/:memberId",
+    handle: notAvailable,
+  },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/members/:memberId/role",
+    handle: notAvailable,
+  },
+  { method: "PATCH", path: "/api/teams/:teamId/rename", handle: notAvailable },
+  { method: "POST", path: "/api/auth/validateInvite", handle: notAvailable },
+
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/slack",
+    handle: () =>
+      jsonResponse({
+        slack_team_name: "Acme Team",
+        is_active: true,
+        needs_reauth: false,
+      }),
+  },
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/slack/connect-url",
+    handle: notAvailable,
+  },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/slack/status",
+    handle: notAvailable,
+  },
+  { method: "DELETE", path: "/api/teams/:teamId/slack", handle: notAvailable },
+  {
+    method: "POST",
+    path: "/api/teams/:teamId/slack/test",
+    handle: notAvailable,
+  },
+
+  {
+    method: "GET",
+    path: "/api/prefs/notifPrefs",
+    handle: () => jsonResponse(SANDBOX_NOTIF_PREFS),
+  },
+  {
+    method: "PATCH",
+    path: "/api/prefs/notifPrefs",
+    handle: notAvailable,
+  },
+
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/usage",
+    handle: () =>
+      jsonResponse(catalog().apps.flatMap((app) => sandboxUsage(app.id))),
+  },
+  {
+    method: "GET",
+    path: "/api/teams/:teamId/billing/info",
+    handle: () => jsonResponse(sandboxBillingInfo()),
+  },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/billing/checkout",
+    handle: notAvailable,
+  },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/billing/downgrade",
+    handle: notAvailable,
+  },
+  {
+    method: "PATCH",
+    path: "/api/teams/:teamId/billing/undo-downgrade",
+    handle: notAvailable,
+  },
+  {
+    method: "POST",
+    path: "/api/teams/:teamId/billing/portal",
+    handle: notAvailable,
+  },
+];

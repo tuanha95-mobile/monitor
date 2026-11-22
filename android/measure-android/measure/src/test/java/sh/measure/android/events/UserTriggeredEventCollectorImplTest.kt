@@ -1,0 +1,738 @@
+package sh.measure.android.events
+
+import org.junit.Assert
+import org.junit.Test
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.never
+import org.mockito.kotlin.any
+import org.mockito.kotlin.anyOrNull
+import org.mockito.kotlin.argumentCaptor
+import org.mockito.kotlin.eq
+import org.mockito.kotlin.verify
+import sh.measure.android.attributes.StringAttr
+import sh.measure.android.bugreport.BugReportData
+import sh.measure.android.events.AttachmentType
+import sh.measure.android.exceptions.ExceptionData
+import sh.measure.android.fakes.FakeConfigProvider
+import sh.measure.android.fakes.FakeLayoutSnapshotCollector
+import sh.measure.android.fakes.FakeProcessInfoProvider
+import sh.measure.android.fakes.NoopLogger
+import sh.measure.android.fakes.TestData
+import sh.measure.android.navigation.ScreenViewData
+import sh.measure.android.okhttp.HttpData
+import sh.measure.android.utils.AndroidTimeProvider
+import sh.measure.android.utils.ProcessInfoProvider
+import sh.measure.android.utils.TestClock
+import sh.measure.android.utils.ValidationLimits
+
+class UserTriggeredEventCollectorImplTest {
+    private val logger = NoopLogger()
+    private val signalProcessor: SignalProcessor = mock()
+    private val timeProvider = AndroidTimeProvider(TestClock.create())
+    private val processInfoProvider: ProcessInfoProvider = FakeProcessInfoProvider()
+    private val configProvider = FakeConfigProvider()
+    private val layoutSnapshotCollector = FakeLayoutSnapshotCollector()
+
+    private val userTriggeredEventCollector = UserTriggeredEventCollectorImpl(
+        logger,
+        signalProcessor,
+        timeProvider,
+        processInfoProvider,
+        configProvider,
+        layoutSnapshotCollector,
+    )
+
+    @Test
+    fun `tracks screen view event`() {
+        val screenName = "screen-name"
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackScreenView(screenName, emptyMap())
+        verify(signalProcessor).trackUserTriggered(
+            data = ScreenViewData(name = screenName),
+            type = EventType.SCREEN_VIEW,
+            timestamp = timeProvider.now(),
+        )
+    }
+
+    @Test
+    fun `attaches layout snapshot to screen view event`() {
+        val snapshot = Attachment(
+            name = "snapshot.json.gz",
+            type = AttachmentType.LAYOUT_SNAPSHOT_JSON,
+            bytes = byteArrayOf(1),
+        )
+        layoutSnapshotCollector.attachment = snapshot
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackScreenView("screen-name", emptyMap())
+        verify(signalProcessor).trackUserTriggered(
+            data = ScreenViewData(name = "screen-name"),
+            type = EventType.SCREEN_VIEW,
+            timestamp = timeProvider.now(),
+            attachments = mutableListOf(snapshot),
+        )
+    }
+
+    @Test
+    fun `tracks screen view event with user-defined attributes`() {
+        val screenName = "screen-name"
+        val attributes = mapOf("key" to StringAttr("value"))
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackScreenView(screenName, attributes)
+        verify(signalProcessor).trackUserTriggered(
+            data = ScreenViewData(name = screenName),
+            type = EventType.SCREEN_VIEW,
+            timestamp = timeProvider.now(),
+            userDefinedAttributes = attributes,
+        )
+    }
+
+    @Test
+    fun `tracks handled exception event`() {
+        val exception = Exception()
+
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHandledException(exception, emptyMap())
+        verify(signalProcessor).trackUserTriggered(
+            data = any<ExceptionData>(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.EXCEPTION),
+            attachments = eq(mutableListOf()),
+            userDefinedAttributes = eq(mapOf()),
+        )
+    }
+
+    @Test
+    fun `tracks handled exception event with attributes`() {
+        val exception = Exception()
+
+        userTriggeredEventCollector.register()
+        val attributes = mapOf("key" to StringAttr("value"))
+        userTriggeredEventCollector.trackHandledException(exception, attributes)
+        verify(signalProcessor).trackUserTriggered(
+            data = any<ExceptionData>(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.EXCEPTION),
+            attachments = eq(mutableListOf()),
+            userDefinedAttributes = eq(attributes),
+        )
+    }
+
+    @Test
+    fun `tracks bug report event with attachments`() {
+        val data = TestData.getBugReportData()
+        val screenshot = TestData.getMsrAttachment()
+        val attachmentsCaptor = argumentCaptor<MutableList<Attachment>>()
+
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackBugReport(
+            data.description,
+            screenshots = listOf(screenshot),
+            attributes = mutableMapOf(),
+        )
+        verify(signalProcessor).trackBugReport(
+            data = eq(data),
+            type = eq(EventType.BUG_REPORT),
+            timestamp = eq(timeProvider.now()),
+            attachments = attachmentsCaptor.capture(),
+            userDefinedAttributes = any(),
+            userTriggered = eq(true),
+            attributes = any(),
+        )
+        Assert.assertEquals(1, attachmentsCaptor.firstValue.size)
+    }
+
+    @Test
+    fun `tracks bug report event with no attachments`() {
+        val data = TestData.getBugReportData()
+
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackBugReport(
+            data.description,
+            screenshots = listOf(),
+            attributes = mutableMapOf(),
+        )
+        verify(signalProcessor).trackBugReport(
+            data = data,
+            type = EventType.BUG_REPORT,
+            timestamp = timeProvider.now(),
+            attachments = mutableListOf(),
+            userDefinedAttributes = mutableMapOf(),
+            userTriggered = true,
+            attributes = mutableMapOf(),
+        )
+    }
+
+    @Test
+    fun `does not track screen view when name exceeds the maximum length`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackScreenView(
+            "s".repeat(ValidationLimits.SCREEN_VIEW_NAME + 1),
+            emptyMap(),
+        )
+        verify(signalProcessor, never()).trackUserTriggered(
+            any<ScreenViewData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `truncates bug report description that exceeds the maximum length`() {
+        val maxLength = configProvider.maxDescriptionLengthInBugReport
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackBugReport(
+            "d".repeat(maxLength + 100),
+            screenshots = listOf(),
+            attributes = mutableMapOf(),
+        )
+        verify(signalProcessor).trackBugReport(
+            data = BugReportData("d".repeat(maxLength)),
+            type = EventType.BUG_REPORT,
+            timestamp = timeProvider.now(),
+            attachments = mutableListOf(),
+            userDefinedAttributes = mutableMapOf(),
+            userTriggered = true,
+            attributes = mutableMapOf(),
+        )
+    }
+
+    @Test
+    fun `does not track http event when client exceeds the maximum length`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://example.com",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "c".repeat(ValidationLimits.HTTP_CLIENT + 1),
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `disables collection on unregistered`() {
+        val exception = Exception()
+        userTriggeredEventCollector.unregister()
+        userTriggeredEventCollector.trackHandledException(exception, emptyMap())
+        verify(signalProcessor, never()).trackUserTriggered(
+            any<ExceptionData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `tracks http event with valid data`() {
+        val url = "https://api.example.com/users"
+        val method = "get"
+        val startTime = 1000L
+        val endTime = 2000L
+        val client = "okhttp"
+        val statusCode = 200
+
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = url,
+            method = method,
+            startTime = startTime,
+            endTime = endTime,
+            client = client,
+            statusCode = statusCode,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor).track(
+            data = any<HttpData>(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+    }
+
+    @Test
+    fun `tracks http event with all optional fields`() {
+        val url = "https://api.example.com/users"
+        val method = "post"
+        val startTime = 1000L
+        val endTime = 2000L
+        val client = "okhttp"
+        val statusCode = 201
+        val requestHeaders = mutableMapOf("Content-Type" to "application/json")
+        val responseHeaders = mutableMapOf("X-Request-Id" to "123")
+        val requestBody = "{\"name\":\"test\"}"
+        val responseBody = "{\"id\":1}"
+
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = url,
+            method = method,
+            startTime = startTime,
+            endTime = endTime,
+            client = client,
+            statusCode = statusCode,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = requestHeaders,
+            responseHeaders = responseHeaders,
+            requestBody = requestBody,
+            responseBody = responseBody,
+        )
+
+        verify(signalProcessor).track(
+            data = any<HttpData>(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+    }
+
+    @Test
+    fun `does not track http event when url is empty`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `does not track http event with invalid method`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "invalid",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `does not track http event when start time is zero or negative`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 0L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `does not track http event when end time is less than start time`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 2000L,
+            endTime = 1000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `does not track http event with invalid status code`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 999,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor, never()).track(
+            any<HttpData>(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyOrNull(),
+            anyOrNull(),
+            any(),
+            any(),
+        )
+    }
+
+    @Test
+    fun `tracks http event with null status code`() {
+        userTriggeredEventCollector.register()
+        userTriggeredEventCollector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = null,
+            failureReason = "timeout",
+            failureDescription = "Connection timeout",
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = null,
+        )
+
+        verify(signalProcessor).track(
+            data = any<HttpData>(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+    }
+
+    @Test
+    fun `tracks http event with all valid http methods`() {
+        val methods = listOf("get", "post", "put", "delete", "patch")
+        userTriggeredEventCollector.register()
+
+        methods.forEach { method ->
+            userTriggeredEventCollector.trackHttp(
+                url = "https://api.example.com/users",
+                method = method,
+                startTime = 1000L,
+                endTime = 2000L,
+                client = "okhttp",
+                statusCode = 200,
+                failureReason = null,
+                failureDescription = null,
+                requestHeaders = null,
+                responseHeaders = null,
+                requestBody = null,
+                responseBody = null,
+            )
+        }
+
+        verify(signalProcessor, org.mockito.Mockito.times(methods.size)).track(
+            data = any<HttpData>(),
+            timestamp = any(),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = any(),
+            isSampled = any(),
+        )
+    }
+
+    @Test
+    fun `tracks http event but discards request body when body tracking is disabled`() {
+        val configProvider = FakeConfigProvider()
+        configProvider.shouldTrackHttpRequestBodyResult = false
+        val collector = UserTriggeredEventCollectorImpl(
+            logger,
+            signalProcessor,
+            timeProvider,
+            processInfoProvider,
+            configProvider,
+            layoutSnapshotCollector,
+        )
+
+        collector.register()
+        collector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "post",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 201,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = mutableMapOf("Content-Type" to "application/json"),
+            responseHeaders = null,
+            requestBody = "{\"name\":\"test\"}",
+            responseBody = null,
+        )
+
+        val httpDataCaptor = argumentCaptor<HttpData>()
+        verify(signalProcessor).track(
+            data = httpDataCaptor.capture(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+        Assert.assertNull("Request body should be null when tracking is disabled", httpDataCaptor.firstValue.request_body)
+    }
+
+    @Test
+    fun `tracks http event but discards response body when body tracking is disabled`() {
+        val configProvider = FakeConfigProvider()
+        configProvider.shouldTrackHttpResponseBodyResult = false
+        val collector = UserTriggeredEventCollectorImpl(
+            logger,
+            signalProcessor,
+            timeProvider,
+            processInfoProvider,
+            configProvider,
+            layoutSnapshotCollector,
+        )
+
+        collector.register()
+        collector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = null,
+            requestBody = null,
+            responseBody = "{\"id\":1,\"name\":\"test\"}",
+        )
+
+        val httpDataCaptor = argumentCaptor<HttpData>()
+        verify(signalProcessor).track(
+            data = httpDataCaptor.capture(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+        Assert.assertNull("Response body should be null when tracking is disabled", httpDataCaptor.firstValue.response_body)
+    }
+
+    @Test
+    fun `tracks http event with request body when body tracking is enabled`() {
+        val configProvider = FakeConfigProvider()
+        configProvider.shouldTrackHttpRequestBodyResult = true
+        val collector = UserTriggeredEventCollectorImpl(
+            logger,
+            signalProcessor,
+            timeProvider,
+            processInfoProvider,
+            configProvider,
+            layoutSnapshotCollector,
+        )
+
+        val requestBody = "{\"name\":\"test\"}"
+        collector.register()
+        collector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "post",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 201,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = mutableMapOf("Content-Type" to "application/json"),
+            responseHeaders = null,
+            requestBody = requestBody,
+            responseBody = null,
+        )
+
+        val httpDataCaptor = argumentCaptor<HttpData>()
+        verify(signalProcessor).track(
+            data = httpDataCaptor.capture(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+        Assert.assertEquals("Request body should be included when tracking is enabled", requestBody, httpDataCaptor.firstValue.request_body)
+    }
+
+    @Test
+    fun `tracks http event with response body when body tracking is enabled`() {
+        val configProvider = FakeConfigProvider()
+        configProvider.shouldTrackHttpResponseBodyResult = true
+        val collector = UserTriggeredEventCollectorImpl(
+            logger,
+            signalProcessor,
+            timeProvider,
+            processInfoProvider,
+            configProvider,
+            layoutSnapshotCollector,
+        )
+
+        val responseBody = "{\"id\":1,\"name\":\"test\"}"
+        collector.register()
+        collector.trackHttp(
+            url = "https://api.example.com/users",
+            method = "get",
+            startTime = 1000L,
+            endTime = 2000L,
+            client = "okhttp",
+            statusCode = 200,
+            failureReason = null,
+            failureDescription = null,
+            requestHeaders = null,
+            responseHeaders = mutableMapOf("Content-Type" to "application/json"),
+            requestBody = null,
+            responseBody = responseBody,
+        )
+
+        val httpDataCaptor = argumentCaptor<HttpData>()
+        verify(signalProcessor).track(
+            data = httpDataCaptor.capture(),
+            timestamp = eq(timeProvider.now()),
+            type = eq(EventType.HTTP),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = anyOrNull(),
+            userTriggered = eq(true),
+            isSampled = any(),
+        )
+        Assert.assertEquals("Response body should be included when tracking is enabled", responseBody, httpDataCaptor.firstValue.response_body)
+    }
+}

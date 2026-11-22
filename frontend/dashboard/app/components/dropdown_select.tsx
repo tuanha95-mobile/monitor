@@ -1,0 +1,253 @@
+"use client";
+
+import { Check, ChevronsUpDown, Circle, CircleCheck } from "lucide-react";
+import React, { useState } from "react";
+
+import { cn } from "../utils/shadcn_utils";
+import { Button } from "./button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+} from "./command";
+import { Popover, PopoverContent, PopoverTrigger } from "./popover";
+
+export enum DropdownSelectType {
+  SingleString,
+  MultiString,
+}
+
+// An item whose shown text differs from the value that is selected, with an
+// optional color dot before the text.
+export type DropdownSelectItem = {
+  value: string;
+  label: string;
+  color?: string;
+};
+
+interface DropdownSelectProps {
+  type: DropdownSelectType;
+  title: string;
+  items: string[] | DropdownSelectItem[];
+  disabled?: boolean;
+  initialSelected: string | string[];
+  onChangeSelected?: (item: string | string[]) => void;
+  // Optional controlled open state, so the popover can be driven from outside.
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}
+
+const DropdownSelect: React.FC<DropdownSelectProps> = ({
+  title,
+  type,
+  items,
+  initialSelected,
+  onChangeSelected,
+  disabled = false,
+  open: controlledOpen,
+  onOpenChange,
+}) => {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = (value: boolean) => {
+    setInternalOpen(value);
+    onOpenChange?.(value);
+  };
+  const options: DropdownSelectItem[] = items.map((item) =>
+    typeof item === "string" ? { value: item, label: item } : item,
+  );
+  const [selected, setSelected] = useState(initialSelected);
+  const [searchValue, setSearchValue] = useState("");
+  // Sync to a new initialSelected from the parent.
+  const [prevInitialSelected, setPrevInitialSelected] =
+    useState(initialSelected);
+  if (initialSelected !== prevInitialSelected) {
+    setPrevInitialSelected(initialSelected);
+    setSelected(initialSelected);
+  }
+
+  const selectSingleItem = (item: string) => {
+    setSelected(item);
+    setOpen(false);
+    onChangeSelected?.(item);
+  };
+
+  const selectAll = () => {
+    const values = options.map((option) => option.value);
+    setSelected(values);
+    onChangeSelected?.(values);
+  };
+
+  const clearAll = () => {
+    setSelected([]);
+    onChangeSelected?.([]);
+  };
+
+  const toggleCheckboxStringItem = (item: string) => {
+    let curSelected = selected as string[];
+    let newSelected;
+    if (curSelected.includes(item)) {
+      newSelected = curSelected.filter((a) => a != item);
+    } else {
+      newSelected = [item, ...curSelected];
+    }
+    setSelected(newSelected);
+    onChangeSelected?.(newSelected);
+  };
+
+  // Helper to get display text for selected items
+  const getDisplayText = () => {
+    switch (type) {
+      case DropdownSelectType.SingleString:
+        return (
+          options.find((option) => option.value === selected)?.label ??
+          (selected as string)
+        );
+      case DropdownSelectType.MultiString:
+        return title;
+    }
+  };
+
+  // Filter items based on search text
+  const getFilteredItems = () => {
+    const searchLower = searchValue.toLowerCase();
+    switch (type) {
+      case DropdownSelectType.SingleString:
+      case DropdownSelectType.MultiString:
+        return options.filter((option) =>
+          option.label.toLowerCase().includes(searchLower),
+        );
+    }
+  };
+
+  const isItemSelected = (item: string) => {
+    switch (type) {
+      case DropdownSelectType.SingleString:
+        return item === selected;
+      case DropdownSelectType.MultiString:
+        return (selected as string[]).includes(item);
+    }
+  };
+
+  const handleItemClick = (item: string) => {
+    switch (type) {
+      case DropdownSelectType.SingleString:
+        selectSingleItem(item);
+        break;
+      case DropdownSelectType.MultiString:
+        toggleCheckboxStringItem(item);
+        break;
+    }
+  };
+
+  const isMultiSelect = () => {
+    return type === DropdownSelectType.MultiString;
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger disabled={disabled} asChild>
+        <Button
+          variant="outline"
+          className="flex justify-between w-fit min-w-37.5 select-none"
+        >
+          <span className="truncate">{getDisplayText()}</span>
+          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="p-0 w-max min-w-64 max-w-96" align="start">
+        <Command>
+          <CommandInput
+            placeholder="Search..."
+            value={searchValue}
+            onValueChange={setSearchValue}
+            className="h-10 p-1 border-0 rounded-md focus:ring-0 font-body text-sm"
+          />
+          {isMultiSelect() && items.length > 1 && (
+            <div className="flex gap-2 p-2 py-4">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={selectAll}
+                className="text-xs flex-1"
+                tabIndex={0}
+                onKeyDown={(e: React.KeyboardEvent<HTMLButtonElement>) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    selectAll();
+                  }
+                }}
+              >
+                All
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={clearAll}
+                className="text-xs flex-1"
+                tabIndex={0}
+                onKeyDown={(e: React.KeyboardEvent<HTMLButtonElement>) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    clearAll();
+                  }
+                }}
+              >
+                Clear
+              </Button>
+            </div>
+          )}
+          <CommandEmpty>
+            <div className="text-center py-2 text-sm text-gray-500">
+              No results found
+            </div>
+          </CommandEmpty>
+          <CommandGroup className="max-h-72 overflow-auto">
+            {getFilteredItems().map((option, index) => (
+              <CommandItem
+                key={index}
+                onSelect={() => handleItemClick(option.value)}
+                className={cn(
+                  "flex items-center cursor-default outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]",
+                )}
+                tabIndex={0}
+                onKeyDown={(e: React.KeyboardEvent<HTMLDivElement>) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleItemClick(option.value);
+                  }
+                }}
+              >
+                {isMultiSelect() && (
+                  <span className="mr-2 flex items-center justify-center w-4 h-4">
+                    {isItemSelected(option.value) ? (
+                      <CircleCheck className="h-4 w-4" />
+                    ) : (
+                      <Circle className="h-4 w-4 opacity-50" />
+                    )}
+                  </span>
+                )}
+                {option.color !== undefined && (
+                  <span
+                    className="mr-2 size-2 shrink-0 rounded-full"
+                    style={{ backgroundColor: option.color }}
+                  />
+                )}
+                <span className="flex-1 truncate font-display text-sm">
+                  {option.label}
+                </span>
+                {!isMultiSelect() && isItemSelected(option.value) && (
+                  <Check className="h-4 w-4 ml-2" />
+                )}
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+};
+
+export default DropdownSelect;

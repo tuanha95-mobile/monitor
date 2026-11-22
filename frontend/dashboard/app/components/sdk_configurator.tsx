@@ -1,0 +1,2038 @@
+"use client";
+
+import { SdkConfig } from "@/app/api/api_calls";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/app/components/accordion";
+import { Button } from "@/app/components/button";
+import DropdownSelect, {
+  DropdownSelectType,
+} from "@/app/components/dropdown_select";
+import InfoTooltip from "@/app/components/info_tooltip";
+import SdkConfigHistory from "@/app/components/sdk_config_history";
+import SdkConfigNumericInput from "@/app/components/sdk_config_numeric_input";
+import { Switch } from "@/app/components/switch";
+import { useSaveSdkConfigMutation } from "@/app/query/hooks";
+import { track } from "@/app/utils/analytics/track";
+import { toastNegative, toastPositive } from "@/app/components/toast";
+import { ArrowLeft, History } from "lucide-react";
+import Link from "next/link";
+import { useParams } from "next/navigation";
+import { useState } from "react";
+import {
+  displayToLogSeverityNumber,
+  displayToMaskLevel,
+  logSeverityNumberToDisplay,
+  maskLevelToDisplay,
+} from "@/app/utils/sdk_config_labels";
+import { underlineLinkStyle } from "../utils/shared_styles";
+import DangerConfirmationDialog from "./danger_confirmation_dialog";
+import { Textarea } from "./textarea";
+
+interface SdkConfiguratorProps {
+  appId: string;
+  appName: string;
+  initialConfig: SdkConfig;
+  currentUserCanChangeAppSettings: boolean;
+  osNames?: string[] | null;
+}
+
+type SectionSaveStatus = "idle" | "saving" | "saved" | "error";
+
+const accordionContentStyle = "p-4";
+
+export default function SdkConfigurator({
+  appId,
+  appName,
+  initialConfig,
+  currentUserCanChangeAppSettings,
+  osNames,
+}: SdkConfiguratorProps) {
+  // Local editable state
+  const [sdkConfig, setSdkConfigState] = useState<SdkConfig | null>(
+    initialConfig,
+  );
+  const [originalSdkConfig, setOriginalSdkConfig] = useState<SdkConfig | null>(
+    initialConfig,
+  );
+
+  // Per-section save status tracking
+  const [sectionStatuses, setSectionStatuses] = useState<
+    Record<string, SectionSaveStatus>
+  >({
+    errors: "idle",
+    anrs: "idle",
+    appHangs: "idle",
+    bugReports: "idle",
+    traces: "idle",
+    launch: "idle",
+    profiling: "idle",
+    journey: "idle",
+    http: "idle",
+    masking: "idle",
+    logs: "idle",
+    memory: "idle",
+  });
+
+  const [showHistory, setShowHistory] = useState(false);
+
+  // TanStack Query mutation
+  const saveSdkConfigMutation = useSaveSdkConfigMutation();
+  const routeParams = useParams<{ teamId: string }>();
+
+  // Confirmation dialog states
+  const [errorsConfirmOpen, setErrorsConfirmOpen] = useState(false);
+  const [anrsConfirmOpen, setAnrsConfirmOpen] = useState(false);
+  const [appHangsConfirmOpen, setAppHangsConfirmOpen] = useState(false);
+  const [bugReportsConfirmOpen, setBugReportsConfirmOpen] = useState(false);
+  const [tracesConfirmOpen, setTracesConfirmOpen] = useState(false);
+  const [launchConfirmOpen, setLaunchConfirmOpen] = useState(false);
+  const [profilingConfirmOpen, setProfilingConfirmOpen] = useState(false);
+  const [journeyConfirmOpen, setJourneyConfirmOpen] = useState(false);
+  const [httpConfirmOpen, setHttpConfirmOpen] = useState(false);
+  const [maskingConfirmOpen, setMaskingConfirmOpen] = useState(false);
+  const [logsConfirmOpen, setLogsConfirmOpen] = useState(false);
+  const [memoryConfirmOpen, setMemoryConfirmOpen] = useState(false);
+
+  // Sync initialConfig prop into local state when it changes.
+  const [prevInitialConfig, setPrevInitialConfig] = useState(initialConfig);
+  if (initialConfig !== prevInitialConfig) {
+    setPrevInitialConfig(initialConfig);
+    setSdkConfigState(initialConfig);
+    setOriginalSdkConfig(initialConfig);
+  }
+
+  const updateSdkConfig = (updates: Partial<SdkConfig>) => {
+    if (!sdkConfig) {
+      return;
+    }
+    setSdkConfigState({ ...sdkConfig, ...updates });
+  };
+
+  // Track changes per section, derived from the current vs. original config.
+  const errorsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.error_fatal_take_screenshot !==
+      originalSdkConfig.error_fatal_take_screenshot ||
+      sdkConfig.error_replay_duration !==
+        originalSdkConfig.error_replay_duration ||
+      sdkConfig.error_fatal_replay_enabled !==
+        originalSdkConfig.error_fatal_replay_enabled ||
+      sdkConfig.error_unhandled_replay_enabled !==
+        originalSdkConfig.error_unhandled_replay_enabled ||
+      sdkConfig.error_handled_replay_enabled !==
+        originalSdkConfig.error_handled_replay_enabled ||
+      sdkConfig.error_fatal_sampling_rate !==
+        originalSdkConfig.error_fatal_sampling_rate ||
+      sdkConfig.error_unhandled_sampling_rate !==
+        originalSdkConfig.error_unhandled_sampling_rate ||
+      sdkConfig.error_handled_sampling_rate !==
+        originalSdkConfig.error_handled_sampling_rate);
+  const anrsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.anr_take_screenshot !== originalSdkConfig.anr_take_screenshot ||
+      sdkConfig.anr_timeline_duration !==
+        originalSdkConfig.anr_timeline_duration);
+  const appHangsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.app_hang_threshold_millis !==
+      originalSdkConfig.app_hang_threshold_millis ||
+      sdkConfig.app_hang_timeline_duration !==
+        originalSdkConfig.app_hang_timeline_duration ||
+      sdkConfig.app_hang_sampling_rate !==
+        originalSdkConfig.app_hang_sampling_rate ||
+      sdkConfig.app_hang_replay_enabled !==
+        originalSdkConfig.app_hang_replay_enabled);
+  const bugReportsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.bug_report_timeline_duration !==
+      originalSdkConfig.bug_report_timeline_duration;
+  const tracesChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.trace_sampling_rate !== originalSdkConfig.trace_sampling_rate;
+  const launchMetricsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.launch_sampling_rate !== originalSdkConfig.launch_sampling_rate;
+  const profilingChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.profile_sampling_rate !== originalSdkConfig.profile_sampling_rate;
+  const journeyChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.journey_sampling_rate !== originalSdkConfig.journey_sampling_rate;
+  const httpChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.http_sampling_rate !== originalSdkConfig.http_sampling_rate ||
+      JSON.stringify(sdkConfig.http_disable_event_for_urls) !==
+        JSON.stringify(originalSdkConfig.http_disable_event_for_urls) ||
+      JSON.stringify(sdkConfig.http_track_request_for_urls) !==
+        JSON.stringify(originalSdkConfig.http_track_request_for_urls) ||
+      JSON.stringify(sdkConfig.http_track_response_for_urls) !==
+        JSON.stringify(originalSdkConfig.http_track_response_for_urls) ||
+      JSON.stringify(sdkConfig.http_blocked_headers) !==
+        JSON.stringify(originalSdkConfig.http_blocked_headers));
+  const screenshotMaskingChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    sdkConfig.screenshot_mask_level !== originalSdkConfig.screenshot_mask_level;
+  const logsChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.log_min_severity !== originalSdkConfig.log_min_severity ||
+      sdkConfig.log_autocollect_enabled !==
+        originalSdkConfig.log_autocollect_enabled ||
+      JSON.stringify(sdkConfig.log_ignore_patterns) !==
+        JSON.stringify(originalSdkConfig.log_ignore_patterns));
+  const memoryChanged =
+    !!sdkConfig &&
+    !!originalSdkConfig &&
+    (sdkConfig.memory_usage_interval !==
+      originalSdkConfig.memory_usage_interval ||
+      sdkConfig.memory_usage_background_interval !==
+        originalSdkConfig.memory_usage_background_interval ||
+      sdkConfig.memory_usage_session_sampling_rate !==
+        originalSdkConfig.memory_usage_session_sampling_rate);
+
+  if (!sdkConfig || !originalSdkConfig) {
+    return null;
+  }
+
+  const setSectionStatus = (section: string, status: SectionSaveStatus) => {
+    setSectionStatuses((prev) => ({ ...prev, [section]: status }));
+  };
+
+  const saveSection = (
+    sectionKey: string,
+    configToSave: Partial<SdkConfig>,
+  ) => {
+    setSectionStatus(sectionKey, "saving");
+    saveSdkConfigMutation.mutate(
+      { appId, config: configToSave },
+      {
+        onSuccess: () => {
+          setSectionStatus(sectionKey, "saved");
+          setOriginalSdkConfig((prev) =>
+            prev ? { ...prev, ...configToSave } : prev,
+          );
+          toastPositive("Configuration saved");
+          track("sampling_adjusted", {
+            team_id: routeParams?.teamId,
+            app_id: appId,
+            app_platform: osNames?.join(","),
+            feature_area: "sampling",
+            entry_point: "direct",
+            section: sectionKey,
+          });
+        },
+        onError: () => {
+          setSectionStatus(sectionKey, "error");
+          toastNegative("Error saving configuration");
+        },
+      },
+    );
+  };
+
+  const handleSaveErrors = () => {
+    saveSection("errors", {
+      error_fatal_take_screenshot: sdkConfig.error_fatal_take_screenshot,
+      error_replay_duration: sdkConfig.error_replay_duration,
+      error_fatal_replay_enabled: sdkConfig.error_fatal_replay_enabled,
+      error_unhandled_replay_enabled: sdkConfig.error_unhandled_replay_enabled,
+      error_handled_replay_enabled: sdkConfig.error_handled_replay_enabled,
+      error_fatal_sampling_rate: sdkConfig.error_fatal_sampling_rate,
+      error_unhandled_sampling_rate: sdkConfig.error_unhandled_sampling_rate,
+      error_handled_sampling_rate: sdkConfig.error_handled_sampling_rate,
+    });
+  };
+  const handleSaveAnrs = () => {
+    saveSection("anrs", {
+      anr_take_screenshot: sdkConfig.anr_take_screenshot,
+      anr_timeline_duration: sdkConfig.anr_timeline_duration,
+    });
+  };
+  const handleSaveAppHangs = () => {
+    saveSection("appHangs", {
+      app_hang_threshold_millis: sdkConfig.app_hang_threshold_millis,
+      app_hang_timeline_duration: sdkConfig.app_hang_timeline_duration,
+      app_hang_sampling_rate: sdkConfig.app_hang_sampling_rate,
+      app_hang_replay_enabled: sdkConfig.app_hang_replay_enabled,
+    });
+  };
+  const handleSaveBugReports = () => {
+    saveSection("bugReports", {
+      bug_report_timeline_duration: sdkConfig.bug_report_timeline_duration,
+    });
+  };
+  const handleSaveTraces = () => {
+    saveSection("traces", {
+      trace_sampling_rate: sdkConfig.trace_sampling_rate,
+    });
+  };
+  const handleSaveLaunch = () => {
+    saveSection("launch", {
+      launch_sampling_rate: sdkConfig.launch_sampling_rate,
+    });
+  };
+  const handleSaveProfiling = () => {
+    saveSection("profiling", {
+      profile_sampling_rate: sdkConfig.profile_sampling_rate,
+    });
+  };
+  const handleSaveJourney = () => {
+    saveSection("journey", {
+      journey_sampling_rate: sdkConfig.journey_sampling_rate,
+    });
+  };
+  const handleSaveHttp = () => {
+    saveSection("http", {
+      http_sampling_rate: sdkConfig.http_sampling_rate,
+      http_disable_event_for_urls: sdkConfig.http_disable_event_for_urls.filter(
+        (url) => url.trim() !== "",
+      ),
+      http_track_request_for_urls: sdkConfig.http_track_request_for_urls.filter(
+        (url) => url.trim() !== "",
+      ),
+      http_track_response_for_urls:
+        sdkConfig.http_track_response_for_urls.filter(
+          (url) => url.trim() !== "",
+        ),
+      http_blocked_headers: sdkConfig.http_blocked_headers.filter(
+        (header) => header.trim() !== "",
+      ),
+    });
+  };
+  const handleSaveMasking = () => {
+    saveSection("masking", {
+      screenshot_mask_level: sdkConfig.screenshot_mask_level,
+    });
+  };
+  const handleSaveLogs = () => {
+    saveSection("logs", {
+      log_autocollect_enabled: sdkConfig.log_autocollect_enabled,
+      log_min_severity: sdkConfig.log_min_severity,
+      log_ignore_patterns: sdkConfig.log_ignore_patterns.filter(
+        (pattern) => pattern.trim() !== "",
+      ),
+    });
+  };
+  const handleSaveMemory = () => {
+    saveSection("memory", {
+      memory_usage_interval: sdkConfig.memory_usage_interval,
+      memory_usage_background_interval:
+        sdkConfig.memory_usage_background_interval,
+      memory_usage_session_sampling_rate:
+        sdkConfig.memory_usage_session_sampling_rate,
+    });
+  };
+
+  const arrayToInput = (arr: string[]): string => {
+    if (!arr || arr.length === 0) return "";
+    return arr.join("\n");
+  };
+
+  const inputToArray = (str: string): string[] => {
+    if (!str || str.trim() === "") return [];
+    return str.split("\n").map((line) => line.trim());
+  };
+
+  const getUrlPlaceholder = () =>
+    [
+      "https://api.example.com/v1/public/*",
+      "https://example.com/*/health",
+    ].join("\n");
+
+  const getHeaderPlaceholder = () => ["X-User-ID", "X-API-Key"].join("\n");
+
+  const shouldShowAndroidSettings =
+    osNames?.some((os) => os.toLowerCase() === "android") ?? false;
+
+  const shouldShowIosSettings =
+    osNames?.some((os) => ["ios", "ipados"].includes(os.toLowerCase())) ??
+    false;
+
+  // Confirmation dialog body generators
+  const getErrorsConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Error settings</span> for app{" "}
+          <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          {sdkConfig.error_fatal_sampling_rate !==
+            originalSdkConfig.error_fatal_sampling_rate && (
+            <li>
+              Sampling rate for fatal errors:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.error_fatal_sampling_rate}%
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_fatal_sampling_rate}%
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_unhandled_sampling_rate !==
+            originalSdkConfig.error_unhandled_sampling_rate && (
+            <li>
+              Sampling rate for unhandled errors:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.error_unhandled_sampling_rate}%
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_unhandled_sampling_rate}%
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_handled_sampling_rate !==
+            originalSdkConfig.error_handled_sampling_rate && (
+            <li>
+              Sampling rate for handled errors:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.error_handled_sampling_rate}%
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_handled_sampling_rate}%
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_fatal_take_screenshot !==
+            originalSdkConfig.error_fatal_take_screenshot && (
+            <li>
+              Screenshot with fatal errors{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_fatal_take_screenshot ? "Enabled" : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_fatal_replay_enabled !==
+            originalSdkConfig.error_fatal_replay_enabled && (
+            <li>
+              Session replay with fatal errors{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_fatal_replay_enabled ? "Enabled" : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_unhandled_replay_enabled !==
+            originalSdkConfig.error_unhandled_replay_enabled && (
+            <li>
+              Session replay with unhandled errors{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_unhandled_replay_enabled
+                  ? "Enabled"
+                  : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_handled_replay_enabled !==
+            originalSdkConfig.error_handled_replay_enabled && (
+            <li>
+              Session replay with handled errors{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_handled_replay_enabled
+                  ? "Enabled"
+                  : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.error_replay_duration !==
+            originalSdkConfig.error_replay_duration && (
+            <li>
+              Session replay duration:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.error_replay_duration} seconds
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.error_replay_duration} seconds
+              </span>
+            </li>
+          )}
+        </ul>
+        <p className="mt-4">These changes will apply to all new errors.</p>
+      </div>
+    );
+  };
+
+  const getAnrsConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">ANR settings</span> for app{" "}
+          <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          {sdkConfig.anr_take_screenshot !==
+            originalSdkConfig.anr_take_screenshot && (
+            <li>
+              Screenshot with ANR:{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.anr_take_screenshot ? "Enabled" : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.anr_timeline_duration !==
+            originalSdkConfig.anr_timeline_duration && (
+            <li>
+              Session replay duration:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.anr_timeline_duration} seconds
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.anr_timeline_duration} seconds
+              </span>
+            </li>
+          )}
+        </ul>
+        <p className="mt-4">These changes will apply to all new ANRs.</p>
+      </div>
+    );
+  };
+
+  const getAppHangsConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">App Hang settings</span> for
+          app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          {sdkConfig.app_hang_threshold_millis !==
+            originalSdkConfig.app_hang_threshold_millis && (
+            <li>
+              Hang threshold:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.app_hang_threshold_millis} ms
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.app_hang_threshold_millis} ms
+              </span>
+            </li>
+          )}
+          {sdkConfig.app_hang_sampling_rate !==
+            originalSdkConfig.app_hang_sampling_rate && (
+            <li>
+              Sampling rate:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.app_hang_sampling_rate}%
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.app_hang_sampling_rate}%
+              </span>
+            </li>
+          )}
+          {sdkConfig.app_hang_replay_enabled !==
+            originalSdkConfig.app_hang_replay_enabled && (
+            <li>
+              Session replay with app hangs:{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.app_hang_replay_enabled ? "Enabled" : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.app_hang_timeline_duration !==
+            originalSdkConfig.app_hang_timeline_duration && (
+            <li>
+              Session replay duration:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.app_hang_timeline_duration} seconds
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.app_hang_timeline_duration} seconds
+              </span>
+            </li>
+          )}
+        </ul>
+        <p className="mt-4">These changes will apply to all new app hangs.</p>
+      </div>
+    );
+  };
+
+  const getBugReportsConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Bug Report settings</span>{" "}
+          for app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Session replay duration:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.bug_report_timeline_duration} seconds
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.bug_report_timeline_duration} seconds
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">These changes will apply to all new bug reports.</p>
+      </div>
+    );
+  };
+
+  const getTracesConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Trace settings</span> for app{" "}
+          <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Sampling rate:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.trace_sampling_rate}%
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.trace_sampling_rate}%
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">These changes will apply to all new traces.</p>
+      </div>
+    );
+  };
+
+  const getLaunchConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">
+            Launch Metrics settings
+          </span>{" "}
+          for app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Sampling rate:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.launch_sampling_rate}%
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.launch_sampling_rate}%
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">These changes will apply to all new launches.</p>
+      </div>
+    );
+  };
+
+  const getProfilingConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Profiling settings</span> for
+          app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Sampling rate:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.profile_sampling_rate}%
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.profile_sampling_rate}%
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">
+          These changes will apply to all new profiling results.
+        </p>
+      </div>
+    );
+  };
+
+  const getJourneysConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">User Journey settings</span>{" "}
+          for app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Sampling rate:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.journey_sampling_rate}%
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.journey_sampling_rate}%
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">These changes will apply to all new sessions.</p>
+      </div>
+    );
+  };
+
+  const getMemoryConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Memory settings</span> for
+          app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Collection interval:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.memory_usage_interval} seconds
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.memory_usage_interval} seconds
+            </span>
+          </li>
+          {shouldShowAndroidSettings && (
+            <li>
+              Background collection interval:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.memory_usage_background_interval} seconds
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.memory_usage_background_interval} seconds
+              </span>
+            </li>
+          )}
+          <li>
+            Session sampling rate:{" "}
+            <span className="font-display font-bold">
+              {originalSdkConfig.memory_usage_session_sampling_rate}%
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {sdkConfig.memory_usage_session_sampling_rate}%
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">
+          These changes will apply to new memory usage sessions.
+        </p>
+      </div>
+    );
+  };
+
+  const getHttpConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">
+            HTTP collection settings
+          </span>{" "}
+          for app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following configurations will be updated:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          {sdkConfig.http_sampling_rate !==
+            originalSdkConfig.http_sampling_rate && (
+            <li>
+              Sampling rate:{" "}
+              <span className="font-display font-bold">
+                {originalSdkConfig.http_sampling_rate} %
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.http_sampling_rate} %
+              </span>
+            </li>
+          )}
+          {JSON.stringify(sdkConfig.http_disable_event_for_urls) !==
+            JSON.stringify(originalSdkConfig.http_disable_event_for_urls) && (
+            <li>Disabled HTTP events for URLs</li>
+          )}
+          {JSON.stringify(sdkConfig.http_track_request_for_urls) !==
+            JSON.stringify(originalSdkConfig.http_track_request_for_urls) && (
+            <li>Collect request for URLs</li>
+          )}
+          {JSON.stringify(sdkConfig.http_track_response_for_urls) !==
+            JSON.stringify(originalSdkConfig.http_track_response_for_urls) && (
+            <li>Collect response for URLs</li>
+          )}
+          {JSON.stringify(sdkConfig.http_blocked_headers) !==
+            JSON.stringify(originalSdkConfig.http_blocked_headers) && (
+            <li>Blocked headers</li>
+          )}
+        </ul>
+        <p className="mt-4">
+          These changes will apply to all new HTTP requests.
+        </p>
+      </div>
+    );
+  };
+
+  const getMaskingConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">
+            Screenshot Masking settings
+          </span>{" "}
+          for app <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          <li>
+            Mask level:{" "}
+            <span className="font-display font-bold">
+              {maskLevelToDisplay(originalSdkConfig.screenshot_mask_level)}
+            </span>{" "}
+            →{" "}
+            <span className="font-display font-bold">
+              {maskLevelToDisplay(sdkConfig.screenshot_mask_level)}
+            </span>
+          </li>
+        </ul>
+        <p className="mt-4">These changes will apply to all new screenshots.</p>
+      </div>
+    );
+  };
+
+  const getLogsConfirmBody = () => {
+    return (
+      <div className="font-body">
+        <p>
+          Are you sure you want to update{" "}
+          <span className="font-display font-bold">Logs settings</span> for app{" "}
+          <span className="font-display font-bold">{appName}</span>?
+        </p>
+        <p className="mt-4">The following changes will be applied:</p>
+        <ul className="mt-2 space-y-1 list-disc list-inside">
+          {sdkConfig.log_autocollect_enabled !==
+            originalSdkConfig.log_autocollect_enabled && (
+            <li>
+              Automatic log collection:{" "}
+              <span className="font-display font-bold">
+                {sdkConfig.log_autocollect_enabled ? "Enabled" : "Disabled"}
+              </span>
+            </li>
+          )}
+          {sdkConfig.log_min_severity !==
+            originalSdkConfig.log_min_severity && (
+            <li>
+              Minimum log level:{" "}
+              <span className="font-display font-bold">
+                {logSeverityNumberToDisplay(originalSdkConfig.log_min_severity)}
+              </span>{" "}
+              →{" "}
+              <span className="font-display font-bold">
+                {logSeverityNumberToDisplay(sdkConfig.log_min_severity)}
+              </span>
+            </li>
+          )}
+          {JSON.stringify(sdkConfig.log_ignore_patterns) !==
+            JSON.stringify(originalSdkConfig.log_ignore_patterns) && (
+            <li>Log ignore patterns updated</li>
+          )}
+        </ul>
+      </div>
+    );
+  };
+
+  const preventSpaceKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === " ") {
+      e.preventDefault();
+    }
+  };
+
+  return (
+    <div className="w-full">
+      <div className="flex items-center gap-2">
+        <p className="max-w-6xl font-display text-xl">
+          {showHistory
+            ? "Data Collection History"
+            : "Configure Data Collection"}
+        </p>
+        {!showHistory && (
+          <InfoTooltip
+            content={
+              <>
+                See the{" "}
+                <Link
+                  href="/docs/adaptive-capture"
+                  className={underlineLinkStyle}
+                >
+                  docs
+                </Link>{" "}
+                to learn more
+              </>
+            }
+          />
+        )}
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-auto"
+          onClick={() => setShowHistory((show) => !show)}
+        >
+          {showHistory ? (
+            <>
+              <ArrowLeft /> Configure Data Collection
+            </>
+          ) : (
+            <>
+              <History /> History
+            </>
+          )}
+        </Button>
+      </div>
+
+      {showHistory && (
+        <div className="mt-6">
+          <SdkConfigHistory key={appId} appId={appId} />
+        </div>
+      )}
+
+      <div className="mt-6" hidden={showHistory}>
+        <Accordion type="single" collapsible className="w-full">
+          {/* Errors Accordion */}
+          <AccordionItem value="errors" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Errors
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="py-2">
+                  <p className="font-display text-muted-foreground mb-4">
+                    Sampling rate
+                  </p>
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-body text-sm">
+                        Collect <span className="font-bold">fatal</span> errors
+                        at
+                      </span>
+                      <SdkConfigNumericInput
+                        testId="error-fatal-sampling-rate-input"
+                        value={sdkConfig.error_fatal_sampling_rate}
+                        minValue={0}
+                        maxValue={100}
+                        step={0.01}
+                        type="float"
+                        onChange={(value) =>
+                          updateSdkConfig({ error_fatal_sampling_rate: value })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                      <span className="font-body text-sm">% sampling rate</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-body text-sm">
+                        Collect <span className="font-bold">unhandled</span>{" "}
+                        errors at
+                      </span>
+                      <SdkConfigNumericInput
+                        testId="error-unhandled-sampling-rate-input"
+                        value={sdkConfig.error_unhandled_sampling_rate}
+                        minValue={0}
+                        maxValue={100}
+                        step={0.01}
+                        type="float"
+                        onChange={(value) =>
+                          updateSdkConfig({
+                            error_unhandled_sampling_rate: value,
+                          })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                      <span className="font-body text-sm">% sampling rate</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-body text-sm">
+                        Collect <span className="font-bold">handled</span>{" "}
+                        errors at
+                      </span>
+                      <SdkConfigNumericInput
+                        testId="error-handled-sampling-rate-input"
+                        value={sdkConfig.error_handled_sampling_rate}
+                        minValue={0}
+                        maxValue={100}
+                        step={0.01}
+                        type="float"
+                        onChange={(value) =>
+                          updateSdkConfig({
+                            error_handled_sampling_rate: value,
+                          })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                      <span className="font-body text-sm">% sampling rate</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="py-2">
+                  <p className="font-display text-muted-foreground mb-4">
+                    Screenshots
+                  </p>
+                  <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                    <p className="text-sm">
+                      Collect screenshot with{" "}
+                      <span className="font-bold">fatal</span> errors
+                    </p>
+                    <Switch
+                      data-testid="error-fatal-screenshot-switch"
+                      className="sm:ml-4"
+                      checked={sdkConfig.error_fatal_take_screenshot}
+                      onCheckedChange={(checked) =>
+                        updateSdkConfig({
+                          error_fatal_take_screenshot: checked,
+                        })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                  </div>
+                </div>
+
+                <div className="py-2">
+                  <p className="font-display text-muted-foreground mb-4">
+                    Session replay
+                  </p>
+                  <div className="space-y-4">
+                    <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                      <p className="text-sm">
+                        Collect session replay with{" "}
+                        <span className="font-bold">fatal</span> errors
+                      </p>
+                      <Switch
+                        data-testid="error-fatal-replay-switch"
+                        className="sm:ml-4"
+                        checked={sdkConfig.error_fatal_replay_enabled}
+                        onCheckedChange={(checked) =>
+                          updateSdkConfig({
+                            error_fatal_replay_enabled: checked,
+                          })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                    </div>
+                    <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                      <p className="text-sm">
+                        Collect session replay with{" "}
+                        <span className="font-bold">unhandled</span> errors
+                      </p>
+                      <Switch
+                        data-testid="error-unhandled-replay-switch"
+                        className="sm:ml-4"
+                        checked={sdkConfig.error_unhandled_replay_enabled}
+                        onCheckedChange={(checked) =>
+                          updateSdkConfig({
+                            error_unhandled_replay_enabled: checked,
+                          })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                    </div>
+                    <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                      <p className="text-sm">
+                        Collect session replay with{" "}
+                        <span className="font-bold">handled</span> errors
+                      </p>
+                      <Switch
+                        data-testid="error-handled-replay-switch"
+                        className="sm:ml-4"
+                        checked={sdkConfig.error_handled_replay_enabled}
+                        onCheckedChange={(checked) =>
+                          updateSdkConfig({
+                            error_handled_replay_enabled: checked,
+                          })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-body text-sm">
+                        Each session replay covers the last
+                      </span>
+                      <SdkConfigNumericInput
+                        testId="error-replay-duration-input"
+                        value={sdkConfig.error_replay_duration}
+                        minValue={0}
+                        maxValue={3600}
+                        onChange={(val) =>
+                          updateSdkConfig({ error_replay_duration: val })
+                        }
+                        disabled={!currentUserCanChangeAppSettings}
+                      />
+                      <span className="font-body text-sm">seconds</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="errors-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !errorsChanged
+                    }
+                    loading={sectionStatuses.errors === "saving"}
+                    onClick={() => setErrorsConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* ANRs Accordion */}
+          {shouldShowAndroidSettings && (
+            <AccordionItem value="anrs" className="mt-2">
+              <AccordionTrigger className="font-body text-base">
+                ANRs
+              </AccordionTrigger>
+              <AccordionContent className={accordionContentStyle}>
+                <div className="mt-2 space-y-4">
+                  <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                    <p className="text-sm">Collect screenshot with ANRs</p>
+                    <Switch
+                      data-testid="anr-screenshot-switch"
+                      className="sm:ml-4"
+                      checked={sdkConfig.anr_take_screenshot}
+                      onCheckedChange={(checked) =>
+                        updateSdkConfig({ anr_take_screenshot: checked })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-body text-sm">
+                      Collect session replay of
+                    </span>
+                    <SdkConfigNumericInput
+                      testId="anr-timeline-duration-input"
+                      value={sdkConfig.anr_timeline_duration}
+                      minValue={0}
+                      maxValue={3600}
+                      onChange={(val) =>
+                        updateSdkConfig({ anr_timeline_duration: val })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                    <span className="font-body text-sm">
+                      seconds with every ANR
+                    </span>
+                  </div>
+                  <div className="flex justify-end mt-2">
+                    <Button
+                      data-testid="anrs-save-button"
+                      variant="outline"
+                      disabled={
+                        !currentUserCanChangeAppSettings || !anrsChanged
+                      }
+                      loading={sectionStatuses.anrs === "saving"}
+                      onClick={() => setAnrsConfirmOpen(true)}
+                    >
+                      Save
+                    </Button>
+                  </div>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          )}
+
+          {/* App Hangs Accordion */}
+          {shouldShowIosSettings && (
+            <AccordionItem value="app_hangs" className="mt-2">
+              <AccordionTrigger className="font-body text-base">
+                App Hangs
+              </AccordionTrigger>
+              <AccordionContent className={accordionContentStyle}>
+                <div className="mt-2 space-y-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-body text-sm">
+                      Report an app hang when the main thread is blocked for
+                    </span>
+                    <SdkConfigNumericInput
+                      testId="app-hang-threshold-input"
+                      value={sdkConfig.app_hang_threshold_millis}
+                      minValue={1000}
+                      maxValue={30000}
+                      onChange={(val) =>
+                        updateSdkConfig({ app_hang_threshold_millis: val })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                    <span className="font-body text-sm">
+                      milliseconds or longer
+                    </span>
+                    <InfoTooltip
+                      content={
+                        <>
+                          A lower threshold catches shorter stalls but wakes the
+                          detector more often. The SDK will not go below 1000
+                          ms.
+                        </>
+                      }
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-body text-sm">
+                      Collect app hangs at
+                    </span>
+                    <SdkConfigNumericInput
+                      testId="app-hang-sampling-rate-input"
+                      value={sdkConfig.app_hang_sampling_rate}
+                      minValue={0}
+                      maxValue={100}
+                      step={0.01}
+                      type="float"
+                      onChange={(value) =>
+                        updateSdkConfig({ app_hang_sampling_rate: value })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                    <span className="font-body text-sm">% sampling rate</span>
+                  </div>
+                  <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                    <p className="text-sm">
+                      Collect session replay with app hangs
+                    </p>
+                    <Switch
+                      data-testid="app-hang-replay-switch"
+                      className="sm:ml-4"
+                      checked={sdkConfig.app_hang_replay_enabled}
+                      onCheckedChange={(checked) =>
+                        updateSdkConfig({ app_hang_replay_enabled: checked })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-body text-sm">
+                      Collect session replay of
+                    </span>
+                    <SdkConfigNumericInput
+                      testId="app-hang-timeline-duration-input"
+                      value={sdkConfig.app_hang_timeline_duration}
+                      minValue={0}
+                      maxValue={3600}
+                      onChange={(val) =>
+                        updateSdkConfig({ app_hang_timeline_duration: val })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                    <span className="font-body text-sm">
+                      seconds with every app hang
+                    </span>
+                  </div>
+                  <div className="flex justify-end mt-2">
+                    <Button
+                      data-testid="app-hangs-save-button"
+                      variant="outline"
+                      disabled={
+                        !currentUserCanChangeAppSettings || !appHangsChanged
+                      }
+                      loading={sectionStatuses.appHangs === "saving"}
+                      onClick={() => setAppHangsConfirmOpen(true)}
+                    >
+                      Save
+                    </Button>
+                  </div>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          )}
+
+          {/* Bug Reports Accordion */}
+          <AccordionItem value="bug_reports" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Bug Reports
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect session replay of
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="bug-report-timeline-duration-input"
+                    value={sdkConfig.bug_report_timeline_duration}
+                    minValue={0}
+                    maxValue={3600}
+                    onChange={(val) =>
+                      updateSdkConfig({ bug_report_timeline_duration: val })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">
+                    seconds with every Bug Report
+                  </span>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="bug-reports-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !bugReportsChanged
+                    }
+                    loading={sectionStatuses.bugReports === "saving"}
+                    onClick={() => setBugReportsConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Traces Accordion */}
+          <AccordionItem value="traces" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Traces
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">Collect traces at</span>
+                  <SdkConfigNumericInput
+                    testId="trace-sampling-rate-input"
+                    value={sdkConfig.trace_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({ trace_sampling_rate: value })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% sampling rate</span>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="traces-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !tracesChanged
+                    }
+                    loading={sectionStatuses.traces === "saving"}
+                    onClick={() => setTracesConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Launch Metrics Accordion */}
+          <AccordionItem value="launch" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Launch Metrics
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect cold, warm and hot launch metrics at
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="launch-sampling-rate-input"
+                    value={sdkConfig.launch_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({ launch_sampling_rate: value })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% sampling rate</span>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="launch-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !launchMetricsChanged
+                    }
+                    loading={sectionStatuses.launch === "saving"}
+                    onClick={() => setLaunchConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Profiling Accordion */}
+          <AccordionItem value="profiling" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Profiles
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">Collect profiles at</span>
+                  <SdkConfigNumericInput
+                    testId="profiling-sampling-rate-input"
+                    value={sdkConfig.profile_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({
+                        profile_sampling_rate: value,
+                      })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% sampling rate</span>
+                  <InfoTooltip
+                    content={
+                      <>
+                        Profiles are captured on Android using the trigger-based
+                        profiling API for an ANR or the app being fully drawn.{" "}
+                        <Link
+                          href="/docs/performance-tracing/profiling#sampling"
+                          className={underlineLinkStyle}
+                        >
+                          Learn more
+                        </Link>
+                      </>
+                    }
+                  />
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="profiling-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !profilingChanged
+                    }
+                    loading={sectionStatuses.profiling === "saving"}
+                    onClick={() => setProfilingConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* User Journeys Accordion */}
+          <AccordionItem value="journeys" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              User Journeys
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect user journeys for
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="journey-sampling-rate-input"
+                    value={sdkConfig.journey_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({ journey_sampling_rate: value })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% sessions</span>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="journey-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !journeyChanged
+                    }
+                    loading={sectionStatuses.journey === "saving"}
+                    onClick={() => setJourneyConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* HTTP Accordion */}
+          <AccordionItem value="http" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              HTTP
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                {/* HTTP events sampling rate */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect HTTP events at
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="http-sampling-rate-input"
+                    value={sdkConfig.http_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({ http_sampling_rate: value })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% sampling rate</span>
+                </div>
+                {/* Disable HTTP event for URLs */}
+                <div className="py-8">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="font-display">Disable HTTP event for URLs</p>
+                    <InfoTooltip
+                      content={
+                        <>
+                          HTTP events will not be collected for URLs matching
+                          these patterns. Supports exact match and wildcards
+                          (*). Enter one pattern per line.
+                        </>
+                      }
+                    />
+                  </div>
+                  <Textarea
+                    data-testid="http-disable-urls-textarea"
+                    rows={4}
+                    value={arrayToInput(sdkConfig.http_disable_event_for_urls)}
+                    onChange={(e) =>
+                      updateSdkConfig({
+                        http_disable_event_for_urls: inputToArray(
+                          e.target.value,
+                        ),
+                      })
+                    }
+                    onKeyDown={preventSpaceKey}
+                    placeholder={getUrlPlaceholder()}
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+
+                {/* Track Request for URLs */}
+                <div className="py-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="font-display">Track request for URLs</p>
+                    <InfoTooltip
+                      content={
+                        <>
+                          Full HTTP request (body and headers) will be captured
+                          for URLs matching these patterns. Supports exact match
+                          and wildcards (*). Enter one pattern per line.
+                        </>
+                      }
+                    />
+                  </div>
+                  <Textarea
+                    data-testid="http-track-request-urls-textarea"
+                    rows={4}
+                    value={arrayToInput(sdkConfig.http_track_request_for_urls)}
+                    onChange={(e) =>
+                      updateSdkConfig({
+                        http_track_request_for_urls: inputToArray(
+                          e.target.value,
+                        ),
+                      })
+                    }
+                    onKeyDown={preventSpaceKey}
+                    placeholder={getUrlPlaceholder()}
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+
+                {/* Track Response for URLs */}
+                <div className="py-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="font-display">Track response for URLs</p>
+                    <InfoTooltip
+                      content={
+                        <>
+                          Full HTTP response (body and headers) will be captured
+                          for URLs matching these patterns. Supports exact match
+                          and wildcards (*). Enter one pattern per line.
+                        </>
+                      }
+                    />
+                  </div>
+                  <Textarea
+                    data-testid="http-track-response-urls-textarea"
+                    rows={4}
+                    value={arrayToInput(sdkConfig.http_track_response_for_urls)}
+                    onChange={(e) =>
+                      updateSdkConfig({
+                        http_track_response_for_urls: inputToArray(
+                          e.target.value,
+                        ),
+                      })
+                    }
+                    onKeyDown={preventSpaceKey}
+                    placeholder={getUrlPlaceholder()}
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+
+                {/* Blocked Headers */}
+                <div className="py-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="font-display">Blocked headers</p>
+                    <InfoTooltip
+                      content={
+                        <>
+                          Headers that will never be captured in HTTP requests
+                          or responses. Note that common sensitive headers like
+                          Authorization, Cookies, etc are never collected by
+                          default. Enter one header name per line.
+                        </>
+                      }
+                    />
+                  </div>
+                  <Textarea
+                    data-testid="http-blocked-headers-textarea"
+                    rows={4}
+                    value={arrayToInput(sdkConfig.http_blocked_headers)}
+                    onChange={(e) =>
+                      updateSdkConfig({
+                        http_blocked_headers: inputToArray(e.target.value),
+                      })
+                    }
+                    onKeyDown={preventSpaceKey}
+                    placeholder={getHeaderPlaceholder()}
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+
+                <div className="flex justify-end py-2">
+                  <Button
+                    data-testid="http-save-button"
+                    variant="outline"
+                    disabled={!currentUserCanChangeAppSettings || !httpChanged}
+                    loading={sectionStatuses.http === "saving"}
+                    onClick={() => setHttpConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Screenshot Masking Accordion */}
+          <AccordionItem value="masking" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Screenshot Masking
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                  <p className="text-sm">Screenshot mask level</p>
+                  <div className="sm:ml-3">
+                    <DropdownSelect
+                      data-testid="screenshot-mask-level-dropdown"
+                      type={DropdownSelectType.SingleString}
+                      title=""
+                      items={[
+                        "All text and media",
+                        "All text",
+                        "All text except clickable",
+                        "Sensitive fields only",
+                      ]}
+                      initialSelected={maskLevelToDisplay(
+                        sdkConfig.screenshot_mask_level,
+                      )}
+                      onChangeSelected={(item) =>
+                        updateSdkConfig({
+                          screenshot_mask_level: displayToMaskLevel(
+                            item as string,
+                          ),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="masking-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings ||
+                      !screenshotMaskingChanged
+                    }
+                    loading={sectionStatuses.masking === "saving"}
+                    onClick={() => setMaskingConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Memory Accordion */}
+          <AccordionItem value="memory" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Memory
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect memory usage every
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="memory-usage-interval-input"
+                    value={sdkConfig.memory_usage_interval}
+                    minValue={1}
+                    maxValue={3600}
+                    step={1}
+                    type="integer"
+                    onChange={(value) =>
+                      updateSdkConfig({ memory_usage_interval: value })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">seconds</span>
+                </div>
+                {shouldShowAndroidSettings && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-body text-sm">
+                      Collect memory usage in the background every
+                    </span>
+                    <SdkConfigNumericInput
+                      testId="memory-usage-background-interval-input"
+                      value={sdkConfig.memory_usage_background_interval}
+                      minValue={1}
+                      maxValue={3600}
+                      step={1}
+                      type="integer"
+                      onChange={(value) =>
+                        updateSdkConfig({
+                          memory_usage_background_interval: value,
+                        })
+                      }
+                      disabled={!currentUserCanChangeAppSettings}
+                    />
+                    <span className="font-body text-sm">seconds</span>
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-body text-sm">
+                    Collect memory usage for
+                  </span>
+                  <SdkConfigNumericInput
+                    testId="memory-usage-session-sampling-rate-input"
+                    value={sdkConfig.memory_usage_session_sampling_rate}
+                    minValue={0}
+                    maxValue={100}
+                    step={0.01}
+                    type="float"
+                    onChange={(value) =>
+                      updateSdkConfig({
+                        memory_usage_session_sampling_rate: value,
+                      })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                  <span className="font-body text-sm">% of sessions</span>
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="memory-save-button"
+                    variant="outline"
+                    disabled={
+                      !currentUserCanChangeAppSettings || !memoryChanged
+                    }
+                    loading={sectionStatuses.memory === "saving"}
+                    onClick={() => setMemoryConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Logs Accordion */}
+          <AccordionItem value="logs" className="mt-2">
+            <AccordionTrigger className="font-body text-base">
+              Logs
+            </AccordionTrigger>
+            <AccordionContent className={accordionContentStyle}>
+              <div className="mt-2 space-y-4">
+                <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-0">
+                  <p className="text-sm">Automatically collect logs</p>
+                  <Switch
+                    data-testid="automatic-log-collection-switch"
+                    className="sm:ml-4"
+                    checked={sdkConfig.log_autocollect_enabled}
+                    onCheckedChange={(checked) =>
+                      updateSdkConfig({
+                        log_autocollect_enabled: checked,
+                      })
+                    }
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+                <div className="flex flex-col gap-2 min-h-10 sm:flex-row sm:items-center sm:gap-2">
+                  <span className="font-body text-sm">Collect</span>
+                  <DropdownSelect
+                    data-testid="min-log-level-dropdown"
+                    type={DropdownSelectType.SingleString}
+                    title=""
+                    items={["Debug", "Info", "Warning", "Error", "Fatal"]}
+                    initialSelected={logSeverityNumberToDisplay(
+                      sdkConfig.log_min_severity,
+                    )}
+                    onChangeSelected={(item) =>
+                      updateSdkConfig({
+                        log_min_severity: displayToLogSeverityNumber(
+                          item as string,
+                        ),
+                      })
+                    }
+                  />
+                  <span className="font-body text-sm">severity and above</span>
+                </div>
+                <div className="py-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="font-display">Ignore patterns</p>
+                    <InfoTooltip
+                      content={
+                        <>
+                          Logs whose body matches any of these regular
+                          expressions are dropped on the SDK. Enter one pattern
+                          per line.
+                        </>
+                      }
+                    />
+                  </div>
+                  <Textarea
+                    data-testid="log-ignore-patterns-textarea"
+                    rows={4}
+                    value={arrayToInput(sdkConfig.log_ignore_patterns)}
+                    onChange={(e) =>
+                      updateSdkConfig({
+                        log_ignore_patterns: inputToArray(e.target.value),
+                      })
+                    }
+                    placeholder={"password=.*\ntoken=.*"}
+                    disabled={!currentUserCanChangeAppSettings}
+                  />
+                </div>
+                <div className="flex justify-end mt-2">
+                  <Button
+                    data-testid="logs-save-button"
+                    variant="outline"
+                    disabled={!currentUserCanChangeAppSettings || !logsChanged}
+                    loading={sectionStatuses.logs === "saving"}
+                    onClick={() => setLogsConfirmOpen(true)}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+      </div>
+
+      {/* Confirmation Dialogs */}
+      <DangerConfirmationDialog
+        body={getErrorsConfirmBody()}
+        open={errorsConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setErrorsConfirmOpen(false);
+          handleSaveErrors();
+        }}
+        onCancelAction={() => setErrorsConfirmOpen(false)}
+      />
+
+      {shouldShowAndroidSettings && (
+        <DangerConfirmationDialog
+          body={getAnrsConfirmBody()}
+          open={anrsConfirmOpen}
+          affirmativeText="Yes, I'm sure"
+          cancelText="Cancel"
+          onAffirmativeAction={() => {
+            setAnrsConfirmOpen(false);
+            handleSaveAnrs();
+          }}
+          onCancelAction={() => setAnrsConfirmOpen(false)}
+        />
+      )}
+
+      {shouldShowIosSettings && (
+        <DangerConfirmationDialog
+          body={getAppHangsConfirmBody()}
+          open={appHangsConfirmOpen}
+          affirmativeText="Yes, I'm sure"
+          cancelText="Cancel"
+          onAffirmativeAction={() => {
+            setAppHangsConfirmOpen(false);
+            handleSaveAppHangs();
+          }}
+          onCancelAction={() => setAppHangsConfirmOpen(false)}
+        />
+      )}
+
+      <DangerConfirmationDialog
+        body={getBugReportsConfirmBody()}
+        open={bugReportsConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setBugReportsConfirmOpen(false);
+          handleSaveBugReports();
+        }}
+        onCancelAction={() => setBugReportsConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getTracesConfirmBody()}
+        open={tracesConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setTracesConfirmOpen(false);
+          handleSaveTraces();
+        }}
+        onCancelAction={() => setTracesConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getLaunchConfirmBody()}
+        open={launchConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setLaunchConfirmOpen(false);
+          handleSaveLaunch();
+        }}
+        onCancelAction={() => setLaunchConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getProfilingConfirmBody()}
+        open={profilingConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setProfilingConfirmOpen(false);
+          handleSaveProfiling();
+        }}
+        onCancelAction={() => setProfilingConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getJourneysConfirmBody()}
+        open={journeyConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setJourneyConfirmOpen(false);
+          handleSaveJourney();
+        }}
+        onCancelAction={() => setJourneyConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getMemoryConfirmBody()}
+        open={memoryConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setMemoryConfirmOpen(false);
+          handleSaveMemory();
+        }}
+        onCancelAction={() => setMemoryConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getHttpConfirmBody()}
+        open={httpConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setHttpConfirmOpen(false);
+          handleSaveHttp();
+        }}
+        onCancelAction={() => setHttpConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getMaskingConfirmBody()}
+        open={maskingConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setMaskingConfirmOpen(false);
+          handleSaveMasking();
+        }}
+        onCancelAction={() => setMaskingConfirmOpen(false)}
+      />
+
+      <DangerConfirmationDialog
+        body={getLogsConfirmBody()}
+        open={logsConfirmOpen}
+        affirmativeText="Yes, I'm sure"
+        cancelText="Cancel"
+        onAffirmativeAction={() => {
+          setLogsConfirmOpen(false);
+          handleSaveLogs();
+        }}
+        onCancelAction={() => setLogsConfirmOpen(false)}
+      />
+    </div>
+  );
+}

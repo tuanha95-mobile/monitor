@@ -1,0 +1,416 @@
+package authsession
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/leporo/sqlf"
+)
+
+// ErrInvalidOAuthCode reports a provider rejecting the authorization code as
+// unknown, already used or expired.
+var ErrInvalidOAuthCode = errors.New("invalid oauth code")
+
+// errBodyLimit caps how much of a provider's response body ends up in an error.
+const errBodyLimit = 256
+
+// providerClient bounds every call to GitHub and Google. The MCP token
+// endpoint waits on one of these inline, so a provider that accepts a
+// connection and never answers would otherwise hold a request open.
+var providerClient = &http.Client{Timeout: 10 * time.Second}
+
+// AuthState represents temporary state
+// to store code and other details during
+// authentication.
+type AuthState struct {
+	State         string
+	Code          string
+	OAuthProvider string `json:"oauth_provider"`
+	AccessToken   string `json:"access_token"`
+	RefreshToken  string `json:"refresh_token"`
+}
+
+// GitHubToken represents the GitHub token
+// received from GitHub.
+type GitHubToken struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	Scope       string `json:"scope"`
+}
+
+// GitHubUser represents the GitHub user.
+type GitHubUser struct {
+	ID        int    `json:"id"`
+	Login     string `json:"login"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	AvatarUrl string `json:"avatar_url"`
+	Company   string `json:"company"`
+	Location  string `json:"location"`
+}
+
+// GoogleUser represents the Google user.
+type GoogleUser struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Picture string `json:"picture"`
+}
+
+// Save saves the authentication state.
+func (as AuthState) Save(ctx context.Context, pg *pgxpool.Pool) (err error) {
+	stmt := sqlf.PostgreSQL.
+		InsertInto("auth_states").
+		Set("id", uuid.New()).
+		Set("state", as.State).
+		Set("oauth_provider", as.OAuthProvider)
+
+	defer stmt.Close()
+
+	_, err = pg.Exec(ctx, stmt.String(), stmt.Args()...)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+// GetOAuthState find an oauth state by state.
+func GetOAuthState(ctx context.Context, pg *pgxpool.Pool, state, provider string) (authState AuthState, err error) {
+	stmt := sqlf.PostgreSQL.
+		From("auth_states").
+		Select("state").
+		Where("state = ? and oauth_provider = ?", state, provider).
+		Limit(1)
+
+	defer stmt.Close()
+
+	if err = pg.QueryRow(ctx, stmt.String(), stmt.Args()...).Scan(&authState.State); err != nil {
+		return
+	}
+
+	return
+}
+
+// RemoveOAuthState removes an oauth state.
+func RemoveOAuthState(ctx context.Context, pg *pgxpool.Pool, state, provider string) (err error) {
+	stmt := sqlf.PostgreSQL.
+		DeleteFrom("auth_states").
+		Where("state = ? and oauth_provider = ?", state, provider)
+
+	defer stmt.Close()
+
+	_, err = pg.Exec(ctx, stmt.String(), stmt.Args()...)
+
+	return
+}
+
+// ExchangeCodeForToken exchanges code for a GitHub access token.
+func ExchangeCodeForToken(siteOrigin, ghKey, ghSecret string, code string) (githubToken GitHubToken, err error) {
+	token, err := ExchangeGitHubCodeForToken(code,
+		fmt.Sprintf("%s/auth/callback/github", siteOrigin),
+		ghKey,
+		ghSecret)
+	if err != nil {
+		return
+	}
+	githubToken.AccessToken = token
+	return
+}
+
+// doGitHub makes GitHub API network requests.
+func doGitHub(path, token string) (body []byte, err error) {
+	endpoint := fmt.Sprintf("https://api.github.com%s", path)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	resp, err := providerClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		err = fmt.Errorf("github rejected the token: %w", ErrProviderAccessRevoked)
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf(`failed to retrieve github oauth primary email, status code: %d`, resp.StatusCode)
+		return
+	}
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+// ErrProviderAccessRevoked is returned only for a definite rejection. A
+// GitHub 403 lockout, a Google 401 for our own bad credentials, a timeout or
+// a 5xx say nothing about the token and must not be treated as a revocation.
+var ErrProviderAccessRevoked = errors.New("provider access revoked")
+
+// GetGitHubUser fetches user info from GitHub.
+func GetGitHubUser(token string) (user GitHubUser, err error) {
+	body, err := doGitHub("/user", token)
+	if err != nil {
+		return
+	}
+
+	if err = json.Unmarshal(body, &user); err != nil {
+		return
+	}
+
+	body, err = doGitHub("/user/emails", token)
+	if err != nil {
+		return
+	}
+
+	type ghEmail struct {
+		Email   string `json:"email"`
+		Primary bool   `json:"primary"`
+	}
+
+	var emails []ghEmail
+
+	if err = json.Unmarshal(body, &emails); err != nil {
+		return
+	}
+
+	for i := range emails {
+		if emails[i].Primary {
+			user.Email = emails[i].Email
+			break
+		}
+	}
+
+	return
+}
+
+// truncBody caps a provider response body for safe inclusion in an error.
+func truncBody(body []byte) string {
+	return string(body[:min(len(body), errBodyLimit)])
+}
+
+// githubTokenEndpoint is GitHub's OAuth token endpoint. Override in tests.
+var githubTokenEndpoint = "https://github.com/login/oauth/access_token"
+
+// ExchangeGitHubCodeForToken exchanges a GitHub OAuth code for an access token.
+func ExchangeGitHubCodeForToken(code, redirectURI, clientID, clientSecret string) (string, error) {
+	endpoint := githubTokenEndpoint
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("code", code)
+	data.Set("redirect_uri", redirectURI)
+
+	req, err := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := providerClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var result struct {
+		AccessToken      string `json:"access_token"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse GitHub token response, status %d: %s", resp.StatusCode, truncBody(body))
+	}
+
+	// GitHub reports OAuth errors in the body with a 200, so check the body
+	// before the status code.
+	if result.Error != "" {
+		err := fmt.Errorf("GitHub OAuth error: %s: %s", result.Error, result.ErrorDescription)
+		if result.Error == "bad_verification_code" {
+			err = fmt.Errorf("%w: %w", ErrInvalidOAuthCode, err)
+		}
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub token endpoint returned %d: %s", resp.StatusCode, truncBody(body))
+	}
+
+	if result.AccessToken == "" {
+		return "", fmt.Errorf("GitHub returned empty access token")
+	}
+	return result.AccessToken, nil
+}
+
+// googleTokenEndpoint is Google's OAuth token endpoint. Override in tests.
+var googleTokenEndpoint = "https://oauth2.googleapis.com/token"
+
+// ExchangeGoogleCode exchanges a Google authorization code for a refresh token
+// and ID token using the server-side OAuth flow.
+func ExchangeGoogleCode(code, redirectURI, clientID, clientSecret string) (refreshToken, idToken string, err error) {
+	endpoint := googleTokenEndpoint
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("code", code)
+	data.Set("redirect_uri", redirectURI)
+	data.Set("grant_type", "authorization_code")
+
+	req, reqErr := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+	if reqErr != nil {
+		return "", "", reqErr
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, doErr := providerClient.Do(req)
+	if doErr != nil {
+		return "", "", doErr
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return "", "", readErr
+	}
+
+	var result struct {
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	if jsonErr := json.Unmarshal(body, &result); jsonErr != nil {
+		return "", "", fmt.Errorf("failed to parse Google token response, status %d: %s", resp.StatusCode, truncBody(body))
+	}
+
+	// Google reports OAuth errors in the body with a 400, so check the body
+	// before the status code.
+	if result.Error != "" {
+		err = fmt.Errorf("Google OAuth error: %s: %s", result.Error, result.ErrorDesc)
+		if result.Error == "invalid_grant" {
+			err = fmt.Errorf("%w: %w", ErrInvalidOAuthCode, err)
+		}
+		return "", "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("Google token endpoint returned %d: %s", resp.StatusCode, truncBody(body))
+	}
+
+	if result.IDToken == "" {
+		return "", "", fmt.Errorf("Google returned empty id_token")
+	}
+	return result.RefreshToken, result.IDToken, nil
+}
+
+// GoogleIDTokenClaims holds the user info claims extracted from a Google ID token.
+type GoogleIDTokenClaims struct {
+	Name    string
+	Email   string
+	Picture string
+}
+
+// DecodeGoogleIDToken extracts user info claims from a Google ID token JWT.
+// No signature verification is performed because the token was received
+// directly from Google's token endpoint over HTTPS.
+func DecodeGoogleIDToken(idToken string) (GoogleIDTokenClaims, error) {
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return GoogleIDTokenClaims{}, fmt.Errorf("invalid id_token: expected 3 parts, got %d", len(parts))
+	}
+
+	payload := parts[1]
+	// Add padding if needed.
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+
+	decoded, decErr := base64.URLEncoding.DecodeString(payload)
+	if decErr != nil {
+		return GoogleIDTokenClaims{}, fmt.Errorf("failed to decode id_token payload: %w", decErr)
+	}
+
+	var claims struct {
+		Name    string `json:"name"`
+		Email   string `json:"email"`
+		Picture string `json:"picture"`
+	}
+	if jsonErr := json.Unmarshal(decoded, &claims); jsonErr != nil {
+		return GoogleIDTokenClaims{}, fmt.Errorf("failed to parse id_token claims: %w", jsonErr)
+	}
+	if claims.Email == "" {
+		return GoogleIDTokenClaims{}, fmt.Errorf("id_token missing email claim")
+	}
+	return GoogleIDTokenClaims{
+		Name:    claims.Name,
+		Email:   claims.Email,
+		Picture: claims.Picture,
+	}, nil
+}
+
+// ValidateGoogleRefreshToken checks that a Google refresh token is still valid
+// by attempting a token refresh. Returns nil if valid, error if revoked.
+func ValidateGoogleRefreshToken(refreshToken, clientID, clientSecret string) error {
+	endpoint := "https://oauth2.googleapis.com/token"
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("refresh_token", refreshToken)
+	data.Set("grant_type", "refresh_token")
+
+	req, reqErr := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+	if reqErr != nil {
+		return reqErr
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, doErr := providerClient.Do(req)
+	if doErr != nil {
+		return doErr
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusBadRequest {
+		var body struct {
+			Error string `json:"error"`
+		}
+		if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr == nil && body.Error == "invalid_grant" {
+			return fmt.Errorf("google rejected the refresh token: %w", ErrProviderAccessRevoked)
+		}
+		return fmt.Errorf("Google refresh token validation failed: HTTP %d", resp.StatusCode)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Google refresh token validation failed: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}

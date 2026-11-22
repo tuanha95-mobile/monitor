@@ -1,0 +1,278 @@
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
+import 'package:measure_flutter/src/bug_report/bug_report_collector.dart';
+import 'package:measure_flutter/src/bug_report/shake_detector.dart';
+import 'package:measure_flutter/src/config/config_loader.dart';
+import 'package:measure_flutter/src/events/custom_event_collector.dart';
+import 'package:measure_flutter/src/exception/exception_collector.dart';
+import 'package:measure_flutter/src/exception/exception_severity.dart';
+import 'package:measure_flutter/src/gestures/click_data.dart';
+import 'package:measure_flutter/src/gestures/gesture_collector.dart';
+import 'package:measure_flutter/src/gestures/long_click_data.dart';
+import 'package:measure_flutter/src/http/http_collector.dart';
+import 'package:measure_flutter/src/isolate/file_processing_isolate.dart';
+import 'package:measure_flutter/src/logger/log_level.dart';
+import 'package:measure_flutter/src/logger/logger.dart';
+import 'package:measure_flutter/src/logs/log_collector.dart';
+import 'package:measure_flutter/src/measure_initializer.dart';
+import 'package:measure_flutter/src/method_channel/msr_method_channel.dart';
+import 'package:measure_flutter/src/navigation/navigation_collector.dart';
+import 'package:measure_flutter/src/screenshot/screenshot_collector.dart';
+import 'package:measure_flutter/src/time/time_provider.dart';
+import 'package:measure_flutter/src/tracing/span_processor.dart';
+import 'package:measure_flutter/src/tracing/tracer.dart';
+import 'package:measure_flutter/src/utils/id_provider.dart';
+import 'package:measure_flutter/src/utils/validation_limits.dart';
+
+import '../measure_flutter.dart';
+import 'config/config_provider.dart';
+import 'gestures/scroll_data.dart';
+
+final class MeasureInternal {
+  final MeasureInitializer initializer;
+  final Logger logger;
+  final ConfigProvider configProvider;
+  final CustomEventCollector _customEventCollector;
+  final LogCollector _logCollector;
+  final ExceptionCollector _exceptionCollector;
+  final NavigationCollector _navigationCollector;
+  final HttpCollector _httpCollector;
+  final BugReportCollector _bugReportCollector;
+  final GestureCollector _gestureCollector;
+  final ScreenshotCollector _screenshotCollector;
+  final Tracer _tracer;
+  final TimeProvider _timeProvider;
+  final MsrMethodChannel methodChannel;
+  final IdProvider _idProvider;
+  final ShakeDetector _shakeDetector;
+  final ConfigLoader _configLoader;
+  final SpanProcessor _spanProcessor;
+  final FileProcessingIsolate _fileProcessingIsolate;
+
+  MeasureInternal({
+    required this.initializer,
+    required this.methodChannel,
+  })  : logger = initializer.logger,
+        configProvider = initializer.configProvider,
+        _customEventCollector = initializer.customEventCollector,
+        _logCollector = initializer.logCollector,
+        _exceptionCollector = initializer.exceptionCollector,
+        _httpCollector = initializer.httpCollector,
+        _navigationCollector = initializer.navigationCollector,
+        _bugReportCollector = initializer.bugReportCollector,
+        _gestureCollector = initializer.gestureCollector,
+        _screenshotCollector = initializer.screenshotCollector,
+        _timeProvider = initializer.timeProvider,
+        _tracer = initializer.tracer,
+        _idProvider = initializer.idProvider,
+        _shakeDetector = initializer.shakeDetector,
+        _configLoader = initializer.configLoader,
+        _spanProcessor = initializer.spanProcessor,
+        _fileProcessingIsolate = initializer.fileProcessingIsolate;
+
+  Future<void> init() async {
+    if (configProvider.autoStart) {
+      await registerCollectors();
+    }
+    _configLoader.loadDynamicConfig().then((dynamicConfig) {
+      if (dynamicConfig != null) {
+        configProvider.setDynamicConfig(dynamicConfig);
+      }
+      _spanProcessor.onConfigLoaded();
+    });
+  }
+
+  Future<void> registerCollectors() async {
+    await _fileProcessingIsolate.init();
+    _exceptionCollector.register();
+    _customEventCollector.register();
+    _logCollector.register();
+    _httpCollector.register();
+    _navigationCollector.register();
+    _bugReportCollector.register();
+    _shakeDetector.register();
+    _gestureCollector.register();
+  }
+
+  Future<void> unregisterCollectors() async {
+    _exceptionCollector.unregister();
+    _customEventCollector.unregister();
+    _logCollector.unregister();
+    _httpCollector.unregister();
+    _navigationCollector.unregister();
+    _bugReportCollector.unregister();
+    _shakeDetector.unregister();
+    _gestureCollector.unregister();
+    await initializer.fileProcessingIsolate.dispose();
+  }
+
+  void trackCustomEvent(String name, int? timestamp, Map<String, AttributeValue> attributes) {
+    _customEventCollector.trackCustomEvent(name, timestamp, attributes);
+  }
+
+  void log(String body, LogSeverity severity, Map<String, AttributeValue> attributes) {
+    _logCollector.trackLog(body, severity, attributes);
+  }
+
+  Future<void> trackError(
+    FlutterErrorDetails details, {
+    required ExceptionSeverity severity,
+    Map<String, AttributeValue> attributes = const {},
+  }) {
+    return _exceptionCollector.trackError(details, severity: severity, attributes: attributes);
+  }
+
+  void triggerNativeCrash() {
+    methodChannel.triggerNativeCrash();
+  }
+
+  void trackScreenViewEvent({
+    required String name,
+    required Map<String, AttributeValue> attributes,
+    bool userTriggered = true,
+    int? timestamp,
+    bool captureLayoutSnapshot = true,
+  }) {
+    _navigationCollector.trackScreenViewEvent(
+      name: name,
+      userTriggered: userTriggered,
+      attributes: attributes,
+      timestamp: timestamp,
+      captureLayoutSnapshot: captureLayoutSnapshot,
+    );
+  }
+
+  void trackHttpEvent({
+    required String url,
+    required HttpMethod method,
+    required int startTime,
+    required int endTime,
+    int? statusCode,
+    String? failureReason,
+    String? failureDescription,
+    Map<String, String>? requestHeaders,
+    Map<String, String>? responseHeaders,
+    String? requestBody,
+    String? responseBody,
+    String? client,
+  }) {
+    _httpCollector.trackHttpEvent(
+      url: url,
+      method: method,
+      statusCode: statusCode,
+      startTime: startTime,
+      endTime: endTime,
+      failureReason: failureReason,
+      failureDescription: failureDescription,
+      requestHeaders: requestHeaders,
+      responseHeaders: responseHeaders,
+      requestBody: requestBody,
+      responseBody: responseBody,
+      client: client,
+    );
+  }
+
+  Future<void> start() async {
+    await registerCollectors();
+    return methodChannel.start();
+  }
+
+  Future<void> stop() async {
+    await unregisterCollectors();
+    return methodChannel.stop();
+  }
+
+  SpanBuilder createSpanBuilder(String name) {
+    return _tracer.spanBuilder(name);
+  }
+
+  String getTraceParentHeaderKey() {
+    return _tracer.getTraceParentHeaderKey();
+  }
+
+  String getTraceParentHeaderValue(Span span) {
+    return _tracer.getTraceParentHeaderValue(span);
+  }
+
+  int getCurrentTime() {
+    return _timeProvider.now();
+  }
+
+  Future<void> setUserId(String userId) {
+    if (userId.length > ValidationLimits.userId) {
+      logger.log(
+        LogLevel.error,
+        "User ID exceeds maximum length of ${ValidationLimits.userId} characters and will be ignored",
+      );
+      return Future.value();
+    }
+    return methodChannel.setUserId(userId);
+  }
+
+  Future<void> clearUserId() {
+    return methodChannel.clearUserId();
+  }
+
+  Future<String?> getSessionId() {
+    return methodChannel.getSessionId();
+  }
+
+  Future<void> trackBugReport(
+      String description, List<MsrAttachment> attachments, Map<String, AttributeValue> attributes) async {
+    await _bugReportCollector.trackBugReport(description, attachments, attributes);
+  }
+
+  Future<MsrAttachment?> captureScreenshot() {
+    return _screenshotCollector.capture();
+  }
+
+  MsrAttachment? getAttachment(Uint8List bytes, AttachmentType type) {
+    final id = _idProvider.uuid();
+    return MsrAttachment.fromBytes(bytes: bytes, type: type, uuid: id);
+  }
+
+  Widget createBugReport({
+    Key? key,
+    required MsrAttachment? screenshot,
+    required BugReportTheme theme,
+    required Map<String, AttributeValue>? attributes,
+  }) {
+    return _bugReportCollector.createBugReport(key: key, screenshot: screenshot, theme: theme, attributes: attributes);
+  }
+
+  void setShakeListener(Function? onShake) {
+    _shakeDetector.setShakeListener(onShake);
+  }
+
+  Future<void> trackClick(
+    ClickData clickData,
+    SnapshotNode? snapshot, {
+    int? timestamp,
+  }) async {
+    _gestureCollector.trackGestureClick(
+      clickData,
+      snapshot: snapshot,
+      timestamp: timestamp,
+    );
+  }
+
+  Future<void> trackLongClick(
+    LongClickData longClickData,
+    SnapshotNode? snapshot, {
+    int? timestamp,
+  }) async {
+    _gestureCollector.trackGestureLongClick(
+      longClickData,
+      snapshot: snapshot,
+      timestamp: timestamp,
+    );
+  }
+
+  Future<void> trackScroll(ScrollData scrollData) async {
+    _gestureCollector.trackGestureScroll(scrollData);
+  }
+
+  Map<Type, String> getLayoutSnapshotWidgetFilter() {
+    return configProvider.widgetFilter;
+  }
+}

@@ -1,0 +1,394 @@
+package sh.measure.android
+
+import android.os.Build
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.never
+import org.mockito.Mockito.times
+import org.mockito.Mockito.`when`
+import org.mockito.kotlin.any
+import org.mockito.kotlin.anyOrNull
+import org.mockito.kotlin.argumentCaptor
+import org.mockito.kotlin.eq
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.whenever
+import org.robolectric.annotation.Config
+import sh.measure.android.attributes.Attribute
+import sh.measure.android.attributes.PatchAttributeProcessor
+import sh.measure.android.config.DynamicConfig
+import sh.measure.android.events.EventType
+import sh.measure.android.events.SignalProcessor
+import sh.measure.android.fakes.FakeSessionManager
+import sh.measure.android.utils.ManifestMetadata
+import sh.measure.android.utils.ValidationLimits
+
+@RunWith(AndroidJUnit4::class)
+// Below Android 11 the SIGQUIT collector is the ANR source, which is what
+// the crash tracking assertions below expect.
+@Config(sdk = [Build.VERSION_CODES.Q])
+class MeasureInternalTest {
+    private val sessionManager = mock<SessionManager>()
+    private val signalProcessor = mock<SignalProcessor>()
+    private val patchAttributeProcessor = PatchAttributeProcessor()
+
+    private fun mockMeasureInitializer(): MeasureInitializer {
+        val initializer = mock(MeasureInitializer::class.java)
+
+        // Stubbing all fields with mocks
+        `when`(initializer.logger).thenReturn(mock())
+        `when`(initializer.signalProcessor).thenReturn(signalProcessor)
+        `when`(initializer.httpEventCollector).thenReturn(mock())
+        `when`(initializer.httpUrlConnectionEventCollector).thenReturn(mock())
+        `when`(initializer.processInfoProvider).thenReturn(mock())
+        `when`(initializer.timeProvider).thenReturn(mock())
+        `when`(initializer.bugReportCollector).thenReturn(mock())
+        `when`(initializer.spanCollector).thenReturn(mock())
+        `when`(initializer.customEventCollector).thenReturn(mock())
+        `when`(initializer.logEventCollector).thenReturn(mock())
+        `when`(initializer.sessionManager).thenReturn(sessionManager)
+        `when`(initializer.userTriggeredEventCollector).thenReturn(mock())
+        `when`(initializer.resumedActivityProvider).thenReturn(mock())
+        `when`(initializer.unhandledExceptionCollector).thenReturn(mock())
+        `when`(initializer.anrCollector).thenReturn(mock())
+        `when`(initializer.cpuUsageCollector).thenReturn(mock())
+        `when`(initializer.memoryUsageCollector).thenReturn(mock())
+        `when`(initializer.componentCallbacksCollector).thenReturn(mock())
+        `when`(initializer.appLifecycleManager).thenReturn(mock())
+        `when`(initializer.activityLifecycleCollector).thenReturn(mock())
+        `when`(initializer.appLifecycleCollector).thenReturn(mock())
+        `when`(initializer.gestureCollector).thenReturn(mock())
+        `when`(initializer.appLaunchCollector).thenReturn(mock())
+        `when`(initializer.profileCollector).thenReturn(mock())
+        `when`(initializer.networkChangesCollector).thenReturn(mock())
+        `when`(initializer.appExitCollector).thenReturn(mock())
+        `when`(initializer.userAttributeProcessor).thenReturn(mock())
+        `when`(initializer.configProvider).thenReturn(mock())
+        `when`(initializer.dataCleanupService).thenReturn(mock())
+        `when`(initializer.powerStateProvider).thenReturn(mock())
+        `when`(initializer.periodicSignalStoreScheduler).thenReturn(mock())
+        `when`(initializer.executorServiceRegistry).thenReturn(mock())
+        `when`(initializer.shakeBugReportCollector).thenReturn(mock())
+        `when`(initializer.internalSignalCollector).thenReturn(mock())
+        `when`(initializer.configLoader).thenReturn(mock())
+        `when`(initializer.spanProcessor).thenReturn(mock())
+        `when`(initializer.exporter).thenReturn(mock())
+        `when`(initializer.patchAttributeProcessor).thenReturn(patchAttributeProcessor)
+
+        return initializer
+    }
+
+    @Test
+    fun `init sets up lifecycle listeners`() {
+        val initializer = initWithValidCredentials()
+
+        verify(initializer.appLifecycleManager).register()
+        verify(initializer.resumedActivityProvider).register()
+        verify(initializer.appLaunchCollector).register()
+    }
+
+    @Test
+    fun `init loads config and updates config provider`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        val dynamicConfig = DynamicConfig()
+        val callbackCaptor = argumentCaptor<(DynamicConfig?) -> Unit>()
+
+        measureInternal.init()
+
+        verify(initializer.configLoader).loadDynamicConfig(callbackCaptor.capture())
+        callbackCaptor.firstValue.invoke(dynamicConfig)
+
+        verify(initializer.configProvider).setDynamicConfig(dynamicConfig)
+    }
+
+    @Test
+    fun `init loads config updates various components`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val callbackCaptor = argumentCaptor<(DynamicConfig?) -> Unit>()
+        val measureInternal = MeasureInternal(initializer)
+
+        measureInternal.init()
+
+        verify(initializer.configLoader).loadDynamicConfig(callbackCaptor.capture())
+        callbackCaptor.firstValue.invoke(DynamicConfig())
+
+        verify(initializer.sessionManager).onConfigLoaded()
+        verify(initializer.spanProcessor).onConfigLoaded()
+        verify(initializer.appLaunchCollector).onConfigLoaded()
+        verify(initializer.exporter).export()
+
+        // TODO: the following assertions require robolectric
+        // verify(initializer.cpuUsageCollector).onConfigLoaded()
+        // verify(initializer.memoryUsageCollector).onConfigLoaded()
+        // verify(initializer.appExitCollector).collect()
+    }
+
+    @Test
+    fun `onAppBackground unregisters CPU usage and reschedules Memory usage collection`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        measureInternal.start()
+
+        measureInternal.onAppBackground()
+
+        verify(initializer.cpuUsageCollector).unregister()
+        verify(initializer.memoryUsageCollector).onAppBackground()
+        verify(initializer.memoryUsageCollector, never()).unregister()
+    }
+
+    @Test
+    fun `onAppBackground triggers signal store scheduler`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        measureInternal.start()
+
+        measureInternal.onAppBackground()
+
+        verify(initializer.periodicSignalStoreScheduler).onAppBackground()
+    }
+
+    @Test
+    fun `onAppBackground triggers data cleanup`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        measureInternal.start()
+
+        measureInternal.onAppBackground()
+
+        verify(initializer.dataCleanupService).cleanup()
+    }
+
+    @Test
+    fun `onAppBackground triggers export`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        measureInternal.start()
+
+        measureInternal.onAppBackground()
+
+        verify(initializer.exporter).export()
+    }
+
+    @Test
+    fun `onAppForeground triggers flush`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        measureInternal.start()
+
+        measureInternal.onAppForeground()
+
+        verify(initializer.exporter).flush()
+    }
+
+    @Test
+    fun `init with auto-start disabled does not register collectors`() {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        `when`(initializer.configProvider.autoStart).thenReturn(false)
+
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+
+        verify(initializer.userTriggeredEventCollector, never()).register()
+        verify(initializer.activityLifecycleCollector, never()).register()
+        verify(initializer.appLifecycleCollector, never()).register()
+        verify(initializer.cpuUsageCollector, never()).register()
+        verify(initializer.memoryUsageCollector, never()).register()
+        verify(initializer.componentCallbacksCollector, never()).register()
+        verify(initializer.gestureCollector, never()).register()
+        verify(initializer.networkChangesCollector, never()).register()
+        verify(initializer.httpEventCollector, never()).register()
+        verify(initializer.powerStateProvider, never()).register()
+        verify(initializer.spanCollector, never()).register()
+        verify(initializer.customEventCollector, never()).register()
+        verify(initializer.periodicSignalStoreScheduler, never()).register()
+
+        // These should still be registered as they're called before the autoStart check
+        verify(initializer.appLifecycleManager).register()
+        verify(initializer.resumedActivityProvider).register()
+        verify(initializer.appLaunchCollector).register()
+
+        // Crash tracking should not be enabled when autoStart is false
+        verify(initializer.unhandledExceptionCollector, never()).register()
+        verify(initializer.anrCollector, never()).register()
+    }
+
+    @Test
+    fun `start registers all collectors`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+
+        measureInternal.start()
+
+        verify(initializer.userTriggeredEventCollector).register()
+        verify(initializer.activityLifecycleCollector).register()
+        verify(initializer.appLifecycleCollector).register()
+        verify(initializer.cpuUsageCollector).register()
+        verify(initializer.memoryUsageCollector).register()
+        verify(initializer.componentCallbacksCollector).register()
+        verify(initializer.gestureCollector).register()
+        verify(initializer.networkChangesCollector).register()
+        verify(initializer.httpEventCollector).register()
+        verify(initializer.powerStateProvider).register()
+        verify(initializer.spanCollector).register()
+        verify(initializer.customEventCollector).register()
+        verify(initializer.logEventCollector).register()
+        verify(initializer.periodicSignalStoreScheduler).register()
+    }
+
+    @Test
+    fun `start enables crash tracking`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+
+        measureInternal.start()
+
+        verify(initializer.unhandledExceptionCollector).register()
+        verify(initializer.anrCollector).register()
+    }
+
+    @Test
+    fun `start is idempotent`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+
+        measureInternal.start()
+        measureInternal.start()
+
+        verify(initializer.gestureCollector, times(1)).register()
+        verify(initializer.unhandledExceptionCollector, times(1)).register()
+    }
+
+    @Test
+    fun `stop unregisters all collectors`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.start()
+
+        measureInternal.stop()
+
+        verify(initializer.userTriggeredEventCollector).unregister()
+        verify(initializer.activityLifecycleCollector).unregister()
+        verify(initializer.appLifecycleCollector).unregister()
+        verify(initializer.cpuUsageCollector).unregister()
+        verify(initializer.memoryUsageCollector).unregister()
+        verify(initializer.componentCallbacksCollector).unregister()
+        verify(initializer.gestureCollector).unregister()
+        verify(initializer.networkChangesCollector).unregister()
+        verify(initializer.httpEventCollector).unregister()
+        verify(initializer.powerStateProvider).unregister()
+        verify(initializer.spanCollector).unregister()
+        verify(initializer.customEventCollector).unregister()
+        verify(initializer.logEventCollector).unregister()
+        verify(initializer.periodicSignalStoreScheduler).unregister()
+    }
+
+    @Test
+    fun `stop disables crash tracking`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.start()
+
+        measureInternal.stop()
+
+        verify(initializer.unhandledExceptionCollector).unregister()
+        verify(initializer.anrCollector).unregister()
+    }
+
+    @Test
+    fun `stop is idempotent`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.start()
+
+        measureInternal.stop()
+        measureInternal.stop()
+
+        verify(initializer.gestureCollector, times(1)).unregister()
+        verify(initializer.unhandledExceptionCollector, times(1)).unregister()
+    }
+
+    @Test
+    fun `stop before start does nothing`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+
+        measureInternal.stop()
+
+        verify(initializer.gestureCollector, never()).unregister()
+        verify(initializer.unhandledExceptionCollector, never()).unregister()
+    }
+
+    @Test
+    fun `session start callback triggers a session start event`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.onSessionStart("session-id", 123456789L)
+
+        verify(signalProcessor).track(
+            data = eq(SessionStartData),
+            timestamp = eq(123456789L),
+            type = eq(EventType.SESSION_START),
+            attributes = any(),
+            userDefinedAttributes = any(),
+            attachments = any(),
+            threadName = anyOrNull(),
+            sessionId = eq("session-id"),
+            userTriggered = any(),
+            isSampled = eq(true),
+        )
+    }
+
+    @Test
+    fun `session start callback triggers export for existing batches`() {
+        val initializer = mockMeasureInitializer()
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.onSessionStart("session-id", 123456789L)
+        verify(initializer.exporter).flush()
+    }
+
+    private fun initWithValidCredentials(): MeasureInitializer {
+        val initializer = mockMeasureInitializer()
+        val manifest = ManifestMetadata("https://api.measure.sh", "msrsh_123")
+        whenever(initializer.manifest).thenReturn(manifest)
+        val measureInternal = MeasureInternal(initializer)
+        measureInternal.init()
+        return initializer
+    }
+
+    @Test
+    fun `internalSetPatch ignores patch id that is not a uuid`() {
+        val measureInternal = MeasureInternal(mockMeasureInitializer())
+
+        measureInternal.internalSetPatch("not-a-uuid", "1.0.0")
+
+        val attributes = mutableMapOf<String, Any?>()
+        patchAttributeProcessor.appendAttributes(attributes)
+        assertNull(attributes[Attribute.PATCH_ID_KEY])
+        assertNull(attributes[Attribute.PATCH_VERSION_KEY])
+    }
+}

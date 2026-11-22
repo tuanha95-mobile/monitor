@@ -1,0 +1,248 @@
+name: Frank App
+
+on:
+  pull_request:
+    paths:
+      - 'samples/frank/**'
+      - 'android/**'
+      - 'ios/**'
+      - 'flutter/**'
+      - 'react-native/**'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'samples/frank/**'
+      - 'android/**'
+      - 'ios/**'
+      - 'flutter/**'
+      - 'react-native/**'
+
+env:
+  JAVA_VERSION: '21'
+  FLUTTER_VERSION: '3.44.7'
+  YARN_VERSION: '3.6.1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frank-android:
+    name: Frank Android
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: samples/frank
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-*
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - uses: subosito/flutter-action@f2c4f6686ca8e8d6e6d0f28410eeef506ed66aff
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          check-latest: true
+      - name: Setup Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@${{ env.YARN_VERSION }} --activate
+      - name: Get Yarn cache directory
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ hashFiles('react-native/yarn.lock', 'samples/frank/react_native/yarn.lock') }}
+          restore-keys: yarn-
+      - name: Install React Native dependencies
+        run: yarn install
+        working-directory: samples/frank/react_native
+      - name: Generate Flutter module files
+        run: flutter pub get
+        working-directory: samples/frank/flutter
+      - name: Override google-services.json with real Firebase config
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.FRANK_APP_GOOGLE_SERVICES_JSON }}
+        if: ${{ env.GOOGLE_SERVICES_JSON != '' }}
+        run: echo "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+      - name: Setup Measure config
+        run: |
+          echo '${{ secrets.FRANK_APP_ENV }}' > .env
+          ./setup-secrets.sh
+      - name: Extract Firebase App IDs from google-services.json
+        run: |
+          echo "FIREBASE_ANDROID_APP_ID_DEBUG=$(jq -r '.client[] | select(.client_info.android_client_info.package_name == "sh.frankenstein.android.debug") | .client_info.mobilesdk_app_id' android/app/google-services.json)" >> $GITHUB_ENV
+          echo "FIREBASE_ANDROID_APP_ID_RELEASE=$(jq -r '.client[] | select(.client_info.android_client_info.package_name == "sh.frankenstein.android") | .client_info.mobilesdk_app_id' android/app/google-services.json)" >> $GITHUB_ENV
+      - name: Install Android CMake
+        run: |
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n1)"
+          yes | "$sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$sdkmanager" "cmake;3.22.1"
+      - name: Assemble debug
+        run: ./gradlew :android:app:assembleDebug --parallel --stacktrace
+      - name: Assemble release
+        if: github.ref == 'refs/heads/main'
+        run: ./gradlew :android:app:assembleRelease --parallel --stacktrace
+      - name: Publish debug APK to Firebase App Distribution
+        if: github.ref == 'refs/heads/main'
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ env.FIREBASE_ANDROID_APP_ID_DEBUG }}
+          serviceCredentialsFileContent: ${{ secrets.FRANK_APP_FIREBASE_SERVICE_ACCOUNT }}
+          file: samples/frank/android/app/build/outputs/apk/debug/app-debug.apk
+          groups: measure-devs
+      - name: Publish release APK to Firebase App Distribution
+        if: github.ref == 'refs/heads/main'
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ env.FIREBASE_ANDROID_APP_ID_RELEASE }}
+          serviceCredentialsFileContent: ${{ secrets.FRANK_APP_FIREBASE_SERVICE_ACCOUNT }}
+          file: samples/frank/android/app/build/outputs/apk/release/app-release.apk
+          groups: measure-devs
+
+  frank-ios:
+    name: Frank iOS
+    runs-on: macos-26
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Switch to Xcode 26.4
+        run: sudo xcode-select -switch /Applications/Xcode_26.4.app
+      - uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'gradle'
+      - uses: subosito/flutter-action@f2c4f6686ca8e8d6e6d0f28410eeef506ed66aff
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          check-latest: true
+      - name: Setup Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@${{ env.YARN_VERSION }} --activate
+      - name: Get Yarn cache directory
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: yarn-${{ hashFiles('react-native/yarn.lock', 'samples/frank/react_native/yarn.lock') }}
+          restore-keys: yarn-
+      - name: Install React Native dependencies
+        run: yarn install
+        working-directory: samples/frank/react_native
+      - name: Generate Flutter module files
+        run: flutter pub get
+        working-directory: samples/frank/flutter
+      - name: Build Flutter Swift package
+        run: |
+          rm -f .ios/Podfile
+          flutter build swift-package --platform ios --no-codesign
+        working-directory: samples/frank/flutter
+      - name: Override GoogleService-Info.plist with real Firebase config
+        env:
+          GOOGLE_SERVICE_INFO_PLIST_RELEASE: ${{ secrets.FRANK_APP_GOOGLE_SERVICE_INFO_PLIST_RELEASE }}
+        if: ${{ env.GOOGLE_SERVICE_INFO_PLIST_RELEASE != '' }}
+        run: echo "$GOOGLE_SERVICE_INFO_PLIST_RELEASE" > samples/frank/ios/FrankensteinApp/Firebase/Release/GoogleService-Info.plist
+      - name: Setup Measure config
+        run: |
+          echo '${{ secrets.FRANK_APP_ENV }}' > samples/frank/.env
+          cd samples/frank && ./setup-secrets.sh
+      - name: Restore Measure xcframework cache
+        id: xcframework-cache
+        uses: actions/cache@v6
+        with:
+          path: kmp/measure-kmp/build/xcframework/Measure.xcframework
+          key: xcframework-${{ hashFiles('ios/Sources/**', 'ios/MeasureSDK.xcodeproj/**', 'ios/Measure.xcworkspace/**', 'ios/Package.resolved') }}
+      - name: Build Measure xcframework
+        if: steps.xcframework-cache.outputs.cache-hit != 'true'
+        run: bash kmp/measure-kmp/Scripts/build-xcframework.sh
+      - name: Cache CocoaPods
+        uses: actions/cache@v6
+        with:
+          path: samples/frank/ios/Pods
+          key: pods-${{ hashFiles('samples/frank/ios/Podfile.lock', 'samples/frank/ios/Podfile') }}
+          restore-keys: |
+            pods-
+      - name: Install CocoaPods dependencies
+        run: pod install
+        working-directory: samples/frank/ios
+      - name: Setup App Store Connect API key
+        if: github.ref == 'refs/heads/main'
+        run: |
+          API_KEY_DIR="$RUNNER_TEMP/private_keys"
+          mkdir -p "$API_KEY_DIR"
+          API_KEY_PATH="$API_KEY_DIR/AuthKey_${{ secrets.FRANK_APP_ASC_API_KEY_ID }}.p8"
+          printf '%s' "${{ secrets.FRANK_APP_ASC_API_PRIVATE_KEY }}" > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          echo "ASC_API_KEY_PATH=$API_KEY_PATH" >> $GITHUB_ENV
+      - name: Generate version xcconfig
+        run: |
+          VERSION_NAME=$(grep '^VERSION_NAME=' samples/frank/version.properties | cut -d= -f2)
+          VERSION_CODE=$(git rev-list --count HEAD)
+          printf '// Auto-generated — do not edit\nMARKETING_VERSION = %s\nCURRENT_PROJECT_VERSION = %s\n' \
+            "$VERSION_NAME" "$VERSION_CODE" \
+            > samples/frank/ios/Generated.xcconfig
+      - name: Build release
+        if: github.ref != 'refs/heads/main'
+        run: |
+          xcodebuild build \
+            -workspace samples/frank/ios/FrankensteinApp.xcworkspace \
+            -scheme FrankensteinApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -parallelizeTargets \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Setup Ruby
+        if: github.ref == 'refs/heads/main'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: samples/frank/ios
+      - name: Build and upload to TestFlight
+        if: github.ref == 'refs/heads/main'
+        working-directory: samples/frank/ios
+        run: bundle exec fastlane beta
+        env:
+          ASC_API_KEY_PATH: ${{ env.ASC_API_KEY_PATH }}
+          ASC_API_KEY_ID: ${{ secrets.FRANK_APP_ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.FRANK_APP_ASC_API_ISSUER_ID }}
+          MATCH_PASSWORD: ${{ secrets.FRANK_APP_MATCH_PASSWORD }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.FRANK_APP_MATCH_GIT_BASIC_AUTHORIZATION }}
+          FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: 180
+          FASTLANE_XCODEBUILD_SETTINGS_RETRIES: 1

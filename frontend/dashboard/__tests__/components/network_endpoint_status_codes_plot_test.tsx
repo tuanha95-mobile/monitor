@@ -1,0 +1,48 @@
+import NetworkEndpointStatusCodesPlot from "@/app/components/network_endpoint_status_codes_plot";
+import "@testing-library/jest-dom";
+import { render, screen } from "@testing-library/react";
+
+let chartProps: any;
+
+jest.mock("@nivo/line", () => ({
+  ResponsiveLineCanvas: (props: any) => {
+    chartProps = props;
+    return <div data-testid="status-codes-chart" />;
+  },
+}));
+
+jest.mock("next-themes", () => ({ useTheme: () => ({ theme: "light" }) }));
+
+describe("NetworkEndpointStatusCodesPlot", () => {
+  beforeEach(() => {
+    chartProps = undefined;
+  });
+
+  it("maps exact status-code counts into canvas series", () => {
+    render(
+      <NetworkEndpointStatusCodesPlot
+        statusCodes={[200, 404]}
+        data={[
+          {
+            datetime: "2024-01-01",
+            total_count: 10,
+            count_200: 8,
+            count_404: 2,
+          },
+          {
+            datetime: "2024-01-02",
+            total_count: 5,
+            count_200: 5,
+          },
+        ]}
+        plotTimeGroup={"days" as any}
+      />,
+    );
+
+    expect(screen.getByTestId("status-codes-chart")).toBeInTheDocument();
+    expect(chartProps.data).toMatchObject([
+      { id: "200", data: [{ y: 8 }, { y: 5 }] },
+      { id: "404", data: [{ y: 2 }, { y: 0 }] },
+    ]);
+  });
+});

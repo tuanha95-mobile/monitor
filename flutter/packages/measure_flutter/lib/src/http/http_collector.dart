@@ -1,0 +1,123 @@
+import 'package:measure_flutter/measure_flutter.dart';
+import 'package:measure_flutter/src/config/config_provider.dart';
+import 'package:measure_flutter/src/logger/log_level.dart';
+import 'package:measure_flutter/src/logger/logger.dart';
+import 'package:measure_flutter/src/utils/validation_limits.dart';
+
+import '../events/event_type.dart';
+import '../method_channel/signal_processor.dart';
+import 'http_data.dart';
+
+class HttpCollector {
+  final Logger logger;
+  final SignalProcessor signalProcessor;
+  final ConfigProvider configProvider;
+  bool _enabled = false;
+
+  HttpCollector({
+    required this.logger,
+    required this.signalProcessor,
+    required this.configProvider,
+  });
+
+  void register() {
+    _enabled = true;
+  }
+
+  void unregister() {
+    _enabled = false;
+  }
+
+  void trackHttpEvent({
+    required String url,
+    required HttpMethod method,
+    required int startTime,
+    int? statusCode,
+    int? endTime,
+    String? failureReason,
+    String? failureDescription,
+    Map<String, String>? requestHeaders,
+    Map<String, String>? responseHeaders,
+    String? requestBody,
+    String? responseBody,
+    String? client,
+  }) {
+    if (!_enabled) {
+      return;
+    }
+
+    if (!configProvider.shouldTrackHttpEvent(url)) {
+      return;
+    }
+
+    if (client != null && client.length > ValidationLimits.httpClient) {
+      logger.log(
+        LogLevel.error,
+        "Invalid HTTP event: client exceeds maximum length of ${ValidationLimits.httpClient} characters",
+      );
+      return;
+    }
+
+    Map<String, String>? filteredRequestHeaders;
+    if (requestHeaders != null) {
+      filteredRequestHeaders = Map.from(requestHeaders)
+        ..removeWhere(
+              (key, value) => !configProvider.shouldTrackHttpHeader(key),
+        );
+    }
+
+    Map<String, String>? filteredResponseHeaders;
+    if (responseHeaders != null) {
+      filteredResponseHeaders = Map.from(responseHeaders)
+        ..removeWhere(
+              (key, value) => !configProvider.shouldTrackHttpHeader(key),
+        );
+    }
+
+    if (!configProvider.shouldTrackHttpRequestBody(url) ||
+        !_isJsonContentType(requestHeaders)) {
+      requestBody = null;
+    }
+
+    if (!configProvider.shouldTrackHttpResponseBody(url) ||
+        !_isJsonContentType(responseHeaders)) {
+      responseBody = null;
+    }
+
+    final data = HttpData(
+      url: url,
+      method: method.name,
+      statusCode: statusCode,
+      startTime: startTime,
+      endTime: endTime,
+      failureReason: failureReason,
+      failureDescription: failureDescription,
+      requestHeaders: filteredRequestHeaders,
+      responseHeaders: filteredResponseHeaders,
+      requestBody: requestBody,
+      responseBody: responseBody,
+      client: client ?? 'unknown',
+    );
+    signalProcessor.trackEvent(
+      data: data,
+      type: EventType.http,
+      timestamp: startTime,
+      userDefinedAttrs: {},
+      userTriggered: false,
+    );
+  }
+
+  // Only collect JSON bodies. Non-JSON bodies (images, protobuf, gzip, etc.)
+  // are binary and render as garbled text in the timeline.
+  bool _isJsonContentType(Map<String, String>? headers) {
+    if (headers == null) {
+      return false;
+    }
+    for (final entry in headers.entries) {
+      if (entry.key.toLowerCase() == 'content-type') {
+        return entry.value.toLowerCase().startsWith('application/json');
+      }
+    }
+    return false;
+  }
+}

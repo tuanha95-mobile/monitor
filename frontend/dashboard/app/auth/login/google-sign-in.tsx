@@ -1,0 +1,61 @@
+"use client";
+
+import { encodeOAuthState } from "@/app/auth/oauth";
+import { Button } from "@/app/components/button";
+import { navigateTo } from "@/app/utils/navigation";
+import Image from "next/image";
+
+const googleClientID = process.env.NEXT_PUBLIC_OAUTH_GOOGLE_KEY;
+
+export default function GoogleSignIn({
+  mcpAuthorizeUrl,
+}: {
+  mcpAuthorizeUrl?: string;
+}) {
+  const doGoogleLogin = async () => {
+    const { origin } = new URL(window.location.href);
+    const state = encodeOAuthState("");
+
+    await fetch("/api/auth/google", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "init", state }),
+    });
+
+    const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    url.searchParams.set("client_id", googleClientID || "");
+    url.searchParams.set("redirect_uri", `${origin}/auth/callback/google`);
+    url.searchParams.set("state", state);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "openid email profile");
+    url.searchParams.set("access_type", "offline");
+    url.searchParams.set("prompt", "consent");
+    navigateTo(url.toString());
+  };
+
+  const handleClick = () => {
+    if (mcpAuthorizeUrl) {
+      navigateTo(mcpAuthorizeUrl);
+      return;
+    }
+    doGoogleLogin();
+  };
+
+  return (
+    <Button
+      variant="outline"
+      size={"lg"}
+      className="justify-center w-full font-display border-2 border-border"
+      onClick={handleClick}
+    >
+      <Image
+        src="/images/google_logo.svg"
+        width={24}
+        height={24}
+        className="w-4 h-4"
+        alt={"Google logo"}
+      />
+      <span> Sign in with Google</span>
+    </Button>
+  );
+}

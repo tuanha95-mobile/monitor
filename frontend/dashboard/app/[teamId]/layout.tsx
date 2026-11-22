@@ -1,0 +1,409 @@
+"use client";
+
+import AppBreadcrumbs from "@/app/components/app_breadcrumbs";
+import { Separator } from "@/app/components/separator";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/app/components/sidebar";
+import { signOut, useTeamsQuery } from "@/app/query/hooks";
+import { notFound, usePathname, useRouter } from "next/navigation";
+import posthog from "posthog-js";
+import React, { useEffect, useMemo, useState } from "react";
+import { Team } from "../api/api_calls";
+import { apiClient } from "../api/api_client";
+import SandboxBanner from "../components/sandbox_banner";
+import { Skeleton } from "../components/skeleton";
+import TeamSwitcher, { TeamsSwitcherStatus } from "../components/team_switcher";
+import { ThemeToggle } from "../components/theme_toggle";
+import UsageThresholdBanner from "../components/usage_threshold_banner";
+import UserAvatar from "../components/user_avatar";
+import { useMeasureStoreRegistry } from "../stores/provider";
+import { isCloud } from "../utils/env_utils";
+import { isSandboxTeamId } from "../utils/sandbox";
+
+type NavItem = {
+  title: string;
+  url: string;
+  // Query string appended when navigating, so a page opens with a default
+  // view. Not part of the pathname-based active match.
+  queryString?: string;
+  isActive: boolean;
+  external: boolean;
+};
+
+type NavSection = {
+  title: string;
+  items: NavItem[];
+};
+
+function buildInitNavData(): { navMain: NavSection[] } {
+  return {
+    navMain: [
+      {
+        title: "Dashboard",
+        items: [
+          {
+            title: "Overview",
+            url: "overview",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Session Replays",
+            url: "session_replays",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Journeys",
+            url: "journeys",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Funnels",
+            url: "funnels",
+            isActive: false,
+            external: false,
+          },
+        ],
+      },
+      {
+        title: "Issues",
+        items: [
+          {
+            title: "Errors",
+            url: "errors",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Bug Reports",
+            url: "bug_reports",
+            queryString: "?filter_expr=bug_report_status:in:open",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Alerts",
+            url: "alerts",
+            isActive: false,
+            external: false,
+          },
+        ],
+      },
+      {
+        title: "Performance",
+        items: [
+          {
+            title: "Traces",
+            url: "traces",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Network",
+            url: "network",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Memory",
+            url: "memory",
+            queryString: "?filter_expr=app_state:eq:foreground",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Profiles",
+            url: "profiles",
+            isActive: false,
+            external: false,
+          },
+        ],
+      },
+      {
+        title: "Settings",
+        items: [
+          {
+            title: "Apps",
+            url: "apps",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Builds",
+            url: "builds",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Team",
+            url: "team",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Notifications",
+            url: "notif_prefs",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: isCloud() ? "Usage & Billing" : "Usage",
+            url: "usage",
+            isActive: false,
+            external: false,
+          },
+          {
+            title: "Support",
+            url: "https://discord.gg/f6zGkBCt42",
+            isActive: false,
+            external: true,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+export default function DashboardLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const registry = useMeasureStoreRegistry();
+  const { data: teams, status: teamsStatus } = useTeamsQuery();
+  const [navData, setNavData] = useState(buildInitNavData);
+
+  const pathName = usePathname();
+  const router = useRouter();
+
+  const teamId = pathName.split("/")[1];
+
+  const selectedTeam = useMemo(() => {
+    if (!teams) {
+      return null;
+    }
+    return teams.find((e) => e.id === teamId) ?? null;
+  }, [teams, teamId]);
+
+  // When teams have loaded and none matches the URL teamId, the id is either
+  // malformed or names a team this user isn't a member of. Render the 404
+  // page from the layout so every route under [teamId] is covered in one
+  // place.
+  if (teamsStatus === "success" && !selectedTeam) {
+    notFound();
+  }
+
+  useEffect(() => {
+    apiClient.init(router);
+  }, []);
+
+  // Group subsequent events by team so PostHog can attribute engagement to
+  // a team, not just an individual user.
+  useEffect(() => {
+    if (isSandboxTeamId(teamId) || !selectedTeam) {
+      return;
+    }
+    posthog.group("team", selectedTeam.id, { name: selectedTeam.name });
+  }, [teamId, selectedTeam?.id, selectedTeam?.name]);
+
+  // Mark the active nav item from the current path. prevPathName starts null so
+  // this runs on first render too (buildInitNavData starts every item inactive).
+  const [prevPathName, setPrevPathName] = useState<string | null>(null);
+  if (pathName !== prevPathName) {
+    setPrevPathName(pathName);
+    setNavData((current) => ({
+      ...current,
+      navMain: current.navMain.map((section) => ({
+        ...section,
+        items: section.items.map((item) => ({
+          ...item,
+          isActive: pathName.includes(item.url),
+        })),
+      })),
+    }));
+  }
+
+  const logoutUser = async () => {
+    await signOut();
+  };
+
+  const onTeamChanged = (item: Team) => {
+    // Reset the filters store before navigating so the new page doesn't
+    // mount with stale filters.ready=true from the previous team. Without
+    // this, Zustand's useSyncExternalStore triggers re-renders during the
+    // React transition, aborting the in-flight RSC fetch and crashing.
+    registry.filtersStore.getState().reset();
+    const newPath = `/${item.id}/overview`;
+    router.push(newPath);
+  };
+
+  const teamsStatusToTeamsSwitcherStatus: Record<string, TeamsSwitcherStatus> =
+    {
+      pending: TeamsSwitcherStatus.Loading,
+      success: TeamsSwitcherStatus.Success,
+      error: TeamsSwitcherStatus.Error,
+    };
+
+  const handleNavClick = (url: string) => {
+    const updatedNavData = { ...navData };
+    updatedNavData.navMain.forEach((section) => {
+      section.items.forEach((item) => {
+        item.isActive = item.url === url;
+      });
+    });
+    setNavData(updatedNavData);
+  };
+
+  return (
+    <SidebarProvider>
+      <Sidebar variant="sidebar" className="select-none">
+        <SidebarHeader className="p-4 pb-2">
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <TeamSwitcher
+                items={teams ?? null}
+                initialItemIndex={teams?.findIndex(
+                  (e) => e.id === selectedTeam?.id,
+                )}
+                teamsSwitcherStatus={
+                  teamsStatusToTeamsSwitcherStatus[teamsStatus]
+                }
+                onChangeSelectedItem={(item) => onTeamChanged(item)}
+              />
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarHeader>
+        <SidebarContent>
+          <SidebarGroup className="p-4">
+            <SidebarMenu className="gap-0.5">
+              {teamsStatus === "pending" &&
+                navData.navMain.map((section) => (
+                  <SidebarMenuItem
+                    key={section.title}
+                    className="mt-6 first:mt-0"
+                  >
+                    <Skeleton className="h-5 w-24 mx-2 mb-1" />
+                    <SidebarMenuSub className="mx-0 border-l-0 px-0 py-0 gap-0.5">
+                      {section.items.map((item) => (
+                        <SidebarMenuSubItem key={item.title}>
+                          <div className="flex h-9 items-center p-2">
+                            <Skeleton className="h-5 w-full" />
+                          </div>
+                        </SidebarMenuSubItem>
+                      ))}
+                    </SidebarMenuSub>
+                  </SidebarMenuItem>
+                ))}
+              {teamsStatus === "error" && (
+                <span className="ml-2 text-xs font-body">
+                  Error fetching teams. Please refresh page to try again.
+                </span>
+              )}
+              {teamsStatus === "success" &&
+                navData.navMain.map((item) => (
+                  <SidebarMenuItem key={item.title} className="mt-6 first:mt-0">
+                    <p className="px-2 mb-1 text-sm font-display">
+                      {item.title}
+                    </p>
+                    {item.items?.length ? (
+                      <SidebarMenuSub className="mx-0 border-l-0 px-0 py-0 gap-0.5">
+                        {item.items.map((item) => (
+                          <SidebarMenuSubItem key={item.title}>
+                            <SidebarMenuSubButton
+                              asChild
+                              isActive={item.isActive}
+                              className="h-auto font-body rounded-lg p-2 text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+                            >
+                              <a
+                                href={
+                                  item.external
+                                    ? `${item.url}`
+                                    : `/${selectedTeam?.id}/${item.url}${item.queryString ?? ""}`
+                                }
+                                onClick={(e) => {
+                                  if (!item.external) {
+                                    e.preventDefault();
+                                    handleNavClick(item.url);
+                                    router.push(
+                                      `/${selectedTeam?.id}/${item.url}${item.queryString ?? ""}`,
+                                    );
+                                  }
+                                }}
+                              >
+                                {item.title}
+                              </a>
+                            </SidebarMenuSubButton>
+                          </SidebarMenuSubItem>
+                        ))}
+                      </SidebarMenuSub>
+                    ) : null}
+                  </SidebarMenuItem>
+                ))}
+            </SidebarMenu>
+          </SidebarGroup>
+        </SidebarContent>
+        <SidebarFooter className="p-4 pt-2">
+          <SidebarMenu>
+            <SidebarMenuItem>
+              {teamsStatus === "pending" ? (
+                <div className="flex flex-row items-center w-full p-1 gap-2">
+                  <Skeleton className="w-12 h-12 rounded-full shrink-0" />
+                  <div className="flex flex-col gap-1 flex-1">
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="h-3 w-32" />
+                  </div>
+                </div>
+              ) : (
+                <UserAvatar
+                  onLogoutClick={
+                    isSandboxTeamId(teamId) ? undefined : () => logoutUser()
+                  }
+                />
+              )}
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarFooter>
+      </Sidebar>
+      <SidebarInset>
+        <div className="sticky top-0 z-30 bg-background">
+          <header className="flex h-16 shrink-0 items-center gap-2 px-4">
+            <SidebarTrigger className="-ml-1" />
+            <Separator
+              orientation="vertical"
+              className="data-[orientation=vertical]:h-4"
+            />
+            <AppBreadcrumbs />
+            <div className="ml-auto">
+              <ThemeToggle />
+            </div>
+          </header>
+
+          {isSandboxTeamId(teamId) ? (
+            <SandboxBanner />
+          ) : (
+            selectedTeam && <UsageThresholdBanner teamId={selectedTeam.id} />
+          )}
+        </div>
+
+        <main className="flex justify-center">
+          <div className="w-full max-w-275 px-4 pb-24">{children}</div>
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
+  );
+}

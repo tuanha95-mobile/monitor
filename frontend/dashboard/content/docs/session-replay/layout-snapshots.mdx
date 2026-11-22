@@ -1,0 +1,126 @@
+---
+title: "Layout snapshots"
+seoTitle: "Layout Snapshots for Mobile Session Replay"
+description: "Capture a lightweight wireframe of the screen as the user moves through the app to see the UI behind each event."
+---
+
+Measure captures a layout snapshot as the user moves through the app: a wireframe of the screen at that moment. A snapshot shows what the user was acting on at a fraction of the cost of capturing, storing, and rendering a screenshot.
+
+| Screenshot                                                  | Layout snapshot                                       |
+|-------------------------------------------------------------|-------------------------------------------------------|
+| ![Screenshot](/docs/assets/layout-snapshot-screenshot.webp) | ![Layout snapshot](/docs/assets/layout-snapshot.webp) |
+
+<Callout type="info">
+
+Snapshots are throttled to at most one every 750 ms, so bursts of taps don't add overhead.
+
+</Callout>
+
+## Android
+
+Snapshots are collected with Views, Jetpack Compose, or a mix of both. A snapshot is captured at each of these moments:
+
+- A click, with the tapped element marked.
+- An activity resuming.
+- A screen view, whether tracked automatically or with `Measure.trackScreenView`.
+- The app going to the background.
+
+Layout snapshots with clicks are throttled to one snapshot every 750 ms, and the other three moments share a separate 750 ms limit.
+
+## iOS
+
+Snapshots capture the full view hierarchy of the screen with no setup. SwiftUI content appears with its underlying system view names rather than your SwiftUI view names.
+
+## Flutter
+
+A snapshot is captured at each of these moments:
+
+- A click or long press, with the target widget marked.
+- A screen view, whether tracked by `MsrNavigatorObserver` or with `Measure.instance.trackScreenViewEvent`.
+
+Clicks and screen views are throttled separately, each to one snapshot every 750 ms.
+
+A screen can hold thousands of widgets, so snapshots include only common widget types by default and skip the rest:
+
+| Category        | Widgets                                                                                                                              |
+|-----------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| Buttons         | `FilledButton`, `OutlinedButton`, `TextButton`, `ElevatedButton`, `CupertinoButton`, `ButtonStyleButton`, `MaterialButton`, `IconButton`, `FloatingActionButton` |
+| Menus and lists | `ListTile`, `PopupMenuButton`, `PopupMenuItem`, `DropdownButton`, `DropdownMenuItem`, `ExpansionTile`                                  |
+| Structure       | `Scaffold`, `CupertinoPageScaffold`, `MaterialApp`, `CupertinoApp`, `Container`, `Row`, `Column`, `Card`                               |
+| Scrolling       | `ListView`, `PageView`, `SingleChildScrollView`, `ScrollView`                                                                          |
+| Text            | `Text`, `RichText`                                                                                                                     |
+
+### Include your own widgets
+
+If your app is built from custom widgets, the default list won't say much about your UI. The [measure_build](https://github.com/measure-sh/measure/blob/main/flutter/packages/measure_build/README.md) package scans your project and generates a map of every widget type your code declares or uses, including widgets from packages you depend on, so snapshots show your real widget names. Private widgets (names starting with `_`) are left out.
+
+1. **Add the dev dependencies** in `pubspec.yaml`:
+
+   ```yaml
+   dev_dependencies:
+     measure_build: ^0.1.0
+     build_runner: ^2.4.0
+   ```
+
+2. **Generate the widget map**:
+
+   ```bash
+   dart run build_runner build
+   ```
+
+   This writes `lib/msr_widgets.g.dart` containing a map named `widgetFilter`. Re-run it after adding new widget types, or use `dart run build_runner watch` to regenerate on every change.
+
+3. **Pass the map to the SDK** during initialization:
+
+   ```dart
+   import 'package:measure_flutter/measure_flutter.dart';
+   import 'package:your_app/msr_widgets.g.dart';
+
+   Future<void> main() async {
+     await Measure.instance.init(
+       () => runApp(MeasureWidget(child: MyApp())),
+       config: const MeasureConfig(widgetFilter: widgetFilter),
+     );
+   }
+   ```
+
+### Configuration
+
+The generator works without configuration. To change its defaults, configure it in your app's `build.yaml`:
+
+```yaml
+targets:
+  $default:
+    builders:
+      measure_build|widget_analyzer:
+        options:
+          output_path: lib/src/msr_widgets.g.dart
+          scan_directories:
+            - lib
+            - custom_widgets
+          variable_name: msrWidgetFilter
+```
+
+- `output_path` sets where the generated file is written. Defaults to `lib/msr_widgets.g.dart`.
+- `scan_directories` lists the directories scanned for widgets. Defaults to `lib`; add entries if widget code lives elsewhere.
+- `variable_name` names the generated map. Defaults to `widgetFilter`.
+
+## React Native
+
+Snapshots are generated by the native SDK for the platform the app runs on, so the Android and iOS behavior applies as is.
+
+## Performance
+
+See [Performance Impact](/docs/performance-impact) for the full benchmark setup.
+
+### Android
+
+Detecting and creating a snapshot adds 0.6 ms to 1 ms per click.
+
+### iOS
+
+Capturing the layout hierarchy takes 7.5 ms at the 95th percentile, measured on an iPhone 14 Plus.
+
+### Flutter
+
+Generating a snapshot and finding the tapped widget takes about 3 ms in a widget tree 50 levels deep, and the time grows linearly with depth ([benchmarks](https://github.com/measure-sh/measure/blob/main/flutter/example/integration_test/layout_snapshot_performance_test.dart)).

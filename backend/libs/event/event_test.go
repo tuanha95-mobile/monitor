@@ -1,0 +1,1584 @@
+package event
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+func readException(path string) (exception Exception, err error) {
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(bytes, &exception)
+	return
+}
+
+func readANR(path string) (anr ANR, err error) {
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(bytes, &anr)
+	return
+}
+
+func readMemoryUsage(path string) (memoryUsage MemoryUsage, err error) {
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(bytes, &memoryUsage)
+	return
+}
+
+func readStacktrace(path string) (stacktrace string, err error) {
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	stacktrace = string(bytes)
+	return
+}
+
+func TestExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/exception_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/exception_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected %q stacktrace, but got %q", expected, got)
+	}
+}
+
+func TestNestedExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/nested_exception_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/nested_exception_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected %q stacktrace, but got %q", expected, got)
+	}
+}
+
+func TestANRStacktraceOne(t *testing.T) {
+	anr, err := readANR("./testdata/anr_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/anr_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := anr.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected %q stacktrace, but got %q", expected, got)
+	}
+}
+
+func TestObfuscatedDartNestedExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/dart_nested_exception_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/dart_nested_exception_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected %q stacktrace, but got %q", expected, got)
+	}
+}
+
+func TestObfuscatedDartExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/dart_exception_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/dart_exception_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected %q stacktrace, but got %q", expected, got)
+	}
+}
+
+func TestAppleExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/apple_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/apple_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected:\n%q\nGot:\n%q", expected, got)
+	}
+}
+
+func TestAppleExceptionStacktraceTwo(t *testing.T) {
+	exception, err := readException("./testdata/apple_two.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/apple_stacktrace_two.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected:\n%q\nGot:\n%q", expected, got)
+	}
+}
+
+func TestJSExceptionStacktraceOne(t *testing.T) {
+	exception, err := readException("./testdata/js_exception_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	expected, err := readStacktrace("./testdata/js_exception_stacktrace_one.txt")
+	if err != nil {
+		panic(err)
+	}
+	got := exception.Stacktrace()
+
+	if expected != got {
+		t.Errorf("Expected:\n%q\nGot:\n%q", expected, got)
+	}
+}
+
+func TestHasError(t *testing.T) {
+	// Empty exception
+	{
+		e := Exception{}
+		expected := false
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+
+	// Error has non-empty string code
+	{
+		e := Exception{
+			Error: &Error{
+				Code: "ENOFILE",
+			},
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+	{
+		e := Exception{
+			Code: "ENOFILE",
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+
+	// Error has non-zero numeric code
+	{
+		e := Exception{
+			Error: &Error{
+				NumCode: 47,
+			},
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+	{
+		numCode := int32(47)
+		e := Exception{
+			NumCode: &numCode,
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+
+	// NumCode sent as zero is still present, not absent
+	{
+		numCode := int32(0)
+		e := Exception{
+			NumCode: &numCode,
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+
+	// Error has some meta items
+	{
+		e := Exception{
+			Error: &Error{
+				Meta: map[string]any{
+					"foo": "bar",
+				},
+			},
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+	{
+		e := Exception{
+			Meta: map[string]any{
+				"foo": "bar",
+			},
+		}
+		expected := true
+		got := e.HasError()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	}
+}
+
+func TestMemoryUsageFields(t *testing.T) {
+	memoryUsage, err := readMemoryUsage("./testdata/memory_usage_one.json")
+	if err != nil {
+		panic(err)
+	}
+
+	if memoryUsage.AnonRSS == nil || *memoryUsage.AnonRSS != 1234 || memoryUsage.Swap == nil || *memoryUsage.Swap != 56 {
+		t.Errorf("Expected anon_rss=1234 and swap=56, but got anon_rss=%v and swap=%v", memoryUsage.AnonRSS, memoryUsage.Swap)
+	}
+}
+
+func TestGetType(t *testing.T) {
+	t.Run("Android unhandled exception's type can be derived", func(t *testing.T) {
+		exception := Exception{
+			Handled: false,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "java.lang.RuntimeException",
+					Message: "java.lang.reflect.InvocationTargetException",
+					Frames: Frames{
+						{
+							LineNum:    558,
+							FileName:   "RuntimeInit.java",
+							ClassName:  "com.android.internal.os.RuntimeInit$MethodAndArgsCaller",
+							MethodName: "run",
+						},
+						{
+							ClassName:  "com.android.internal.os.ZygoteInit",
+							MethodName: "main",
+							FileName:   "ZygoteInit.java",
+							LineNum:    936,
+						},
+					},
+				},
+			},
+			Threads: Threads{
+				{
+					Name: "ConnectivityThread",
+					Frames: Frames{
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "nativePollOnce",
+							FileName:   "MessageQueue.java",
+							LineNum:    -2,
+						},
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "next",
+							FileName:   "MessageQueue.java",
+							LineNum:    335,
+						},
+					},
+				},
+			},
+			Foreground: true,
+		}
+
+		expected := "java.lang.RuntimeException"
+		got := exception.GetType()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Apple unhandled exception's type should be its signal", func(t *testing.T) {
+		exception := Exception{
+			Handled: false,
+			Exceptions: ExceptionUnits{
+				{
+					ExceptionUnitiOS: &ExceptionUnitiOS{
+						Signal:         "SIGABRT",
+						ThreadName:     "Thread 0 Crashed",
+						ThreadSequence: 0,
+						OSBuildNumber:  "24D70",
+					},
+					Frames: Frames{
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_kernel.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        37128,
+								FrameIndex:    0,
+								SymbolAddress: "0000000100fd5108",
+							},
+							InApp: false,
+						},
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_c.dylib",
+								BinaryAddress: "1800fd000",
+								Offset:        472300,
+								FrameIndex:    1,
+								SymbolAddress: "00000001801704ec",
+							},
+							InApp: false,
+						},
+					},
+				},
+			},
+			Threads: Threads{
+				{
+					Name: "Thread 1",
+					ThreadiOS: &ThreadiOS{
+						Sequence: 1,
+					},
+					Frames: Frames{
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_kernel.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        11884,
+								FrameIndex:    0,
+								SymbolAddress: "0000000100fcee6c",
+							},
+							InApp: false,
+						},
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_pthread.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        11884,
+								FrameIndex:    1,
+								SymbolAddress: "0000000100fcee6c",
+							},
+							InApp: false,
+						},
+					},
+				},
+			},
+		}
+
+		expected := "SIGABRT"
+		got := exception.GetType()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Apple handled exception with error's type might be its error's code", func(t *testing.T) {
+		exception := Exception{
+			// Handled should be true, but "type" computation
+			// does not depend on this field
+			Handled: true,
+			Error: &Error{
+				Code: "ENOFILE",
+			},
+		}
+
+		expected := "ENOFILE"
+		got := exception.GetType()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Apple handled exception with error's type might be unknown", func(t *testing.T) {
+		exception := Exception{
+			// Handled should be true, but "type" computation
+			// does not depend on this field
+			Handled: true,
+			Error: &Error{
+				NumCode: 42,
+			},
+		}
+
+		expected := "unknown type"
+		got := exception.GetType()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+}
+
+func TestGetMessage(t *testing.T) {
+	t.Run("Android unhandled exception's message can be derived", func(t *testing.T) {
+		exception := Exception{
+			Handled: false,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "java.lang.RuntimeException",
+					Message: "java.lang.reflect.InvocationTargetException",
+					Frames: Frames{
+						{
+							LineNum:    558,
+							FileName:   "RuntimeInit.java",
+							ClassName:  "com.android.internal.os.RuntimeInit$MethodAndArgsCaller",
+							MethodName: "run",
+						},
+						{
+							ClassName:  "com.android.internal.os.ZygoteInit",
+							MethodName: "main",
+							FileName:   "ZygoteInit.java",
+							LineNum:    936,
+						},
+					},
+				},
+			},
+			Threads: Threads{
+				{
+					Name: "ConnectivityThread",
+					Frames: Frames{
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "nativePollOnce",
+							FileName:   "MessageQueue.java",
+							LineNum:    -2,
+						},
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "next",
+							FileName:   "MessageQueue.java",
+							LineNum:    335,
+						},
+					},
+				},
+			},
+			Foreground: true,
+		}
+
+		expected := "java.lang.reflect.InvocationTargetException"
+		got := exception.GetMessage()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Apple exception's message is always empty", func(t *testing.T) {
+		exception := Exception{
+			Handled: false,
+			Exceptions: ExceptionUnits{
+				{
+					ExceptionUnitiOS: &ExceptionUnitiOS{
+						Signal:         "",
+						ThreadName:     "",
+						ThreadSequence: 0,
+						OSBuildNumber:  "",
+					},
+					Frames: Frames{
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_kernel.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        37128,
+								FrameIndex:    0,
+								SymbolAddress: "0000000100fd5108",
+							},
+							InApp: false,
+						},
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_c.dylib",
+								BinaryAddress: "1800fd000",
+								Offset:        472300,
+								FrameIndex:    1,
+								SymbolAddress: "00000001801704ec",
+							},
+							InApp: false,
+						},
+					},
+				},
+			},
+			Threads: Threads{
+				{
+					Name: "Thread 1",
+					ThreadiOS: &ThreadiOS{
+						Sequence: 1,
+					},
+					Frames: Frames{
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_kernel.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        11884,
+								FrameIndex:    0,
+								SymbolAddress: "0000000100fcee6c",
+							},
+							InApp: false,
+						},
+						{
+							FrameiOS: &FrameiOS{
+								BinaryName:    "libsystem_pthread.dylib",
+								BinaryAddress: "100fcc000",
+								Offset:        11884,
+								FrameIndex:    1,
+								SymbolAddress: "0000000100fcee6c",
+							},
+							InApp: false,
+						},
+					},
+				},
+			},
+		}
+
+		expected := ""
+		got := exception.GetMessage()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+}
+
+func TestGetFramework(t *testing.T) {
+	t.Run("Provides framework if present", func(t *testing.T) {
+		frameworks := []string{FrameworkDart, FrameworkJS}
+		for _, fw := range frameworks {
+			exception := Exception{
+				Framework: fw,
+			}
+
+			got := exception.GetFramework()
+
+			if fw != got {
+				t.Errorf("Expected %v, but got %v", fw, got)
+			}
+		}
+	})
+
+	t.Run("Determines Apple framework heuristically when framework is absent", func(t *testing.T) {
+		t.Run("Exception without error", func(t *testing.T) {
+			exception := Exception{
+				Handled: false,
+				Exceptions: ExceptionUnits{
+					{
+						ExceptionUnitiOS: &ExceptionUnitiOS{
+							Signal: "SIGABRT",
+						},
+						Frames: Frames{
+							{
+								FrameiOS: &FrameiOS{
+									BinaryName:    "libsystem_kernel.dylib",
+									BinaryAddress: "100fcc000",
+									Offset:        37128,
+									FrameIndex:    0,
+									SymbolAddress: "0000000100fd5108",
+								},
+								InApp: false,
+							},
+							{
+								FrameiOS: &FrameiOS{
+									BinaryName:    "libsystem_c.dylib",
+									BinaryAddress: "1800fd000",
+									Offset:        472300,
+									FrameIndex:    1,
+									SymbolAddress: "00000001801704ec",
+								},
+								InApp: false,
+							},
+						},
+					},
+				},
+				Threads: Threads{
+					{
+						Name: "Thread 1",
+						ThreadiOS: &ThreadiOS{
+							Sequence: 1,
+						},
+						Frames: Frames{
+							{
+								FrameiOS: &FrameiOS{
+									BinaryName:    "libsystem_kernel.dylib",
+									BinaryAddress: "100fcc000",
+									Offset:        11884,
+									FrameIndex:    0,
+									SymbolAddress: "0000000100fcee6c",
+								},
+								InApp: false,
+							},
+							{
+								FrameiOS: &FrameiOS{
+									BinaryName:    "libsystem_pthread.dylib",
+									BinaryAddress: "100fcc000",
+									Offset:        11884,
+									FrameIndex:    1,
+									SymbolAddress: "0000000100fcee6c",
+								},
+								InApp: false,
+							},
+						},
+					},
+				},
+			}
+
+			expected := FrameworkApple
+			got := exception.GetFramework()
+
+			if expected != got {
+				t.Errorf("Expected %v, but got %v", expected, got)
+			}
+		})
+
+		t.Run("Exception with error", func(t *testing.T) {
+			exception := Exception{
+				Handled: true,
+				Error: &Error{
+					Code: "ENOFILE",
+				},
+			}
+
+			expected := FrameworkApple
+			got := exception.GetFramework()
+
+			if expected != got {
+				t.Errorf("Expected %v, but got %v", expected, got)
+			}
+		})
+	})
+
+	t.Run("Determines JVM framework heuristically when framework is absent", func(t *testing.T) {
+		exception := Exception{
+			Handled: false,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "java.lang.RuntimeException",
+					Message: "java.lang.reflect.InvocationTargetException",
+					Frames: Frames{
+						{
+							LineNum:    558,
+							FileName:   "RuntimeInit.java",
+							ClassName:  "com.android.internal.os.RuntimeInit$MethodAndArgsCaller",
+							MethodName: "run",
+						},
+						{
+							ClassName:  "com.android.internal.os.ZygoteInit",
+							MethodName: "main",
+							FileName:   "ZygoteInit.java",
+							LineNum:    936,
+						},
+					},
+				},
+			},
+			Threads: Threads{
+				{
+					Name: "ConnectivityThread",
+					Frames: Frames{
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "nativePollOnce",
+							FileName:   "MessageQueue.java",
+							LineNum:    -2,
+						},
+						{
+							ClassName:  "android.os.MessageQueue",
+							MethodName: "next",
+							FileName:   "MessageQueue.java",
+							LineNum:    335,
+						},
+					},
+				},
+			},
+			Foreground: true,
+		}
+
+		expected := FrameworkJVM
+		got := exception.GetFramework()
+
+		if expected != got {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+}
+
+func TestGetSeverity(t *testing.T) {
+	t.Run("Returns SeverityFatal for unhandled exception with empty severity", func(t *testing.T) {
+		e := Exception{
+			Handled:  false,
+			Severity: "",
+		}
+		expected := SeverityFatal
+		got := e.GetSeverity()
+		if got != expected {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Returns SeverityHandled for handled exception with empty severity", func(t *testing.T) {
+		e := Exception{
+			Handled:  true,
+			Severity: "",
+		}
+		expected := SeverityHandled
+		got := e.GetSeverity()
+		if got != expected {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+
+	t.Run("Returns e.Severity if it is not empty", func(t *testing.T) {
+		e := Exception{
+			Handled:  false,
+			Severity: SeverityUnhandled,
+		}
+		expected := SeverityUnhandled
+		got := e.GetSeverity()
+		if got != expected {
+			t.Errorf("Expected %v, but got %v", expected, got)
+		}
+	})
+}
+
+func TestIsFatalException(t *testing.T) {
+	t.Run("Returns true for an exception with SeverityFatal", func(t *testing.T) {
+		e := EventField{
+			Type: TypeException,
+			Exception: &Exception{
+				Severity: SeverityFatal,
+			},
+		}
+
+		if !e.IsFatalException() {
+			t.Errorf("Expected IsFatalException to be true, got false")
+		}
+	})
+
+	t.Run("Returns false for an exception with non-fatal severity", func(t *testing.T) {
+		e := EventField{
+			Type: TypeException,
+			Exception: &Exception{
+				Severity: SeverityHandled,
+			},
+		}
+
+		if e.IsFatalException() {
+			t.Errorf("Expected IsFatalException to be false, got true")
+		}
+	})
+
+	t.Run("Returns false if event is not an exception", func(t *testing.T) {
+		e := EventField{
+			Type: TypeANR,
+			ANR:  &ANR{},
+		}
+
+		if e.IsFatalException() {
+			t.Errorf("Expected IsFatalException to be false, got true")
+		}
+	})
+
+	t.Run("Returns true for an exception when unhandled and empty severity (implied fatal)", func(t *testing.T) {
+		e := EventField{
+			Type: TypeException,
+			Exception: &Exception{
+				Handled:  false,
+				Severity: "",
+			},
+		}
+
+		if !e.IsFatalException() {
+			t.Errorf("Expected IsFatalException to be true, got false")
+		}
+	})
+}
+
+func TestGetMetaBytes(t *testing.T) {
+	t.Run("Returns e.Meta as bytes if e.Meta is not nil", func(t *testing.T) {
+		e := Exception{
+			Meta: map[string]any{
+				"key1": "value1",
+			},
+			Error: &Error{
+				Meta: map[string]any{
+					"key2": "value2",
+				},
+			},
+		}
+
+		bytes, err := e.GetMetaBytes()
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		expected := `{"key1":"value1"}`
+		if string(bytes) != expected {
+			t.Errorf("Expected %s, got %s", expected, string(bytes))
+		}
+	})
+
+	t.Run("Returns e.Error.Meta as bytes if e.Meta is nil and e.Error.Meta is not nil", func(t *testing.T) {
+		e := Exception{
+			Error: &Error{
+				Meta: map[string]any{
+					"key2": "value2",
+				},
+			},
+		}
+
+		bytes, err := e.GetMetaBytes()
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		expected := `{"key2":"value2"}`
+		if string(bytes) != expected {
+			t.Errorf("Expected %s, got %s", expected, string(bytes))
+		}
+	})
+
+	t.Run("Returns nil bytes and nil err if both are nil", func(t *testing.T) {
+		e := Exception{}
+
+		bytes, err := e.GetMetaBytes()
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		if bytes != nil {
+			t.Errorf("Expected nil bytes, got %s", string(bytes))
+		}
+	})
+
+	t.Run("Returns error if marshaling fails", func(t *testing.T) {
+		e := Exception{
+			Meta: map[string]any{
+				"key": make(chan int),
+			},
+		}
+
+		_, err := e.GetMetaBytes()
+		if err == nil {
+			t.Errorf("Expected error during marshaling, got nil")
+		}
+	})
+}
+
+func TestHasJSFrames(t *testing.T) {
+	t.Run("Returns true for JS exception with frames", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+			Exceptions: ExceptionUnits{
+				{
+					Frames: Frames{
+						{MethodName: "render"},
+					},
+				},
+			},
+		}
+
+		if !e.HasJSFrames() {
+			t.Errorf("Expected HasJSFrames to return true, got false")
+		}
+	})
+
+	t.Run("Returns false for JS exception with no frames", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+			Exceptions: ExceptionUnits{
+				{
+					Frames: Frames{},
+				},
+			},
+		}
+
+		if e.HasJSFrames() {
+			t.Errorf("Expected HasJSFrames to return false, got true")
+		}
+	})
+
+	t.Run("Returns false for JS exception with no exception units", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+		}
+
+		if e.HasJSFrames() {
+			t.Errorf("Expected HasJSFrames to return false, got true")
+		}
+	})
+
+	t.Run("Returns false for non-JS framework with frames", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkDart,
+			Exceptions: ExceptionUnits{
+				{
+					Frames: Frames{
+						{MethodName: "main"},
+					},
+				},
+			},
+		}
+
+		if e.HasJSFrames() {
+			t.Errorf("Expected HasJSFrames to return false for non-JS framework, got true")
+		}
+	})
+}
+
+func TestValidateAppleFrameworkOSName(t *testing.T) {
+	makeEvent := func(osName string) EventField {
+		return EventField{
+			ID:        uuid.New(),
+			AppID:     uuid.New(),
+			Type:      TypeException,
+			Timestamp: time.Now(),
+			Attribute: Attribute{OSName: osName},
+			Exception: &Exception{
+				Framework: FrameworkApple,
+				Exceptions: ExceptionUnits{
+					{
+						Type: "EXC_BAD_ACCESS",
+						ExceptionUnitiOS: &ExceptionUnitiOS{
+							Signal: "SIGSEGV",
+						},
+						Frames: Frames{{}},
+					},
+				},
+				Threads: Threads{
+					{Name: "main", Frames: Frames{{}}},
+				},
+			},
+		}
+	}
+
+	t.Run("Rejects apple framework on non-Apple os_name", func(t *testing.T) {
+		ev := makeEvent("android")
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for apple framework with android os_name, got nil")
+		}
+	})
+
+	t.Run("Accepts apple framework on Apple os_name", func(t *testing.T) {
+		ev := makeEvent("ios")
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for apple framework with ios os_name, got %v", err)
+		}
+	})
+}
+
+func TestValidateAttachmentLimit(t *testing.T) {
+	makeEvent := func(n int) EventField {
+		attachments := make([]Attachment, n)
+		for i := range attachments {
+			attachments[i] = Attachment{
+				ID:   uuid.New(),
+				Name: "screenshot.png",
+				Type: "screenshot",
+			}
+		}
+		return EventField{
+			ID:          uuid.New(),
+			AppID:       uuid.New(),
+			Type:        TypeString,
+			Timestamp:   time.Now(),
+			Attribute:   Attribute{OSName: "android"},
+			LogString:   &LogString{String: "log line"},
+			Attachments: attachments,
+		}
+	}
+
+	t.Run("Accepts event with no attachments", func(t *testing.T) {
+		ev := makeEvent(0)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for 0 attachments, got %v", err)
+		}
+	})
+
+	t.Run("Accepts event at the attachment limit", func(t *testing.T) {
+		ev := makeEvent(maxEventAttachments)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for %d attachments, got %v", maxEventAttachments, err)
+		}
+	})
+
+	t.Run("Rejects event over the attachment limit", func(t *testing.T) {
+		ev := makeEvent(maxEventAttachments + 1)
+		if err := ev.Validate(); err == nil {
+			t.Errorf("Expected validation error for %d attachments, got nil", maxEventAttachments+1)
+		}
+	})
+}
+
+func TestValidateLogSeverity(t *testing.T) {
+	makeLog := func(severityText string, severityNumber int32) EventField {
+		return EventField{
+			ID:        uuid.New(),
+			AppID:     uuid.New(),
+			Type:      TypeLog,
+			Timestamp: time.Now(),
+			Attribute: Attribute{OSName: "android"},
+			Log: &Log{
+				SeverityText:   severityText,
+				SeverityNumber: severityNumber,
+				Body:           "something happened",
+			},
+		}
+	}
+
+	t.Run("Accepts fatal severity", func(t *testing.T) {
+		ev := makeLog("fatal", 24)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for fatal severity, got %v", err)
+		}
+	})
+
+	t.Run("Rejects unknown severity", func(t *testing.T) {
+		ev := makeLog("verbose", 4)
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for unknown severity, got nil")
+		}
+	})
+
+	t.Run("Rejects severity_number that does not match severity_text", func(t *testing.T) {
+		ev := makeLog("fatal", 20)
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for mismatched severity_number, got nil")
+		}
+	})
+}
+
+func TestValidateANR(t *testing.T) {
+	makeANR := func(anr ANR) EventField {
+		return EventField{
+			ID:        uuid.New(),
+			AppID:     uuid.New(),
+			Type:      TypeANR,
+			Timestamp: time.Now(),
+			Attribute: Attribute{OSName: "android"},
+			ANR:       &anr,
+		}
+	}
+
+	withExceptions := ANR{
+		Exceptions: ExceptionUnits{
+			{
+				Type: "AppNotResponding",
+				Frames: Frames{
+					{
+						MethodName: "blockerMethod",
+						FileName:   "MainActivity.java",
+					},
+				},
+			},
+		},
+		Threads: Threads{
+			{
+				Name: "main",
+				Frames: Frames{
+					{
+						MethodName: "blockerMethod",
+						FileName:   "MainActivity.java",
+					},
+				},
+			},
+		},
+	}
+
+	withThreadDump := ANR{
+		RawThreadDump: "DALVIK THREADS (1):\n\"main\" prio=5 tid=1 Blocked\n  at sh.foo.Repo.load(Repo.kt:8)\n",
+		Subject:       "Broadcast of Intent { cmp=sh.foo/.Receiver }",
+	}
+
+	t.Run("Accepts an anr with a thread dump and no exceptions", func(t *testing.T) {
+		ev := makeANR(withThreadDump)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for a dump-only anr, got %v", err)
+		}
+	})
+
+	t.Run("Accepts an anr with exceptions and no thread dump", func(t *testing.T) {
+		ev := makeANR(withExceptions)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for a stacktrace anr, got %v", err)
+		}
+	})
+
+	t.Run("Accepts an anr with a thread dump and no subject", func(t *testing.T) {
+		anr := withThreadDump
+		anr.Subject = ""
+		ev := makeANR(anr)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for a dump without a subject, got %v", err)
+		}
+	})
+
+	t.Run("Accepts an anr carrying both representations", func(t *testing.T) {
+		anr := withExceptions
+		anr.RawThreadDump = withThreadDump.RawThreadDump
+		ev := makeANR(anr)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for an anr with both representations, got %v", err)
+		}
+	})
+
+	t.Run("Rejects an anr with exceptions but no threads", func(t *testing.T) {
+		anr := withExceptions
+		anr.Threads = nil
+		ev := makeANR(anr)
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for a stacktrace anr with no threads, got nil")
+		}
+	})
+
+	t.Run("Rejects an anr with neither a thread dump nor exceptions", func(t *testing.T) {
+		ev := makeANR(ANR{Subject: "Input dispatching timed out"})
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for an anr carrying only a subject, got nil")
+		}
+	})
+
+	t.Run("Rejects a thread dump without a main thread", func(t *testing.T) {
+		anr := withThreadDump
+		anr.RawThreadDump = "DALVIK THREADS (1):\n\"worker\" prio=5 tid=2 Blocked\n  at sh.foo.Repo.load(Repo.kt:8)\n"
+		ev := makeANR(anr)
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for a dump without a main thread, got nil")
+		}
+	})
+
+	t.Run("Rejects a thread dump whose main thread has no frames", func(t *testing.T) {
+		anr := withThreadDump
+		anr.RawThreadDump = "DALVIK THREADS (1):\n\"main\" prio=5 tid=1 Native\n  (no managed stack frames)\n"
+		ev := makeANR(anr)
+		if err := ev.Validate(); err == nil {
+			t.Error("Expected validation error for a dump whose main thread has no frames, got nil")
+		}
+	})
+
+	t.Run("Accepts a thread dump at the size limit", func(t *testing.T) {
+		anr := withThreadDump
+		anr.RawThreadDump += strings.Repeat("a", maxANRThreadDumpBytes-len(anr.RawThreadDump))
+		ev := makeANR(anr)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for a dump of %d bytes, got %v", maxANRThreadDumpBytes, err)
+		}
+	})
+
+	t.Run("Rejects a thread dump over the size limit", func(t *testing.T) {
+		anr := withThreadDump
+		anr.RawThreadDump = strings.Repeat("a", maxANRThreadDumpBytes+1)
+		ev := makeANR(anr)
+		if err := ev.Validate(); err == nil {
+			t.Errorf("Expected validation error for a dump of %d bytes, got nil", maxANRThreadDumpBytes+1)
+		}
+	})
+
+	t.Run("Accepts a subject at the size limit", func(t *testing.T) {
+		anr := withThreadDump
+		anr.Subject = strings.Repeat("a", maxANRSubjectBytes)
+		ev := makeANR(anr)
+		if err := ev.Validate(); err != nil {
+			t.Errorf("Expected no validation error for a subject of %d bytes, got %v", maxANRSubjectBytes, err)
+		}
+	})
+
+	t.Run("Rejects a subject over the size limit", func(t *testing.T) {
+		anr := withThreadDump
+		anr.Subject = strings.Repeat("a", maxANRSubjectBytes+1)
+		ev := makeANR(anr)
+		if err := ev.Validate(); err == nil {
+			t.Errorf("Expected validation error for a subject of %d bytes, got nil", maxANRSubjectBytes+1)
+		}
+	})
+}
+
+func TestComputeFingerprint(t *testing.T) {
+	t.Run("FrameworkJS with message", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "TypeError",
+					Message: "Cannot read property 'foo' of undefined",
+					Frames: Frames{
+						{
+							MethodName: "render",
+							FileName:   "App.js",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing JS fingerprint: %v", err)
+		}
+
+		expected := "a8c01be01b06e5284186a69934ec04f6"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkJS with different message", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "TypeError",
+					Message: "Cannot read property 'bar' of undefined",
+					Frames: Frames{
+						{
+							MethodName: "render",
+							FileName:   "App.js",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing JS fingerprint: %v", err)
+		}
+
+		expected := "56f894bf670623086c843b1d462c5c44"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkJS with empty message", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJS,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "TypeError",
+					Message: "",
+					Frames: Frames{
+						{
+							MethodName: "render",
+							FileName:   "App.js",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing JS fingerprint: %v", err)
+		}
+
+		expected := "f7a09ac70683ba3a38cc8dbf537d51b4"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkDart with invalid double message", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkDart,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "FormatException",
+					Message: "Invalid double",
+					Frames: Frames{
+						{
+							MethodName: "parseDouble",
+							FileName:   "parser.dart",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing Dart fingerprint: %v", err)
+		}
+
+		expected := "20bb2b941c29aefcd6b81b2cba2d3511"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkDart with invalid float message (retains same fingerprint)", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkDart,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "FormatException",
+					Message: "Invalid float",
+					Frames: Frames{
+						{
+							MethodName: "parseDouble",
+							FileName:   "parser.dart",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing Dart fingerprint: %v", err)
+		}
+
+		expected := "20bb2b941c29aefcd6b81b2cba2d3511"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkJVM with nested exceptions uses innermost", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkJVM,
+			Exceptions: ExceptionUnits{
+				{
+					Type:    "java.lang.RuntimeException",
+					Message: "Nested exception wrapper",
+					Frames: Frames{
+						{
+							MethodName: "outerMethod",
+							FileName:   "OuterClass.java",
+						},
+					},
+				},
+				{
+					Type:    "java.lang.NullPointerException",
+					Message: "Null pointer occurred",
+					Frames: Frames{
+						{
+							MethodName: "innerMethod",
+							FileName:   "InnerClass.java",
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing JVM fingerprint: %v", err)
+		}
+
+		expected := "a74cd8f37b38b20c7505f5da3bc83df3"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+
+	t.Run("FrameworkApple selects relevant in-app frame", func(t *testing.T) {
+		e := Exception{
+			Framework: FrameworkApple,
+			Exceptions: ExceptionUnits{
+				{
+					ExceptionUnitiOS: &ExceptionUnitiOS{
+						Signal: "SIGABRT",
+					},
+					Frames: Frames{
+						{
+							MethodName: "systemMethod",
+							FileName:   "libsystem_kernel.dylib",
+							InApp:      false,
+						},
+						{
+							MethodName: "myInAppMethod",
+							FileName:   "ViewController.swift",
+							InApp:      true,
+						},
+					},
+				},
+			},
+		}
+
+		err := e.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing Apple fingerprint: %v", err)
+		}
+
+		expected := "53f373bcd16b29f5033e1c4477a8f5cd"
+		if e.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, e.Fingerprint)
+		}
+	})
+}
+
+func TestANRComputeFingerprint(t *testing.T) {
+	t.Run("ANR with nested exceptions uses innermost", func(t *testing.T) {
+		a := ANR{
+			Exceptions: ExceptionUnits{
+				{
+					Type: "AppNotResponding",
+					Frames: Frames{
+						{
+							MethodName: "systemWait",
+							FileName:   "native.c",
+						},
+					},
+				},
+				{
+					Type: "MainThreadBlocked",
+					Frames: Frames{
+						{
+							MethodName: "blockerMethod",
+							FileName:   "MainActivity.java",
+						},
+					},
+				},
+			},
+		}
+
+		err := a.ComputeFingerprint()
+		if err != nil {
+			t.Fatalf("Unexpected error computing ANR fingerprint: %v", err)
+		}
+
+		expected := "575ddc443e854d811e7e1b2b04868356"
+		if a.Fingerprint != expected {
+			t.Errorf("Expected fingerprint %q, but got %q", expected, a.Fingerprint)
+		}
+	})
+}
+
+func TestTruncateMessages(t *testing.T) {
+	big := strings.Repeat("a", maxExceptionMessageBytes+500)
+	// 3 byte runes so the cap lands inside a rune
+	straddle := "a" + strings.Repeat("\u20ac", maxExceptionMessageBytes)
+	nasty := strings.Repeat("\"\\<>&\n\u20ac\U0001F600", maxExceptionMessageBytes)
+
+	t.Run("under cap unchanged", func(t *testing.T) {
+		a := ANR{Exceptions: ExceptionUnits{{Message: "short"}}}
+		a.TruncateMessages()
+		if a.Exceptions[0].Message != "short" {
+			t.Errorf("message changed: %q", a.Exceptions[0].Message)
+		}
+	})
+
+	t.Run("oversized ascii cut to cap", func(t *testing.T) {
+		a := ANR{Exceptions: ExceptionUnits{{Message: big}}}
+		a.TruncateMessages()
+		if got := len(a.Exceptions[0].Message); got != maxExceptionMessageBytes {
+			t.Errorf("got %d bytes, want %d", got, maxExceptionMessageBytes)
+		}
+	})
+
+	t.Run("multi-byte cut on rune boundary", func(t *testing.T) {
+		a := ANR{Exceptions: ExceptionUnits{{Message: straddle}}}
+		a.TruncateMessages()
+		got := a.Exceptions[0].Message
+		if len(got) > maxExceptionMessageBytes || !utf8.ValidString(got) {
+			t.Errorf("got %d bytes, valid utf8 %v", len(got), utf8.ValidString(got))
+		}
+		if !strings.HasPrefix(straddle, got) || len(got) < maxExceptionMessageBytes-3 {
+			t.Errorf("cut removed more than one rune")
+		}
+	})
+
+	t.Run("exception caps unit messages & keeps abort message", func(t *testing.T) {
+		e := Exception{
+			Exceptions:   ExceptionUnits{{Message: big}, {Message: big}},
+			AbortMessage: big,
+		}
+		e.TruncateMessages()
+		for i, u := range e.Exceptions {
+			if len(u.Message) != maxExceptionMessageBytes {
+				t.Errorf("unit %d has %d bytes", i, len(u.Message))
+			}
+		}
+		if e.AbortMessage != big {
+			t.Errorf("abort message changed to %d bytes", len(e.AbortMessage))
+		}
+	})
+
+	t.Run("anr caps every unit", func(t *testing.T) {
+		a := ANR{Exceptions: ExceptionUnits{{Message: big}, {Message: big}}}
+		a.TruncateMessages()
+		for i, u := range a.Exceptions {
+			if len(u.Message) != maxExceptionMessageBytes {
+				t.Errorf("unit %d has %d bytes", i, len(u.Message))
+			}
+		}
+	})
+
+	t.Run("marshaled exceptions stay valid json", func(t *testing.T) {
+		e := Exception{Exceptions: ExceptionUnits{{Message: nasty}}}
+		a := ANR{Exceptions: ExceptionUnits{{Message: nasty}}}
+		e.TruncateMessages()
+		a.TruncateMessages()
+		for name, units := range map[string]ExceptionUnits{"exception": e.Exceptions, "anr": a.Exceptions} {
+			b, err := json.Marshal(units)
+			if err != nil || !json.Valid(b) {
+				t.Fatalf("%s: invalid json, err %v", name, err)
+			}
+			var back ExceptionUnits
+			if err := json.Unmarshal(b, &back); err != nil {
+				t.Fatalf("%s: unmarshal: %v", name, err)
+			}
+			if back[0].Message != units[0].Message || len(back[0].Message) > maxExceptionMessageBytes {
+				t.Errorf("%s: round trip mismatch", name)
+			}
+		}
+	})
+}

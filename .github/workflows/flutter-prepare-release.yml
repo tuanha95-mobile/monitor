@@ -1,0 +1,151 @@
+name: Prepare Flutter Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to release'
+        required: true
+        type: choice
+        options:
+          - measure_flutter
+          - measure_dio
+          - measure_build
+      version:
+        description: 'Version number (e.g., 0.5.0)'
+        required: true
+        type: string
+      next_version:
+        description: 'Next development version (e.g., 0.6.0)'
+        required: true
+        type: string
+      android_sdk_version:
+        description: 'Measure Android SDK version (only for measure_flutter, e.g., 0.17.0)'
+        required: false
+        type: string
+      ios_sdk_version:
+        description: 'Measure iOS SDK version (only for measure_flutter, e.g., 0.10.0)'
+        required: false
+        type: string
+      measure_flutter_version:
+        description: 'measure_flutter version (only for measure_dio, e.g., 0.5.0)'
+        required: false
+        type: string
+
+jobs:
+  prepare-release:
+    name: Prepare ${{ inputs.package }} Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: 'main'
+          fetch-depth: 0
+          token: ${{ secrets.SDK_RELEASE }}
+
+      - name: Setup Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must match pattern x.y.z (e.g. 1.2.3)"
+            echo "Got: $VERSION"
+            exit 1
+          fi
+
+      - name: Validate measure_flutter inputs
+        if: inputs.package == 'measure_flutter'
+        env:
+          ANDROID_SDK_VERSION: ${{ inputs.android_sdk_version }}
+          IOS_SDK_VERSION: ${{ inputs.ios_sdk_version }}
+        run: |
+          if [ -z "$ANDROID_SDK_VERSION" ] || [ -z "$IOS_SDK_VERSION" ]; then
+            echo "Error: android_sdk_version and ios_sdk_version are required for measure_flutter"
+            exit 1
+          fi
+
+      - name: Validate measure_dio inputs
+        if: inputs.package == 'measure_dio'
+        env:
+          MEASURE_FLUTTER_VERSION: ${{ inputs.measure_flutter_version }}
+        run: |
+          if [ -z "$MEASURE_FLUTTER_VERSION" ]; then
+            echo "Error: measure_flutter_version is required for measure_dio"
+            exit 1
+          fi
+
+      # measure_flutter steps
+      - name: Update measure_flutter versions
+        if: inputs.package == 'measure_flutter'
+        env:
+          VERSION: ${{ inputs.version }}
+          ANDROID_SDK_VERSION: ${{ inputs.android_sdk_version }}
+          IOS_SDK_VERSION: ${{ inputs.ios_sdk_version }}
+        run: |
+          sed -i "s/^version: .*/version: $VERSION/" flutter/packages/measure_flutter/pubspec.yaml
+          sed -i "s/\(s.version *= *\).*/\1'$VERSION'/" flutter/packages/measure_flutter/ios/measure_flutter.podspec
+          sed -i "s/api(\"sh.measure:measure-android:.*\")/api(\"sh.measure:measure-android:$ANDROID_SDK_VERSION\")/" flutter/packages/measure_flutter/android/build.gradle
+          sed -i "s|branch: \"ios-v[0-9.]*\"|branch: \"ios-v$IOS_SDK_VERSION\"|" flutter/packages/measure_flutter/ios/measure_flutter/Package.swift
+          sed -i "s/s.dependency 'measure-sh', '~> [0-9.]*'/s.dependency 'measure-sh', '~> $IOS_SDK_VERSION'/" flutter/packages/measure_flutter/ios/measure_flutter.podspec
+          sed -i "s/measure_flutter: ^.*/measure_flutter: ^$VERSION/" flutter/packages/measure_flutter/README.md
+          sed -i "s/measure_flutter: ^.*/measure_flutter: ^$VERSION/" frontend/dashboard/content/docs/getting-started/flutter.mdx
+          sed -i "/^| Measure Android/ s/[0-9]*\.[0-9]*\.[0-9]*/$ANDROID_SDK_VERSION/" frontend/dashboard/content/docs/getting-started/flutter.mdx
+          sed -i "/^| Measure iOS/ s/[0-9]*\.[0-9]*\.[0-9]*/$IOS_SDK_VERSION/" frontend/dashboard/content/docs/getting-started/flutter.mdx
+
+      # measure_dio steps
+      - name: Update measure_dio versions
+        if: inputs.package == 'measure_dio'
+        env:
+          VERSION: ${{ inputs.version }}
+          MEASURE_FLUTTER_VERSION: ${{ inputs.measure_flutter_version }}
+        run: |
+          cd flutter/packages/measure_dio
+          sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
+          sed -i "s/measure_flutter: ^.*/measure_flutter: ^$MEASURE_FLUTTER_VERSION/" pubspec.yaml
+          sed -i '/^dependency_overrides:/,/^[^ ]/{ /^[^ ]/!d; /^dependency_overrides:/d }' pubspec.yaml
+
+      # measure_build steps
+      - name: Update measure_build versions
+        if: inputs.package == 'measure_build'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sed -i "s/^version: .*/version: $VERSION/" flutter/packages/measure_build/pubspec.yaml
+          sed -i "s/measure_build: ^.*/measure_build: ^$VERSION/" flutter/packages/measure_build/README.md
+
+      # Shared steps
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: flutter/packages/${{ inputs.package }}/cliff.toml
+          args: --output flutter/packages/${{ inputs.package }}/CHANGELOG.md --tag ${{ inputs.package }}-v${{ inputs.version }} --include-path "flutter/packages/${{ inputs.package }}/**"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SDK_RELEASE }}
+          commit-message: "chore(flutter): prepare ${{ inputs.package }} release ${{ inputs.version }}"
+          branch: ${{ inputs.package }}-v${{ inputs.version }}
+          delete-branch: false
+          title: "chore(flutter): prepare ${{ inputs.package }} release ${{ inputs.version }}"
+          body: |
+            This PR prepares ${{ inputs.package }} for release version ${{ inputs.version }}.
+
+            <!-- release-meta
+            NEXT_VERSION=${{ inputs.next_version }}
+            ANDROID_SNAPSHOT_VERSION=${{ inputs.android_sdk_version && format('{0}-SNAPSHOT', inputs.android_sdk_version) || '' }}
+            MEASURE_FLUTTER_VERSION=${{ inputs.measure_flutter_version || '' }}
+            -->
+          base: main
+          labels: flutter
+          assignees: abhaysood

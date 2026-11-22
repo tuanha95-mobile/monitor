@@ -1,0 +1,15 @@
+go 1.27.3
+
+use (
+	./backend/agent
+	./backend/alerts
+	./backend/api
+	./backend/cleanup
+	./backend/ingest
+	./backend/ingest-worker
+	./backend/libs
+	./backend/migrator
+	./backend/symboloader
+	./backend/testinfra
+	./self-host/sessionator
+)

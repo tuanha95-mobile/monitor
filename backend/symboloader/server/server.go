@@ -1,0 +1,218 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strings"
+
+	"backend/libs/secret"
+
+	"cloud.google.com/go/cloudsqlconn"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"google.golang.org/grpc/credentials"
+)
+
+var Server *server
+
+type server struct {
+	PgPool *pgxpool.Pool
+	Config *ServerConfig
+}
+
+type PostgresConfig struct {
+	/* connection string of the postgres instance */
+	DSN string
+}
+
+type ServerConfig struct {
+	PG                     PostgresConfig
+	SymbolsBucket          string
+	SymbolsBucketRegion    string
+	SymbolsAccessKey       string
+	SymbolsSecretAccessKey string
+	AWSEndpoint            string
+	OtelServiceName        string
+	CloudEnv               bool
+}
+
+// IsCloud is true if the service is assumed
+// running on a cloud environment.
+func (sc *ServerConfig) IsCloud() bool {
+	if sc.CloudEnv {
+		return true
+	}
+
+	return false
+}
+
+func NewConfig() *ServerConfig {
+	cloudEnv := false
+	if os.Getenv("K_SERVICE") != "" && os.Getenv("K_REVISION") != "" {
+		cloudEnv = true
+	}
+
+	symbolsBucket := os.Getenv("SYMBOLS_S3_BUCKET")
+	if symbolsBucket == "" {
+		log.Println("SYMBOLS_S3_BUCKET env var not set, mapping file uploads won't work")
+	}
+
+	symbolsBucketRegion := os.Getenv("SYMBOLS_S3_BUCKET_REGION")
+	if symbolsBucketRegion == "" {
+		log.Println("SYMBOLS_S3_BUCKET_REGION env var not set, mapping file uploads won't work")
+	}
+
+	symbolsAccessKey := os.Getenv("SYMBOLS_ACCESS_KEY")
+	if symbolsAccessKey == "" {
+		log.Println("SYMBOLS_ACCESS_KEY env var not set, mapping file uploads won't work")
+	}
+
+	symbolsSecretAccessKey, secErr := secret.FromEnvOrFile("SYMBOLS_SECRET_ACCESS_KEY")
+	if secErr != nil {
+		log.Printf("failed to read SYMBOLS_SECRET_ACCESS_KEY: %v", secErr)
+	}
+	if symbolsSecretAccessKey == "" {
+		log.Println("SYMBOLS_SECRET_ACCESS_KEY env var not set, mapping file uploads won't work")
+	}
+
+	postgresDSN, secErr := secret.FromEnvOrFile("POSTGRES_DSN")
+	if secErr != nil {
+		log.Printf("failed to read POSTGRES_DSN: %v", secErr)
+	}
+	if postgresDSN == "" {
+		// log.Fatal("POSTGRES_DSN env var is not set, cannot start server")
+		log.Println("POSTGRES_DSN env var is not set, cannot start server")
+	}
+
+	otelServiceName := os.Getenv("OTEL_SERVICE_NAME")
+	if otelServiceName == "" {
+		log.Println("OTEL_SERVICE_NAME env var is not set, o11y will not work")
+	}
+
+	endpoint := os.Getenv("AWS_ENDPOINT_URL")
+
+	return &ServerConfig{
+		PG: PostgresConfig{
+			DSN: postgresDSN,
+		},
+		SymbolsBucket:          symbolsBucket,
+		SymbolsBucketRegion:    symbolsBucketRegion,
+		SymbolsAccessKey:       symbolsAccessKey,
+		SymbolsSecretAccessKey: symbolsSecretAccessKey,
+		AWSEndpoint:            endpoint,
+		OtelServiceName:        otelServiceName,
+		CloudEnv:               cloudEnv,
+	}
+}
+
+// SetConfig wires a config into the global server without a DB
+// pool, for exercising config-dependent helpers in isolation.
+func SetConfig(config *ServerConfig) {
+	Server = &server{Config: config}
+}
+
+func Init(config *ServerConfig) {
+	ctx := context.Background()
+	var pgPool *pgxpool.Pool
+
+	// read/write pool
+	oConfig, err := pgxpool.ParseConfig(config.PG.DSN)
+	if err != nil {
+		log.Fatalf("Unable to parse postgres connection string: %v\n", err)
+	}
+
+	// See https://pkg.go.dev/github.com/jackc/pgx/v5#QueryExecMode
+	oConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	// IAM auth in Cloud with a passwordless DSN; a password DSN uses the plain path.
+	if config.IsCloud() && oConfig.ConnConfig.Password == "" {
+		d, err := cloudsqlconn.NewDialer(ctx,
+			// Always use IAM authentication.
+			cloudsqlconn.WithIAMAuthN(),
+			// In Cloud Run CPU is throttled outside of a request
+			// context causing the backend refresh to fail, hence
+			// the need for `WithLazyRefresh()` option.
+			cloudsqlconn.WithLazyRefresh(),
+		)
+		if err != nil {
+			fmt.Println("Failed to dial postgres connection.")
+		}
+
+		csqlConnName := os.Getenv("CSQL_CONN_NAME")
+		if csqlConnName == "" {
+			// Fail closed: IAM auth has no instance to dial.
+			log.Fatal("CSQL_CONN_NAME is not set but POSTGRES_DSN is in IAM form")
+		}
+
+		oConfig.ConnConfig.DialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+			fmt.Printf("Dialing network: %s, address: %s\n", network, address)
+			return d.Dial(ctx, csqlConnName, cloudsqlconn.WithPrivateIP())
+		}
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, oConfig)
+	if err != nil {
+		log.Fatalf("Unable to create PG connection pool: %v\n", err)
+	}
+	pgPool = pool
+
+	Server = &server{
+		PgPool: pgPool,
+		Config: config,
+	}
+}
+
+func (sc ServerConfig) InitTracer() func(context.Context) error {
+	otelCollectorURL := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	otelInsecureMode := os.Getenv("OTEL_INSECURE_MODE")
+	otelServiceName := sc.OtelServiceName
+
+	var secureOption otlptracegrpc.Option
+
+	if strings.ToLower(otelInsecureMode) == "false" || otelInsecureMode == "0" || strings.ToLower(otelInsecureMode) == "f" {
+		secureOption = otlptracegrpc.WithTLSCredentials(credentials.NewClientTLSFromCert(nil, ""))
+	} else {
+		secureOption = otlptracegrpc.WithInsecure()
+	}
+
+	exporter, err := otlptrace.New(
+		context.Background(),
+		otlptracegrpc.NewClient(
+			secureOption,
+			otlptracegrpc.WithEndpoint(otelCollectorURL),
+		),
+	)
+
+	if err != nil {
+		log.Fatalf("Failed to create exporter: %v", err)
+	}
+	resources, err := resource.New(
+		context.Background(),
+		resource.WithAttributes(
+			attribute.String("service.name", otelServiceName),
+			attribute.String("library.language", "go"),
+		),
+	)
+	if err != nil {
+		log.Fatalf("Could not set resources: %v", err)
+	}
+
+	otel.SetTracerProvider(
+		trace.NewTracerProvider(
+			trace.WithSampler(trace.AlwaysSample()),
+			trace.WithBatcher(exporter),
+			trace.WithResource(resources),
+		),
+	)
+
+	return exporter.Shutdown
+}

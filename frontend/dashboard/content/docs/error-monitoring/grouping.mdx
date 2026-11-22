@@ -1,0 +1,165 @@
+---
+title: "Grouping"
+seoTitle: "Crash and Error Grouping (Android, iOS, Flutter, React Native, Kotlin Multiplatform)"
+description: "See how Measure groups similar errors into a single issue."
+---
+
+Similar errors are grouped into a single issue. For the selected time range, each group shows its number of instances, the users and sessions it affected, when it was last seen and a trend of its instances over time, so you can see at a glance what to fix first.
+
+Grouping rules depend on the platform.
+
+## Android
+
+Errors are grouped by the exception type and the top frame of the stack trace.
+
+- **Exception type**: `java.lang.NullPointerException`
+- **Top frame**: `onCreate` in `MainActivity.kt`
+
+```log
+java.lang.NullPointerException: Attempt to invoke virtual method 'void com.example.app.MainActivity.onCreate(android.os.Bundle)' on a null object reference
+    at com.example.app.MainActivity.onCreate(MainActivity.kt:10)
+    at android.app.Activity.performCreate(Activity.java:8000)
+    ...
+```
+
+### ANRs
+
+ANRs on Android 11 and above are tracked using the thread dump from [ApplicationExitInfo](https://developer.android.com/reference/android/app/ApplicationExitInfo). Below Android 11, we use a stack trace collected by intercepting the [SIGQUIT signal](https://measure.sh/blog/what-we-got-wrong-about-anr-detection-before-we-got-it-right).
+
+**Android 11+**
+
+1. Look for the main thread in the thread dump.
+2. Find the first frame that belongs to your app. This is done using a heuristics-based approach, where we assume a frame is from your app's code if it does not belong to any of the following system packages: Android, Java, Kotlin, AndroidX, Flutter, React Native. Libraries bundled with your app, like OkHttp, are treated as your app's code. In case the stack trace contains no frame from your app's code, it simply falls back to the topmost frame in the main thread.
+3. Use the type of ANR from the thread dump if available, but only when no frame from your app's code was found.
+
+For example, in the thread dump below:
+
+```
+"main" prio=5 tid=1 Runnable
+  at android.os.MessageQueue.next(MessageQueue.java:335)
+  at com.example.app.Repo.load(Repo.kt:8)
+```
+
+The grouping will be done on `Repo.kt: load()`.
+
+In case the main thread is waiting on a lock held by another thread, the root cause lies in the holding thread instead of main. For example:
+
+```
+"main" prio=5 tid=1 Blocked
+  at com.example.app.Screen.render(Screen.kt:12)
+  - waiting to lock <0x0cd03f02> held by thread 21
+
+"pool-1-thread-1" prio=5 tid=21 Sleeping
+  at java.lang.Thread.sleep(Native method)
+  at com.example.app.Cache.refresh(Cache.kt:88)
+  - locked <0x0cd03f02>
+```
+
+In this case the grouping will be done using `Cache.kt: refresh()`.
+
+The thread dump also reports what kind of ANR it was, such as an input or broadcast timeout. It's usually one of:
+
+- `Input dispatching timed out`
+- `Broadcast of Intent`
+- `executing service`
+- `ContentProvider not responding`
+- `Context.startForegroundService() did not then call Service.startForeground()`
+- `App requested`
+- `No response to onStartJob`
+- `No response to onStopJob`
+- `Timed out while trying to bind`
+- `failed to complete startup`
+
+When no frame from your app's code is found, ANRs with the same frame, ANR type, and activity, service, or receiver are grouped together.
+
+Line numbers are not used for grouping, so ANRs from the same function stay in the same group even when the code moves around. If the mapping file for a build was not uploaded, the grouping will be done on obfuscated names, and those ANRs end up in a separate group. See [Upload symbols](/docs/error-monitoring/upload-symbols#android).
+
+**Below Android 11**
+
+- Each issue is titled with the file and function at the top of the stack when the ANR happened.
+
+For example, in the stack trace below:
+
+```log
+sh.measure.android.anr.AnrError: Application Not Responding for at least 5s
+    at java.util.regex.Matcher.find(Matcher.java:637)
+    at com.example.app.SearchScreen.highlight(SearchScreen.kt:57)
+    at com.example.app.SearchScreen.onQueryChanged(SearchScreen.kt:31)
+    ...
+```
+
+The grouping will be done on `Matcher.java: find()`, even though the code to fix is in `SearchScreen.kt`. Since the top frame is often from Android or Java, ANRs with different causes can end up in the same group.
+
+### Native crashes
+
+Native crashes are grouped by the signal and the first function from your app's native libraries. System functions are skipped for grouping.
+
+```log
+Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0
+    #00 pc 000000000005f2c4  /system/lib64/libc.so (memcpy+132)
+    #01 pc 000000000001a3b0  /data/app/com.example.app/lib/arm64/libimage.so (parse_header+48)
+    #02 pc 000000000001a120  /data/app/com.example.app/lib/arm64/libimage.so (decode+24)
+    ...
+```
+
+The grouping will be done on `SIGSEGV` and `libimage.so: parse_header()`.
+
+Memory errors are also grouped by their kind, so a use after free and a buffer overflow in the same function will be grouped as separate errors. Which tool caught the error, GWP-ASan or MTE, doesn't change the grouping.
+
+## iOS
+
+Errors are grouped by the signal and the first stack frame that belongs to your app. Operating-system and framework frames at the top of the stack (like `CoreFoundation` and `libobjc`) are skipped, since the code you can fix is in your own binary.
+
+- **Signal**: `SIGABRT`
+- **First frame from your app**: `-viewDidLoad` in `MainViewController.m`
+
+```log
+Exception Type: EXC_CRASH (SIGABRT)
+Exception Codes: 0x0000000000000000, 0x0000000000000000
+Crashed Thread: 0
+
+Application Specific Information:
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '-[MainViewController viewDidLoad]: unrecognized selector sent to instance 0x600000e2c0c0'
+
+First Throw Call Stack:
+(
+    0   CoreFoundation                      0x000000010a2f3b6c __exceptionPreprocess + 220
+    1   libobjc.A.dylib                     0x0000000109d8e5e1 objc_exception_throw + 48
+    2   MainViewController.m                0x000000010a2f3b6c -[MainViewController viewDidLoad] + 0
+    ...
+)
+```
+
+## Flutter
+
+Errors are grouped by the exception type and the top frame of the stack trace.
+
+- **Exception type**: `FlutterError`
+- **Top frame**: `_incrementCounter` in `main.dart`
+
+```log
+FlutterError (setState() called after dispose(): _MyHomePageState#12345(ticker: _TickerModeEnabled))
+  at _MyHomePageState._incrementCounter (package:my_app/main.dart:42:9)
+  at _MyHomePageState.build (package:my_app/main.dart:30:5)
+  at StatelessElement.build (package:flutter/src/widgets/framework.dart:4620:27)
+  ...
+```
+
+## React Native
+
+Errors are grouped by the error type, its message, and the top frame of the stack trace.
+
+- **Error type**: `TypeError`
+- **Message**: `undefined is not an object (evaluating 'user.profile.name')`
+- **Top frame**: `renderHeader` in `ProfileScreen.js`
+
+```log
+TypeError: undefined is not an object (evaluating 'user.profile.name')
+    at renderHeader (ProfileScreen.js:42:18)
+    at ProfileScreen (ProfileScreen.js:15:10)
+    ...
+```
+
+## Kotlin Multiplatform
+
+Errors follow the host platform's grouping: Android rules on the Android target and iOS rules on the iOS target, including crashes in shared Kotlin code.

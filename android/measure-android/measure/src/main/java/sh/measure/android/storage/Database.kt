@@ -1,0 +1,1313 @@
+package sh.measure.android.storage
+
+import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE
+import android.database.sqlite.SQLiteException
+import android.database.sqlite.SQLiteOpenHelper
+import android.database.sqlite.SQLiteStatement
+import kotlinx.serialization.encodeToString
+import sh.measure.android.events.EventType
+import sh.measure.android.exporter.AttachmentPacket
+import sh.measure.android.exporter.Batch
+import sh.measure.android.exporter.EventPacket
+import sh.measure.android.exporter.SpanPacket
+import sh.measure.android.logger.LogLevel
+import sh.measure.android.logger.Logger
+import sh.measure.android.serialization.jsonSerializer
+import sh.measure.android.utils.IdProvider
+import sh.measure.android.utils.TimeProvider
+import sh.measure.android.utils.iso8601Timestamp
+import java.io.Closeable
+
+/**
+ * Database abstraction for storing and retrieving SDK data including sessions, events, spans,
+ * attachments, and batches.
+ */
+internal interface Database : Closeable {
+
+    // ========================================================================================
+    // Sessions
+    // ========================================================================================
+
+    /**
+     * Inserts a new session and creates an app exit info entry.
+     *
+     * @param session The session entity to insert.
+     * @return `true` if successful, `false` otherwise.
+     */
+    fun insertSession(session: SessionEntity): Boolean
+
+    /**
+     * Deletes a session and all associated data (events, spans, attachments) via cascade.
+     *
+     * @param sessionId The session ID to delete.
+     * @return `true` if the session was deleted, `false` if not found or deletion failed.
+     */
+    fun deleteSession(sessionId: String): Boolean
+
+    /**
+     * Returns all session IDs except the specified one.
+     *
+     * @param excludeSessionId The session ID to exclude from results.
+     */
+    fun getSessionIds(excludeSessionId: String): List<String>
+
+    /**
+     * Returns session IDs of the [count] most recently created sessions.
+     */
+    fun getRecentSessionIds(count: Int): List<String>
+
+    /**
+     * Returns the session ID of the oldest session which still has events or
+     * spans, or `null` if no such session exists.
+     */
+    fun getOldestSessionWithSignals(): String?
+
+    /**
+     * Deletes all events, spans and attachments for a session while keeping the
+     * session row, so late-delivered signals can still be attributed to it.
+     *
+     * @param sessionId The session ID whose data should be deleted.
+     */
+    fun deleteSessionData(sessionId: String)
+
+    /**
+     * Updates all journey events for a given session as sampled.
+     */
+    fun sampleJourneyEvents(sessionId: String, journeyEventTypes: List<EventType>)
+
+    // ========================================================================================
+    // Events
+    // ========================================================================================
+
+    /**
+     * Inserts an event and its associated attachments in a single transaction.
+     *
+     * @param event The event entity to insert.
+     * @return `true` if successful, `false` otherwise.
+     */
+    fun insertEvent(event: EventEntity): Boolean
+
+    /**
+     * Retrieves event packets for the given event IDs.
+     *
+     * @param eventIds The event IDs to retrieve.
+     * @return List of event packets, empty if none found.
+     */
+    fun getEventPackets(eventIds: List<String>): List<EventPacket>
+
+    /**
+     * Returns all event IDs belonging to a session.
+     *
+     * @param session The session ID.
+     */
+    fun getEventsForSession(session: String): List<String>
+
+    /**
+     * Returns the most recently collected event IDs across all sessions, newest first.
+     * Used by the local monitor dump API.
+     *
+     * @param limit Maximum number of event IDs to return.
+     */
+    fun getRecentEventIds(limit: Int): List<String>
+
+    /**
+     * Returns the total count of events across all sessions.
+     */
+    fun getEventsCount(): Int
+
+    /**
+     * Returns the count of events for a specific session.
+     *
+     * @param sessionId The session ID.
+     */
+    fun getEventsCount(sessionId: String): Int
+
+    /**
+     * Deletes events not belonging to the specified session.
+     *
+     * @param excludeSessionId The session ID whose events should be preserved.
+     * @param batchSize Maximum number of events to delete.
+     * @return List of deleted event IDs.
+     */
+    fun deleteEvents(excludeSessionId: String, batchSize: Int): List<String>
+
+    /**
+     * Marks events within a time window for priority reporting (e.g., around a bug report).
+     *
+     * @param timestamp Center timestamp of the window (ISO 8601).
+     * @param durationSeconds Window extends this many seconds before and after timestamp.
+     * @param sessionId The session to mark as priority.
+     */
+    fun markTimelineForReporting(timestamp: String, durationSeconds: Int, sessionId: String)
+
+    // ========================================================================================
+    // Spans
+    // ========================================================================================
+
+    /**
+     * Inserts a span.
+     *
+     * @param spanEntity The span entity to insert.
+     * @return `true` if successful, `false` otherwise.
+     */
+    fun insertSpan(spanEntity: SpanEntity): Boolean
+
+    /**
+     * Retrieves span packets for the given span IDs.
+     *
+     * @param spanIds The span IDs to retrieve.
+     * @return List of span packets, empty if none found.
+     */
+    fun getSpanPackets(spanIds: List<String>): List<SpanPacket>
+
+    /**
+     * Returns the most recently collected span IDs across all sessions, newest first.
+     * Used by the local monitor dump API.
+     *
+     * @param limit Maximum number of span IDs to return.
+     */
+    fun getRecentSpanIds(limit: Int): List<String>
+
+    /**
+     * Returns the total count of spans across all sessions.
+     */
+    fun getSpansCount(): Int
+
+    /**
+     * Returns the count of spans for a specific session.
+     *
+     * @param sessionId The session ID.
+     */
+    fun getSpansCount(sessionId: String): Int
+
+    /**
+     * Deletes spans not belonging to the specified session.
+     *
+     * @param excludeSessionId The session ID whose spans should be preserved.
+     * @param batchSize Maximum number of spans to delete.
+     * @return List of deleted span IDs.
+     */
+    fun deleteSpans(excludeSessionId: String, batchSize: Int): List<String>
+
+    // ========================================================================================
+    // Bulk Signal Operations
+    // ========================================================================================
+
+    /**
+     * Inserts multiple events and spans in a single transaction.
+     *
+     * @param eventEntities The events to insert.
+     * @param spanEntities The spans to insert.
+     * @return `true` if all inserts succeeded, `false` if any failed (transaction rolled back).
+     */
+    fun insertSignals(eventEntities: List<EventEntity>, spanEntities: List<SpanEntity>): Boolean
+
+    // ========================================================================================
+    // Attachments
+    // ========================================================================================
+
+    /**
+     * Returns attachment IDs for the given event IDs.
+     *
+     * @param events The event IDs to query.
+     */
+    fun getAttachmentsForEvents(events: List<String>): List<String>
+
+    /**
+     * Returns non-profile attachments ready for upload (have a signed URL). Profiles are excluded
+     * because they are uploaded by their own WorkManager worker; see [getProfileAttachmentsToUpload].
+     *
+     * @param maxCount Maximum number of attachments to return.
+     */
+    fun getAttachmentsToUpload(maxCount: Int): List<AttachmentPacket>
+
+    /**
+     * Returns profile attachments ready for upload (have a signed URL). Counterpart to
+     * [getAttachmentsToUpload]; the exporter drains these, handing each to the WorkManager-based
+     * profile upload subsystem and then deleting the row.
+     *
+     * @param maxCount Maximum number of attachments to return.
+     */
+    fun getProfileAttachmentsToUpload(maxCount: Int): List<AttachmentPacket>
+
+
+    /**
+     * Deletes a single attachment.
+     *
+     * @param attachmentId The attachment ID to delete.
+     * @return `true` if deleted, `false` if not found or deletion failed.
+     */
+    fun deleteAttachment(attachmentId: String): Boolean
+
+    /**
+     * Deletes multiple attachments.
+     *
+     * @param attachmentIds The attachment IDs to delete.
+     */
+    fun deleteAttachments(attachmentIds: List<String>)
+
+    /**
+     * Returns IDs of attachments whose upload URLs have expired.
+     *
+     * @param currentTime Current time in ISO 8601 format.
+     * @param batchSize Maximum number of attachment IDs to return.
+     */
+    fun getExpiredAttachments(currentTime: String, batchSize: Int): List<String>
+
+    // ========================================================================================
+    // Batching
+    // ========================================================================================
+
+    /**
+     * Inserts a batch record linking events and spans for export.
+     *
+     * @param batchEntity The batch entity containing event and span IDs.
+     * @return `true` if successful, `false` otherwise.
+     */
+    fun insertBatch(batchEntity: BatchEntity): Boolean
+
+    /**
+     * Deletes a batch and its associated events and spans.
+     *
+     * @param batchId The batch ID to delete.
+     * @param eventIds The event IDs in the batch.
+     * @param spanIds The span IDs in the batch.
+     */
+    fun deleteBatch(batchId: String, eventIds: List<String>, spanIds: List<String>)
+
+    /**
+     * Creates batches from sessions that have unbatched signals ready for export.
+     * Groups events and spans into batches respecting size limits.
+     *
+     * @param idProvider Provider for generating batch IDs.
+     * @param timeProvider Provider for timestamps.
+     * @param maxBatchSize Maximum signals (events + spans) per batch.
+     * @param insertionBatchSize Threshold for flushing to database during batch creation.
+     * @return Number of batches created.
+     */
+    fun batchSessions(
+        idProvider: IdProvider,
+        timeProvider: TimeProvider,
+        maxBatchSize: Int,
+        insertionBatchSize: Int,
+    ): Int
+
+    /**
+     * Returns all existing batches.
+     */
+    fun getBatchIds(): List<String>
+
+    /**
+     * Returns a batch with given id.
+     *
+     * @param batchId The batch ID.
+     */
+    fun getBatch(batchId: String): Batch
+
+    // ========================================================================================
+    // App Exit Tracking
+    // ========================================================================================
+
+    /**
+     * Returns session data for app exit attribution based on process ID.
+     * Sessions already marked by [markSessionsAppExitTracked] are ignored.
+     * If multiple sessions share the same PID, returns the most recent one.
+     *
+     * @param pid The process ID to look up.
+     * @return Session data if found, `null` otherwise.
+     */
+    fun getSessionForAppExit(pid: Int): SessionRecord?
+
+    /**
+     * Returns the session that was active at the given time, based on session
+     * start times.
+     *
+     * @param timeMs Time in milliseconds since epoch.
+     * @return Session data if a session started at or before [timeMs], `null` otherwise.
+     */
+    fun getSessionForTime(timeMs: Long): SessionRecord?
+
+    /**
+     * Records that an ANR occurred in the given session, for attributing
+     * late-delivered ANR profiles. Keeps the latest ANR time if called
+     * multiple times for a session.
+     *
+     * @param sessionId The session the ANR occurred in.
+     * @param anrTimeMs The ANR time in milliseconds since epoch.
+     */
+    fun setSessionAnrTime(sessionId: String, anrTimeMs: Long)
+
+    /**
+     * Returns the most recent session that had an ANR at or before [timeMs] and
+     * within [maxGapMs] of it. Used to attribute an ANR profile back to the
+     * session where the ANR happened, even after a relaunch. The gap bounds the
+     * lookup so a profile is never attributed to a stale, unrelated ANR.
+     *
+     * @param timeMs The profile's capture time in milliseconds since epoch.
+     * @param maxGapMs The maximum allowed gap between the ANR and [timeMs].
+     * @return Session data if a matching ANR session is found, `null` otherwise.
+     */
+    fun getSessionForAnr(timeMs: Long, maxGapMs: Long): SessionRecord?
+
+    /**
+     * Marks all sessions except the provided [excludeSessionId] as having had
+     * their app exit tracked, hiding them from [getSessionForAppExit] so an
+     * app exit is never reported twice.
+     *
+     * @param excludeSessionId The session ID to exclude from marking.
+     */
+    fun markSessionsAppExitTracked(excludeSessionId: String)
+}
+
+/**
+ * SQLite implementation of the Database interface.
+ *
+ * Uses WAL mode for improved concurrent read/write performance and enables foreign key
+ * constraints for referential integrity.
+ */
+internal class DatabaseImpl(
+    context: Context,
+    private val logger: Logger,
+) : SQLiteOpenHelper(context, DbConstants.DATABASE_NAME, null, DbConstants.DATABASE_VERSION),
+    Database {
+
+    override fun onCreate(db: SQLiteDatabase) {
+        try {
+            db.execSQL(Sql.CREATE_SESSIONS_TABLE)
+            db.execSQL(Sql.CREATE_EVENTS_TABLE)
+            db.execSQL(Sql.CREATE_ATTACHMENTS_V1_TABLE)
+            db.execSQL(Sql.CREATE_BATCHES_TABLE)
+            db.execSQL(Sql.CREATE_EVENTS_BATCH_TABLE)
+            db.execSQL(Sql.CREATE_SPANS_TABLE)
+            db.execSQL(Sql.CREATE_SPANS_BATCH_TABLE)
+            db.execSQL(Sql.CREATE_EVENTS_TIMESTAMP_INDEX)
+            db.execSQL(Sql.CREATE_EVENTS_SESSION_ID_INDEX)
+            db.execSQL(Sql.CREATE_EVENTS_BATCH_EVENT_ID_INDEX)
+            db.execSQL(Sql.CREATE_SESSIONS_CREATED_AT_INDEX)
+            db.execSQL(Sql.CREATE_SPANS_SESSION_SAMPLED_INDEX)
+            db.execSQL(Sql.CREATE_SPANS_BATCH_SPAN_ID_INDEX)
+            db.execSQL(Sql.CREATE_SESSIONS_PID_INDEX)
+        } catch (e: SQLiteException) {
+            logger.log(LogLevel.Debug, "Failed to create database", e)
+        }
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        DbMigrations.apply(logger, db, oldVersion, newVersion)
+    }
+
+    override fun onConfigure(db: SQLiteDatabase) {
+        setWriteAheadLoggingEnabled(true)
+        db.setForeignKeyConstraintsEnabled(true)
+        db.execSQL("PRAGMA synchronous = NORMAL")
+    }
+
+    // ========================================================================================
+    // Sessions
+    // ========================================================================================
+
+    @SuppressLint("UseKtx")
+    override fun insertSession(session: SessionEntity): Boolean {
+        try {
+            val sessionValues = ContentValues().apply {
+                put(SessionsTable.COL_SESSION_ID, session.sessionId)
+                put(SessionsTable.COL_PID, session.pid)
+                put(SessionsTable.COL_CREATED_AT, session.createdAt)
+                put(SessionsTable.COL_PRIORITY_SESSION, session.prioritySession)
+                put(SessionsTable.COL_CRASHED, false)
+                put(SessionsTable.COL_TRACK_JOURNEY, session.trackJourney)
+                put(SessionsTable.COL_APP_VERSION, session.appVersion)
+                put(SessionsTable.COL_APP_BUILD, session.appBuild)
+            }
+            val sessionsResult =
+                writableDatabase.insert(SessionsTable.TABLE_NAME, null, sessionValues)
+            if (sessionsResult == -1L) {
+                logger.log(LogLevel.Debug, "Failed to insert session(${session.sessionId})")
+                return false
+            }
+            return true
+        } catch (e: Exception) {
+            logger.log(LogLevel.Debug, "Failed to insert session(${session.sessionId})", e)
+            return false
+        }
+    }
+
+    override fun deleteSession(sessionId: String): Boolean {
+        val result = writableDatabase.delete(
+            SessionsTable.TABLE_NAME,
+            "${SessionsTable.COL_SESSION_ID} = ?",
+            arrayOf(sessionId),
+        )
+        if (result == 0) {
+            logger.log(LogLevel.Debug, "Failed to delete session")
+        }
+        return result != 0
+    }
+
+    override fun getSessionIds(excludeSessionId: String): List<String> {
+        val sessionIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getSessionIds, arrayOf(excludeSessionId))
+            .use {
+                val sessionIdIndex = it.getColumnIndex(SessionsTable.COL_SESSION_ID)
+                while (it.moveToNext()) {
+                    sessionIds.add(it.getString(sessionIdIndex))
+                }
+            }
+        return sessionIds
+    }
+
+    override fun getRecentSessionIds(count: Int): List<String> {
+        val sessionIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getRecentSessionIds, arrayOf(count.toString())).use {
+            val sessionIdIndex = it.getColumnIndex(SessionsTable.COL_SESSION_ID)
+            while (it.moveToNext()) {
+                sessionIds.add(it.getString(sessionIdIndex))
+            }
+        }
+        return sessionIds
+    }
+
+    override fun getOldestSessionWithSignals(): String? {
+        val sessionId: String
+        readableDatabase.rawQuery(Sql.getOldestSessionWithSignals, null).use {
+            if (it.count == 0) {
+                return null
+            }
+            it.moveToFirst()
+            val sessionIdIndex = it.getColumnIndex(SessionsTable.COL_SESSION_ID)
+            sessionId = it.getString(sessionIdIndex)
+        }
+        return sessionId
+    }
+
+    override fun deleteSessionData(sessionId: String) {
+        writableDatabase.beginTransaction()
+        try {
+            writableDatabase.delete(
+                EventTable.TABLE_NAME,
+                "${EventTable.COL_SESSION_ID} = ?",
+                arrayOf(sessionId),
+            )
+            writableDatabase.delete(
+                SpansTable.TABLE_NAME,
+                "${SpansTable.COL_SESSION_ID} = ?",
+                arrayOf(sessionId),
+            )
+            writableDatabase.delete(
+                AttachmentV1Table.TABLE_NAME,
+                "${AttachmentV1Table.COL_SESSION_ID} = ?",
+                arrayOf(sessionId),
+            )
+            writableDatabase.setTransactionSuccessful()
+        } catch (e: Exception) {
+            logger.log(LogLevel.Debug, "Failed to delete data for session($sessionId)", e)
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
+    override fun sampleJourneyEvents(sessionId: String, journeyEventTypes: List<EventType>) {
+        if (journeyEventTypes.isEmpty()) return
+
+        val placeholders = journeyEventTypes.joinToString(",") { "?" }
+        val args = arrayOf(sessionId) + journeyEventTypes.map { it.value }.toTypedArray()
+
+        writableDatabase.update(
+            EventTable.TABLE_NAME,
+            ContentValues().apply {
+                put(EventTable.COL_SAMPLED, true)
+            },
+            "${EventTable.COL_SESSION_ID} = ? AND ${EventTable.COL_TYPE} IN ($placeholders)",
+            args,
+        )
+    }
+
+    // ========================================================================================
+    // Events
+    // ========================================================================================
+
+    // Returns false (via insertSignals' rollback) when the event's session row does not exist yet:
+    // an exception/ANR can be recorded on the main thread before the session is written in background.
+    override fun insertEvent(event: EventEntity): Boolean = insertSignals(listOf(event), emptyList())
+
+    override fun getEventPackets(eventIds: List<String>): List<EventPacket> {
+        if (eventIds.isEmpty()) {
+            return emptyList()
+        }
+        readableDatabase.rawQuery(Sql.getEventsForIds(eventIds.size), eventIds.toTypedArray()).use {
+            val eventPackets = mutableListOf<EventPacket>()
+            val eventIdIndex = it.getColumnIndex(EventTable.COL_ID)
+            val sessionIdIndex = it.getColumnIndex(EventTable.COL_SESSION_ID)
+            val timestampIndex = it.getColumnIndex(EventTable.COL_TIMESTAMP)
+            val userTriggeredIndex = it.getColumnIndex(EventTable.COL_USER_TRIGGERED)
+            val typeIndex = it.getColumnIndex(EventTable.COL_TYPE)
+            val serializedDataIndex = it.getColumnIndex(EventTable.COL_DATA_SERIALIZED)
+            val serializedDataFilePathIndex = it.getColumnIndex(EventTable.COL_DATA_FILE_PATH)
+            val attachmentsIndex = it.getColumnIndex(EventTable.COL_ATTACHMENTS)
+            val serializedAttributesIndex = it.getColumnIndex(EventTable.COL_ATTRIBUTES)
+            val serializedUserDefinedAttributesIndex =
+                it.getColumnIndex(EventTable.COL_USER_DEFINED_ATTRIBUTES)
+            while (it.moveToNext()) {
+                val eventId = it.getString(eventIdIndex)
+                val sessionId = it.getString(sessionIdIndex)
+                val timestamp = it.getString(timestampIndex)
+                val userTriggered = it.getInt(userTriggeredIndex) == 1
+                val type = it.getString(typeIndex)
+                val serializedData = it.getString(serializedDataIndex)
+                val serializedDataFilePath = it.getString(serializedDataFilePathIndex)
+                val attachments = it.getString(attachmentsIndex)
+                val serializedAttributes = it.getString(serializedAttributesIndex)
+                val serializedUserDefinedAttributes =
+                    it.getString(serializedUserDefinedAttributesIndex)
+                val eventType = EventType.fromValue(type)
+                    ?: throw IllegalArgumentException("Unknown event type: $type")
+                eventPackets.add(
+                    EventPacket(
+                        eventId,
+                        sessionId,
+                        timestamp,
+                        eventType,
+                        userTriggered,
+                        serializedData,
+                        serializedDataFilePath,
+                        attachments,
+                        serializedAttributes,
+                        serializedUserDefinedAttributes,
+                    ),
+                )
+            }
+            return eventPackets
+        }
+    }
+
+    override fun getEventsForSession(session: String): List<String> {
+        val eventIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getEventsForSession, arrayOf(session)).use {
+            val eventIdIndex = it.getColumnIndex(EventTable.COL_ID)
+            while (it.moveToNext()) {
+                eventIds.add(it.getString(eventIdIndex))
+            }
+        }
+        return eventIds
+    }
+
+    override fun getRecentEventIds(limit: Int): List<String> {
+        val eventIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getRecentEventIds, arrayOf(limit.toString())).use {
+            val eventIdIndex = it.getColumnIndex(EventTable.COL_ID)
+            while (it.moveToNext()) {
+                eventIds.add(it.getString(eventIdIndex))
+            }
+        }
+        return eventIds
+    }
+
+    override fun getEventsCount(): Int {
+        val count: Int
+        readableDatabase.rawQuery(Sql.getEventsCount, null).use {
+            it.moveToFirst()
+            val countIndex = it.getColumnIndex("count")
+            count = it.getInt(countIndex)
+        }
+        return count
+    }
+
+    override fun getEventsCount(sessionId: String): Int {
+        val count = readableDatabase.rawQuery(Sql.getEventsCountForSession, arrayOf(sessionId)).use {
+            if (it.count == 0) {
+                return 0
+            }
+            it.moveToFirst()
+            val countIndex = it.getColumnIndex("count")
+            it.getInt(countIndex)
+        }
+        return count
+    }
+
+    override fun deleteEvents(excludeSessionId: String, batchSize: Int): List<String> {
+        val eventIds = mutableListOf<String>()
+
+        readableDatabase.rawQuery(Sql.getEventsForDeletion, arrayOf(excludeSessionId, batchSize.toString())).use {
+            val idIndex = it.getColumnIndex(EventTable.COL_ID)
+            while (it.moveToNext()) {
+                eventIds.add(it.getString(idIndex))
+            }
+        }
+
+        if (eventIds.isEmpty()) {
+            return emptyList()
+        }
+
+        val placeholders = eventIds.joinToString(",") { "?" }
+        val deletedCount = writableDatabase.delete(
+            EventTable.TABLE_NAME,
+            "${EventTable.COL_ID} IN ($placeholders)",
+            eventIds.toTypedArray(),
+        )
+
+        return if (deletedCount > 0) eventIds else emptyList()
+    }
+
+    @SuppressLint("UseKtx")
+    override fun markTimelineForReporting(
+        timestamp: String,
+        durationSeconds: Int,
+        sessionId: String,
+    ) {
+        writableDatabase.beginTransaction()
+        try {
+            writableDatabase
+                .compileStatement(Sql.markTimelineForReporting)
+                .use { statement ->
+                    statement.bindString(1, timestamp)
+                    statement.bindString(2, "-$durationSeconds seconds")
+                    statement.bindString(3, timestamp)
+                    val eventRowsUpdated = statement.executeUpdateDelete()
+                    logger.log(
+                        LogLevel.Debug,
+                        "Database: Marked $eventRowsUpdated timeline events for reporting",
+                    )
+                }
+
+            writableDatabase
+                .compileStatement(Sql.markSessionAsPriority)
+                .use { statement ->
+                    statement.bindString(1, sessionId)
+                    val sessionsUpdated = statement.executeUpdateDelete()
+                    if (sessionsUpdated > 0) {
+                        logger.log(
+                            LogLevel.Debug,
+                            "Database: Marked session $sessionId as priority",
+                        )
+                    }
+                }
+
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
+    // ========================================================================================
+    // Spans
+    // ========================================================================================
+
+    override fun insertSpan(spanEntity: SpanEntity): Boolean {
+        val values = ContentValues().apply {
+            put(SpansTable.COL_NAME, spanEntity.name)
+            put(SpansTable.COL_SESSION_ID, spanEntity.sessionId)
+            put(SpansTable.COL_SPAN_ID, spanEntity.spanId)
+            put(SpansTable.COL_TRACE_ID, spanEntity.traceId)
+            put(SpansTable.COL_PARENT_ID, spanEntity.parentId)
+            put(SpansTable.COL_START_TIME, spanEntity.startTime)
+            put(SpansTable.COL_END_TIME, spanEntity.endTime)
+            put(SpansTable.COL_DURATION, spanEntity.duration)
+            put(SpansTable.COL_SERIALIZED_ATTRS, spanEntity.serializedAttributes)
+            put(SpansTable.COL_SERIALIZED_USER_DEFINED_ATTRS, spanEntity.serializedUserDefinedAttrs)
+            put(SpansTable.COL_SERIALIZED_SPAN_EVENTS, spanEntity.serializedCheckpoints)
+            put(SpansTable.COL_SAMPLED, spanEntity.sampled)
+            put(SpansTable.COL_STATUS, spanEntity.status.value)
+        }
+        val result = writableDatabase.insert(
+            SpansTable.TABLE_NAME,
+            null,
+            values,
+        )
+        return result != -1L
+    }
+
+    override fun getSpanPackets(spanIds: List<String>): List<SpanPacket> {
+        if (spanIds.isEmpty()) {
+            return emptyList()
+        }
+        readableDatabase.rawQuery(Sql.getSpansForIds(spanIds.size), spanIds.toTypedArray()).use {
+            val spanPackets = mutableListOf<SpanPacket>()
+            val nameIndex = it.getColumnIndex(SpansTable.COL_NAME)
+            val sessionIdIndex = it.getColumnIndex(SpansTable.COL_SESSION_ID)
+            val spanIdIndex = it.getColumnIndex(SpansTable.COL_SPAN_ID)
+            val traceIdIndex = it.getColumnIndex(SpansTable.COL_TRACE_ID)
+            val parentIdIndex = it.getColumnIndex(SpansTable.COL_PARENT_ID)
+            val startTimeIndex = it.getColumnIndex(SpansTable.COL_START_TIME)
+            val endTimeIndex = it.getColumnIndex(SpansTable.COL_END_TIME)
+            val durationIndex = it.getColumnIndex(SpansTable.COL_DURATION)
+            val statusIndex = it.getColumnIndex(SpansTable.COL_STATUS)
+            val serializedAttrsIndex = it.getColumnIndex(SpansTable.COL_SERIALIZED_ATTRS)
+            val serializedUserDefAttrsIndex =
+                it.getColumnIndex(SpansTable.COL_SERIALIZED_USER_DEFINED_ATTRS)
+            val serializedCheckpointsIndex =
+                it.getColumnIndex(SpansTable.COL_SERIALIZED_SPAN_EVENTS)
+            while (it.moveToNext()) {
+                val name = it.getString(nameIndex)
+                val sessionId = it.getString(sessionIdIndex)
+                val spanId = it.getString(spanIdIndex)
+                val traceId = it.getString(traceIdIndex)
+                val parentId = it.getString(parentIdIndex)
+                val startTime = it.getLong(startTimeIndex)
+                val endTime = it.getLong(endTimeIndex)
+                val duration = it.getLong(durationIndex)
+                val status = it.getInt(statusIndex)
+                val serializedAttrs = it.getString(serializedAttrsIndex)
+                val serializedUserDefAttrs = it.getString(serializedUserDefAttrsIndex)
+                val serializedCheckpoints = it.getString(serializedCheckpointsIndex)
+
+                spanPackets.add(
+                    SpanPacket(
+                        name = name,
+                        traceId = traceId,
+                        spanId = spanId,
+                        sessionId = sessionId,
+                        parentId = parentId,
+                        startTime = startTime.iso8601Timestamp(),
+                        endTime = endTime.iso8601Timestamp(),
+                        duration = duration,
+                        status = status,
+                        serializedAttributes = serializedAttrs,
+                        serializedUserDefAttrs = serializedUserDefAttrs,
+                        serializedCheckpoints = serializedCheckpoints,
+                    ),
+                )
+            }
+            return spanPackets
+        }
+    }
+
+    override fun getRecentSpanIds(limit: Int): List<String> {
+        val spanIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getRecentSpanIds, arrayOf(limit.toString())).use {
+            val spanIdIndex = it.getColumnIndex(SpansTable.COL_SPAN_ID)
+            while (it.moveToNext()) {
+                spanIds.add(it.getString(spanIdIndex))
+            }
+        }
+        return spanIds
+    }
+
+    override fun getSpansCount(): Int {
+        val count: Int
+        readableDatabase.rawQuery(Sql.getSpansCount, null).use {
+            it.moveToFirst()
+            val countIndex = it.getColumnIndex("count")
+            count = it.getInt(countIndex)
+        }
+        return count
+    }
+
+    override fun getSpansCount(sessionId: String): Int {
+        val count = readableDatabase.rawQuery(Sql.getSpansCountForSession, arrayOf(sessionId)).use {
+            if (it.count == 0) {
+                return 0
+            }
+            it.moveToFirst()
+            val countIndex = it.getColumnIndex("count")
+            it.getInt(countIndex)
+        }
+        return count
+    }
+
+    override fun deleteSpans(excludeSessionId: String, batchSize: Int): List<String> {
+        val spanIds = mutableListOf<String>()
+
+        readableDatabase.rawQuery(Sql.getSpansForDeletion, arrayOf(excludeSessionId, batchSize.toString())).use {
+            val idIndex = it.getColumnIndex(SpansTable.COL_SPAN_ID)
+            while (it.moveToNext()) {
+                spanIds.add(it.getString(idIndex))
+            }
+        }
+
+        if (spanIds.isEmpty()) {
+            return emptyList()
+        }
+
+        val placeholders = spanIds.joinToString(",") { "?" }
+        val deletedCount = writableDatabase.delete(
+            SpansTable.TABLE_NAME,
+            "${SpansTable.COL_SPAN_ID} IN ($placeholders)",
+            spanIds.toTypedArray(),
+        )
+
+        return if (deletedCount > 0) spanIds else emptyList()
+    }
+
+    // ========================================================================================
+    // Bulk Signal Operations
+    // ========================================================================================
+
+    override fun insertSignals(
+        eventEntities: List<EventEntity>,
+        spanEntities: List<SpanEntity>,
+    ): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        val eventStatement = db.compileStatement(Sql.INSERT_EVENT)
+        val attachmentStatement = db.compileStatement(Sql.INSERT_ATTACHMENT)
+        val spanStatement = db.compileStatement(Sql.INSERT_SPAN)
+        try {
+            eventEntities.forEach { event ->
+                eventStatement.bindEvent(event)
+                if (eventStatement.executeInsert() == -1L) {
+                    return false
+                }
+
+                event.attachmentEntities?.forEach { attachment ->
+                    attachmentStatement.bindAttachment(attachment, event)
+                    if (attachmentStatement.executeInsert() == -1L) {
+                        return false
+                    }
+                }
+            }
+
+            spanEntities.forEach { span ->
+                spanStatement.bindSpan(span)
+                if (spanStatement.executeInsert() == -1L) {
+                    return false
+                }
+            }
+
+            db.setTransactionSuccessful()
+            return true
+        } catch (e: SQLiteException) {
+            logger.log(LogLevel.Debug, "Failed to insert signals", e)
+            return false
+        } finally {
+            eventStatement.close()
+            attachmentStatement.close()
+            spanStatement.close()
+            db.endTransaction()
+        }
+    }
+
+    private fun SQLiteStatement.bindStringOrNull(index: Int, value: String?) {
+        if (value == null) bindNull(index) else bindString(index, value)
+    }
+
+    private fun SQLiteStatement.bindEvent(event: EventEntity) {
+        bindString(1, event.id)
+        bindString(2, event.type.value)
+        bindString(3, event.timestamp)
+        bindString(4, event.sessionId)
+        bindLong(5, if (event.userTriggered) 1 else 0)
+        bindStringOrNull(6, event.filePath)
+        bindStringOrNull(7, event.serializedData)
+        bindStringOrNull(8, event.serializedAttributes)
+        bindStringOrNull(9, event.serializedUserDefAttributes)
+        bindLong(10, event.attachmentsSize)
+        bindStringOrNull(11, event.serializedAttachments)
+        bindLong(12, if (event.isSampled) 1 else 0)
+    }
+
+    private fun SQLiteStatement.bindAttachment(attachment: AttachmentEntity, event: EventEntity) {
+        bindString(1, attachment.id)
+        bindString(2, event.id)
+        bindString(3, attachment.type)
+        bindString(4, event.timestamp)
+        bindString(5, event.sessionId)
+        bindString(6, attachment.path)
+        bindString(7, attachment.name)
+    }
+
+    private fun SQLiteStatement.bindSpan(span: SpanEntity) {
+        bindString(1, span.name)
+        bindString(2, span.sessionId)
+        bindString(3, span.spanId)
+        bindString(4, span.traceId)
+        bindStringOrNull(5, span.parentId)
+        bindLong(6, span.startTime)
+        bindLong(7, span.endTime)
+        bindLong(8, span.duration)
+        bindStringOrNull(9, span.serializedAttributes)
+        bindStringOrNull(10, span.serializedUserDefinedAttrs)
+        bindStringOrNull(11, span.serializedCheckpoints)
+        bindLong(12, if (span.sampled) 1 else 0)
+        bindLong(13, span.status.value.toLong())
+    }
+
+    // ========================================================================================
+    // Attachments
+    // ========================================================================================
+
+    override fun getAttachmentsForEvents(events: List<String>): List<String> {
+        val attachmentIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getAttachmentsForEvents(events.size), events.toTypedArray()).use { cursor ->
+            val attachmentIdIndex = cursor.getColumnIndex(AttachmentV1Table.COL_ID)
+            if (attachmentIdIndex == -1) {
+                return attachmentIds
+            }
+            while (cursor.moveToNext()) {
+                val attachmentId = cursor.getString(attachmentIdIndex)
+                attachmentIds.add(attachmentId)
+            }
+        }
+        return attachmentIds
+    }
+
+    override fun getAttachmentsToUpload(maxCount: Int): List<AttachmentPacket> = queryAttachmentsToUpload(Sql.getAttachmentsToUpload, arrayOf(maxCount.toString()))
+
+    override fun getProfileAttachmentsToUpload(maxCount: Int): List<AttachmentPacket> = queryAttachmentsToUpload(Sql.getProfileAttachmentsToUpload, arrayOf(maxCount.toString()))
+
+    private fun queryAttachmentsToUpload(sql: String, args: Array<String>): List<AttachmentPacket> {
+        val attachments = mutableListOf<AttachmentPacket>()
+        try {
+            readableDatabase.rawQuery(sql, args).use {
+                val idIndex = it.getColumnIndex(AttachmentV1Table.COL_ID)
+                val urlIndex = it.getColumnIndex(AttachmentV1Table.COL_UPLOAD_URL)
+                val expiresAtIndex = it.getColumnIndex(AttachmentV1Table.COL_URL_EXPIRES_AT)
+                val typeIndex = it.getColumnIndex(AttachmentV1Table.COL_TYPE)
+                val nameIndex = it.getColumnIndex(AttachmentV1Table.COL_NAME)
+                val filePathIndex = it.getColumnIndex(AttachmentV1Table.COL_FILE_PATH)
+                val sessionIdIndex = it.getColumnIndex(AttachmentV1Table.COL_SESSION_ID)
+                val headersIndex = it.getColumnIndex(AttachmentV1Table.COL_URL_HEADERS)
+                while (it.moveToNext()) {
+                    val id = it.getString(idIndex)
+                    val url = it.getString(urlIndex)
+                    val expiresAt = it.getString(expiresAtIndex)
+                    val type = it.getString(typeIndex)
+                    val name = it.getString(nameIndex)
+                    val filePath = it.getString(filePathIndex)
+                    val sessionId = it.getString(sessionIdIndex)
+                    val headers = it.getString(headersIndex)
+                    attachments.add(
+                        AttachmentPacket(
+                            id = id,
+                            url = url,
+                            type = type,
+                            expiresAt = expiresAt,
+                            name = name,
+                            path = filePath,
+                            sessionId = sessionId,
+                            headers = jsonSerializer.decodeFromString(headers),
+                        ),
+                    )
+                }
+            }
+            return attachments
+        } catch (e: Exception) {
+            logger.log(LogLevel.Debug, "Failed to get attachments to upload", e)
+            return emptyList()
+        }
+    }
+
+    override fun deleteAttachment(attachmentId: String): Boolean = try {
+        val rowsDeleted = writableDatabase.delete(
+            AttachmentV1Table.TABLE_NAME,
+            "${AttachmentV1Table.COL_ID} = ?",
+            arrayOf(attachmentId),
+        )
+        rowsDeleted > 0
+    } catch (e: Exception) {
+        logger.log(LogLevel.Error, "Failed to delete attachment $attachmentId", e)
+        false
+    }
+
+    override fun deleteAttachments(attachmentIds: List<String>) {
+        if (attachmentIds.isEmpty()) {
+            return
+        }
+        val placeholders = attachmentIds.joinToString { "?" }
+        val whereClause = "${AttachmentV1Table.COL_ID} IN ($placeholders)"
+        writableDatabase.delete(
+            AttachmentV1Table.TABLE_NAME,
+            whereClause,
+            attachmentIds.toTypedArray(),
+        )
+    }
+
+    override fun getExpiredAttachments(currentTime: String, batchSize: Int): List<String> {
+        val attachmentIds = mutableListOf<String>()
+        try {
+            readableDatabase.rawQuery(Sql.getExpiredAttachments, arrayOf(currentTime, batchSize.toString()))
+                .use { cursor ->
+                    val idIndex = cursor.getColumnIndex(AttachmentV1Table.COL_ID)
+                    while (cursor.moveToNext()) {
+                        attachmentIds.add(cursor.getString(idIndex))
+                    }
+                }
+        } catch (e: SQLiteException) {
+            logger.log(LogLevel.Error, "Failed to get expired attachments", e)
+        }
+        return attachmentIds
+    }
+
+    // ========================================================================================
+    // Batching
+    // ========================================================================================
+
+    @SuppressLint("UseKtx")
+    override fun insertBatch(batchEntity: BatchEntity): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        val spanBatchStatement = db.compileStatement(Sql.INSERT_SPANS_BATCH)
+        val eventBatchStatement = db.compileStatement(Sql.INSERT_EVENTS_BATCH)
+        try {
+            val batches = ContentValues().apply {
+                put(BatchesTable.COL_BATCH_ID, batchEntity.batchId)
+                put(BatchesTable.COL_CREATED_AT, batchEntity.createdAt)
+            }
+
+            db.insertWithOnConflict(
+                BatchesTable.TABLE_NAME,
+                null,
+                batches,
+                CONFLICT_IGNORE,
+            )
+            batchEntity.spanIds.forEach { spanId ->
+                spanBatchStatement.bindString(1, spanId)
+                spanBatchStatement.bindString(2, batchEntity.batchId)
+                spanBatchStatement.bindLong(3, batchEntity.createdAt)
+                if (spanBatchStatement.executeInsert() == -1L) {
+                    logger.log(LogLevel.Debug, "Failed to insert span($spanId)")
+                    return false
+                }
+            }
+            batchEntity.eventIds.forEach { eventId ->
+                eventBatchStatement.bindString(1, eventId)
+                eventBatchStatement.bindString(2, batchEntity.batchId)
+                eventBatchStatement.bindLong(3, batchEntity.createdAt)
+                if (eventBatchStatement.executeInsert() == -1L) {
+                    logger.log(LogLevel.Debug, "Failed to insert event($eventId)")
+                    return false
+                }
+            }
+            db.setTransactionSuccessful()
+            return true
+        } catch (e: SQLiteException) {
+            logger.log(LogLevel.Debug, "Failed to insert batch(${batchEntity.batchId})", e)
+            return false
+        } finally {
+            spanBatchStatement.close()
+            eventBatchStatement.close()
+            db.endTransaction()
+        }
+    }
+
+    @SuppressLint("UseKtx")
+    override fun deleteBatch(batchId: String, eventIds: List<String>, spanIds: List<String>) {
+        writableDatabase.beginTransaction()
+        try {
+            val batchesDeleteResult = writableDatabase.delete(
+                BatchesTable.TABLE_NAME,
+                "${BatchesTable.COL_BATCH_ID} = ?",
+                arrayOf(batchId),
+            )
+
+            var eventsDeleteResult: Int? = null
+            if (eventIds.isNotEmpty()) {
+                eventsDeleteResult = writableDatabase.delete(
+                    EventTable.TABLE_NAME,
+                    "${EventTable.COL_ID} IN (${eventIds.joinToString { "?" }})",
+                    eventIds.toTypedArray(),
+                )
+            }
+
+            var spansDeleteResult: Int? = null
+            if (spanIds.isNotEmpty()) {
+                spansDeleteResult = writableDatabase.delete(
+                    SpansTable.TABLE_NAME,
+                    "${SpansTable.COL_SPAN_ID} IN (${spanIds.joinToString { "?" }})",
+                    spanIds.toTypedArray(),
+                )
+            }
+
+            if (batchesDeleteResult == 0 || eventsDeleteResult == 0 || spansDeleteResult == 0) {
+                logger.log(LogLevel.Debug, "Failed to delete batch($batchId)")
+                return
+            }
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
+        }
+    }
+
+    override fun batchSessions(
+        idProvider: IdProvider,
+        timeProvider: TimeProvider,
+        maxBatchSize: Int,
+        insertionBatchSize: Int,
+    ): Int {
+        var batchesInserted = 0
+
+        val sessionIds = getSessionsToBatch()
+        if (sessionIds.isEmpty()) {
+            return batchesInserted
+        }
+
+        var currentBatchId = idProvider.uuid()
+        var currentBatchSize = 0
+        val eventIds = mutableSetOf<String>()
+        val spanIds = mutableSetOf<String>()
+
+        fun insertToDb() {
+            if (eventIds.isEmpty() && spanIds.isEmpty()) return
+            val inserted = insertBatch(
+                BatchEntity(
+                    batchId = currentBatchId,
+                    createdAt = timeProvider.now(),
+                    eventIds = eventIds.toSet(),
+                    spanIds = spanIds.toSet(),
+                ),
+            )
+            if (inserted) batchesInserted++
+            eventIds.clear()
+            spanIds.clear()
+        }
+
+        fun createNewBatch() {
+            insertToDb()
+            currentBatchId = idProvider.uuid()
+            currentBatchSize = 0
+        }
+
+        fun addEvent(id: String) {
+            eventIds.add(id)
+            currentBatchSize++
+            if (currentBatchSize >= maxBatchSize) {
+                createNewBatch()
+            } else if (eventIds.size + spanIds.size >= insertionBatchSize) {
+                insertToDb()
+            }
+        }
+
+        fun addSpan(id: String) {
+            spanIds.add(id)
+            currentBatchSize++
+            if (currentBatchSize >= maxBatchSize) {
+                createNewBatch()
+            } else if (eventIds.size + spanIds.size >= insertionBatchSize) {
+                insertToDb()
+            }
+        }
+
+        for (sessionId in sessionIds) {
+            forEachEvent(Sql.getSampledEvents, arrayOf(sessionId), ::addEvent)
+            forEachSpan(Sql.getSampledSpans, arrayOf(sessionId), ::addSpan)
+        }
+
+        // Insert any remaining events/spans
+        insertToDb()
+
+        return batchesInserted
+    }
+
+    private fun getSessionsToBatch(): List<String> {
+        val query = Sql.getSessionsToBatch
+        val sessionIds = mutableListOf<String>()
+        readableDatabase.rawQuery(query, null).use { cursor ->
+            val sessionIdIndex = cursor.getColumnIndex(SessionsTable.COL_SESSION_ID)
+            while (cursor.moveToNext()) {
+                sessionIds.add(cursor.getString(sessionIdIndex))
+            }
+        }
+        return sessionIds
+    }
+
+    private inline fun forEachEvent(query: String, args: Array<String>, action: (String) -> Unit) {
+        readableDatabase.rawQuery(query, args).use { cursor ->
+            val idIndex = cursor.getColumnIndex(EventTable.COL_ID)
+            while (cursor.moveToNext()) {
+                action(cursor.getString(idIndex))
+            }
+        }
+    }
+
+    private inline fun forEachSpan(query: String, args: Array<String>, action: (String) -> Unit) {
+        readableDatabase.rawQuery(query, args).use { cursor ->
+            val idIndex = cursor.getColumnIndex(SpansTable.COL_SPAN_ID)
+            while (cursor.moveToNext()) {
+                action(cursor.getString(idIndex))
+            }
+        }
+    }
+
+    override fun getBatchIds(): List<String> {
+        val batchIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getBatchIds, null).use {
+            val batchIdIndex = it.getColumnIndex(BatchesTable.COL_BATCH_ID)
+            while (it.moveToNext()) {
+                batchIds.add(it.getString(batchIdIndex))
+            }
+        }
+        return batchIds
+    }
+
+    override fun getBatch(batchId: String): Batch {
+        val eventIds = mutableListOf<String>()
+        val spanIds = mutableListOf<String>()
+        readableDatabase.rawQuery(Sql.getBatchedEventIds(1), arrayOf(batchId)).use {
+            val eventIdIndex = it.getColumnIndex(EventsBatchTable.COL_EVENT_ID)
+            while (it.moveToNext()) {
+                eventIds.add(it.getString(eventIdIndex))
+            }
+        }
+
+        readableDatabase.rawQuery(Sql.getBatchedSpanIds(1), arrayOf(batchId)).use {
+            val spanIdIndex = it.getColumnIndex(SpansBatchTable.COL_SPAN_ID)
+            while (it.moveToNext()) {
+                spanIds.add(it.getString(spanIdIndex))
+            }
+        }
+
+        return Batch(
+            batchId = batchId,
+            eventIds = eventIds,
+            spanIds = spanIds,
+        )
+    }
+
+    // ========================================================================================
+    // App Exit Tracking
+    // ========================================================================================
+
+    override fun getSessionForAppExit(pid: Int): SessionRecord? = querySessionRecord(Sql.getSessionForAppExit, arrayOf(pid.toString()))
+
+    override fun getSessionForTime(timeMs: Long): SessionRecord? = querySessionRecord(Sql.getSessionForTime, arrayOf(timeMs.toString()))
+
+    override fun getSessionForAnr(timeMs: Long, maxGapMs: Long): SessionRecord? = querySessionRecord(
+        Sql.getSessionForAnr,
+        arrayOf(timeMs.toString(), timeMs.toString(), maxGapMs.toString()),
+    )
+
+    private fun querySessionRecord(query: String, args: Array<String>): SessionRecord? {
+        readableDatabase.rawQuery(query, args).use {
+            if (!it.moveToFirst()) {
+                return null
+            }
+            val lastAnrTimeIndex = it.getColumnIndexOrThrow(SessionsTable.COL_LAST_ANR_TIME)
+            return SessionRecord(
+                id = it.getString(it.getColumnIndexOrThrow(SessionsTable.COL_SESSION_ID)),
+                createdAt = it.getLong(it.getColumnIndexOrThrow(SessionsTable.COL_CREATED_AT)),
+                appVersion = it.getString(it.getColumnIndexOrThrow(SessionsTable.COL_APP_VERSION)),
+                appBuild = it.getString(it.getColumnIndexOrThrow(SessionsTable.COL_APP_BUILD)),
+                lastAnrTime = if (it.isNull(lastAnrTimeIndex)) null else it.getLong(lastAnrTimeIndex),
+            )
+        }
+    }
+
+    override fun setSessionAnrTime(sessionId: String, anrTimeMs: Long) {
+        writableDatabase.compileStatement(Sql.setSessionAnrTime).use {
+            it.bindLong(1, anrTimeMs)
+            it.bindString(2, sessionId)
+            it.bindLong(3, anrTimeMs)
+            it.executeUpdateDelete()
+        }
+    }
+
+    override fun markSessionsAppExitTracked(excludeSessionId: String) {
+        val values = ContentValues().apply {
+            put(SessionsTable.COL_APP_EXIT_TRACKED, 1)
+        }
+        writableDatabase.update(
+            SessionsTable.TABLE_NAME,
+            values,
+            "${SessionsTable.COL_SESSION_ID} != ?",
+            arrayOf(excludeSessionId),
+        )
+    }
+
+    override fun close() {
+        writableDatabase.close()
+        super.close()
+    }
+}

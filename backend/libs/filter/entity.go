@@ -1,0 +1,531 @@
+package filter
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"backend/libs/devicememory"
+	"backend/libs/symbol"
+
+	"github.com/google/uuid"
+)
+
+// Entity is one subject a filter can be written against, such as builds,
+// events or spans.
+type Entity struct {
+	// Name is what a request specifies to filter this subject.
+	Name string
+
+	// Keys is everything this subject can be filtered by.
+	Keys []Key
+
+	// Columns says how the entity's keys read on its own table. A query
+	// against a rollup or another table binds with that table's Columns.
+	Columns *Columns
+
+	// ValueSources says where the fixed keys' value suggestions are read from.
+	// The first source that has a key answers it.
+	ValueSources []valueSource
+
+	// CustomKeySource says where the entity's user-defined attributes are
+	// read from. Every listing, lookup, value read and condition binding of a
+	// custom key goes through it, so the keys an entity lists are the keys
+	// it can bind. Nil for an entity whose keys are all fixed.
+	CustomKeySource *customKeySource
+
+	// MaxTimeBucketWidth is the widest time bucket used by any of the entity's
+	// tables. Bucketed queries may include rows from this bucket past the range
+	// end, so custom key bindings must be resolved that far past it. Zero means
+	// all tables store raw timestamps.
+	MaxTimeBucketWidth time.Duration
+}
+
+// customKeyScope is the request context a custom-key binding queries with.
+// The version lists mirror app version conditions already present in the filter.
+// A custom key binding may use it to reduce scans.
+type customKeyScope struct {
+	TeamID       uuid.UUID
+	AppID        uuid.UUID
+	From         time.Time
+	To           time.Time
+	VersionNames [][]string
+	VersionCodes [][]string
+}
+
+func FindByName(name string) (Entity, error) {
+	switch name {
+	case BuildsEntity.Name:
+		return BuildsEntity, nil
+	case SpansEntity.Name:
+		return SpansEntity, nil
+	case BugReportsEntity.Name:
+		return BugReportsEntity, nil
+	case JourneysEntity.Name:
+		return JourneysEntity, nil
+	case FunnelsEntity.Name:
+		return FunnelsEntity, nil
+	case AlertsEntity.Name:
+		return AlertsEntity, nil
+	case NetworkEntity.Name:
+		return NetworkEntity, nil
+	case SessionsEntity.Name:
+		return SessionsEntity, nil
+	case ErrorsEntity.Name:
+		return ErrorsEntity, nil
+	case ErrorGroupEventsEntity.Name:
+		return ErrorGroupEventsEntity, nil
+	case AppHealthEntity.Name:
+		return AppHealthEntity, nil
+	case MemoryEntity.Name:
+		return MemoryEntity, nil
+	case ProfilesEntity.Name:
+		return ProfilesEntity, nil
+	}
+
+	return Entity{}, fmt.Errorf("Unknown filter entity %q", name)
+}
+
+const (
+	KeyGroupError     KeyGroup = "Error"
+	KeyGroupAppHang   KeyGroup = "App Hang"
+	KeyGroupVersion   KeyGroup = "Version"
+	KeyGroupBuild     KeyGroup = "Build"
+	KeyGroupSpan      KeyGroup = "Span"
+	KeyGroupRequest   KeyGroup = "Request"
+	KeyGroupBugReport KeyGroup = "Bug Report"
+	KeyGroupSession   KeyGroup = "Session"
+	KeyGroupMemory    KeyGroup = "Memory"
+	KeyGroupProfile   KeyGroup = "Profile"
+	KeyGroupUser      KeyGroup = "User"
+	KeyGroupOS        KeyGroup = "OS"
+	KeyGroupDevice    KeyGroup = "Device"
+	KeyGroupNetwork   KeyGroup = "Network"
+	KeyGroupLocation  KeyGroup = "Location"
+	KeyGroupCustom    KeyGroup = "Custom"
+)
+
+// keyGroupOrder is the order the filter bar shows groups in.
+var keyGroupOrder = []KeyGroup{
+	KeyGroupError, KeyGroupBugReport, KeyGroupSession, KeyGroupMemory, KeyGroupProfile, KeyGroupSpan, KeyGroupRequest, KeyGroupBuild,
+	KeyGroupVersion, KeyGroupUser, KeyGroupOS, KeyGroupDevice, KeyGroupNetwork, KeyGroupLocation,
+	KeyGroupCustom, KeyGroupAppHang,
+}
+
+func ListKeyGroups(keys []Key) []KeyGroup {
+	present := make(map[KeyGroup]bool, len(keys))
+	for _, key := range keys {
+		present[key.KeyGroup] = true
+	}
+
+	keyGroups := []KeyGroup{}
+	for _, keyGroup := range keyGroupOrder {
+		if present[keyGroup] {
+			keyGroups = append(keyGroups, keyGroup)
+		}
+	}
+	return keyGroups
+}
+
+// The keys an entity can be filtered by. A key is defined once here and
+// shared by every entity that has it, so an app version is called the same
+// thing, described the same way and offers the same operators everywhere. A
+// definition says what a key is; how it maps to data is the entity's binding.
+var (
+	versionName = Key{
+		Name:        "version_name",
+		Label:       "App version",
+		Description: "The version of the app.",
+		KeyGroup:    KeyGroupVersion,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	versionCode = Key{
+		Name:                "version_code",
+		Label:               "Build number",
+		Description:         "The build number (Version Code on Android, Bundle Version on iOS).",
+		KeyGroup:            KeyGroupVersion,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	patchVersion = Key{
+		Name:        "patch_version",
+		Label:       "Patch version",
+		Description: "The version of an Over-The-Air patch.",
+		KeyGroup:    KeyGroupVersion,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn, OperatorContains,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	patchID = Key{
+		Name:        "patch_id",
+		Label:       "Patch id",
+		Description: "The id of an Over-The-Air patch.",
+		KeyGroup:    KeyGroupVersion,
+		ValueType:   ValueTypeUUID,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorIsSet, OperatorIsNotSet,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	mappingType = Key{
+		Name:                "mapping_type",
+		Label:               "Mapping type",
+		Description:         "The kind of symbol file uploaded: proguard, dSYM, ELF debug or JS bundle.",
+		KeyGroup:            KeyGroupBuild,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          mappingTypes(),
+	}
+
+	spanStatus = Key{
+		Name:                "span_status",
+		Label:               "Span status",
+		Description:         "Status of the span.",
+		KeyGroup:            KeyGroupSpan,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"unset", "ok", "error"},
+	}
+
+	httpMethod = Key{
+		Name:                "http_method",
+		Label:               "HTTP method",
+		Description:         "The HTTP method of the request.",
+		KeyGroup:            KeyGroupRequest,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"get", "post", "put", "patch", "delete"},
+	}
+
+	bugReportStatus = Key{
+		Name:                "bug_report_status",
+		Label:               "Status",
+		Description:         "Whether the bug report is open or closed.",
+		KeyGroup:            KeyGroupBugReport,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"open", "closed"},
+	}
+
+	errorType = Key{
+		Name:                "error_type",
+		Label:               "Error Type",
+		Description:         "Fatal or Non-fatal error types",
+		KeyGroup:            KeyGroupError,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues: []string{
+			ErrorTypeCrash, ErrorTypeANR,
+			ErrorTypeHandledError, ErrorTypeUnhandledError,
+			ErrorTypeAppHang,
+		},
+	}
+
+	memoryError = Key{
+		Name:                "memory_error",
+		Label:               "Memory error",
+		Description:         "Filter native Android errors caught by GWP-ASan or MTE.",
+		KeyGroup:            KeyGroupError,
+		ValueType:           ValueTypeBool,
+		Operators:           []Operator{OperatorEq},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"true", "false"},
+	}
+
+	sessionEvents = Key{
+		Name:                "session_events",
+		Label:               "Events",
+		Description:         "The kinds of events contained in the session.",
+		KeyGroup:            KeyGroupSession,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues: []string{
+			"fatal_error", "unhandled_error", "handled_error",
+			"anr", "recovered_app_hang", "killed_app_hang",
+			"bug_report", "user_interaction",
+		},
+	}
+
+	sessionCustomEvent = Key{
+		Name:        "session_custom_event",
+		Label:       "Custom event name",
+		Description: "The name of a custom event tracked in the session.",
+		KeyGroup:    KeyGroupSession,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	sessionLog = Key{
+		Name:        "session_log",
+		Label:       "Log",
+		Description: "Text of a log message.",
+		KeyGroup:    KeyGroupSession,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorContains, OperatorNotContains,
+			OperatorStartsWith, OperatorEndsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeNone,
+	}
+
+	sessionErrorText = Key{
+		Name:        "session_error_text",
+		Label:       "Error text",
+		Description: "Text from a crash, ANR or error - name, message, error code, location (source file, class or method)",
+		KeyGroup:    KeyGroupSession,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorContains, OperatorNotContains,
+			OperatorStartsWith, OperatorEndsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeNone,
+	}
+
+	sessionScreen = Key{
+		Name:        "session_screen",
+		Label:       "Screen",
+		Description: "A screen shown in the session: a screen view name, or an activity, fragment or view controller class name.",
+		KeyGroup:    KeyGroupSession,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	sessionForegroundBackground = Key{
+		Name:                "session_foreground_background",
+		Label:               "Foreground/Background",
+		Description:         "Whether the session ran in the foreground, background, or both.",
+		KeyGroup:            KeyGroupSession,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"foreground", "background"},
+	}
+
+	appState = Key{
+		Name:                "app_state",
+		Label:               "App state",
+		Description:         "Whether the app was in the foreground, running a user-perceived service, or in the background. Android only, ignored for iOS.",
+		KeyGroup:            KeyGroupMemory,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorEq},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{"foreground", "user_service", "background"},
+	}
+
+	appHangState = Key{
+		Name:                "app_hang_state",
+		Label:               "State",
+		Description:         "Whether the app was killed during the hang or recovered from it.",
+		KeyGroup:            KeyGroupAppHang,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          []string{AppHangStateKilled, AppHangStateRecovered},
+	}
+
+	profileTrigger = Key{
+		Name:                "profile_trigger",
+		Label:               "Profile trigger",
+		Description:         "The Android profiling trigger (Android 16 and above), such as an ANR or app fully drawn.",
+		KeyGroup:            KeyGroupProfile,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	deviceTotalMemory = Key{
+		Name:                "device_total_memory",
+		Label:               "Device total memory",
+		Description:         "The total memory of the device.",
+		KeyGroup:            KeyGroupDevice,
+		ValueType:           ValueTypeEnum,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeFullList,
+		EnumValues:          devicememory.Names(),
+	}
+
+	userID = Key{
+		Name:        "user_id",
+		Label:       "User ID",
+		Description: "The user id of the session.",
+		KeyGroup:    KeyGroupUser,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	bugReportDescription = Key{
+		Name:        "bug_report_description",
+		Label:       "Description",
+		Description: "The bug report description written by the reporter.",
+		KeyGroup:    KeyGroupBugReport,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorContains, OperatorNotContains,
+			OperatorStartsWith, OperatorEndsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeNone,
+	}
+
+	sessionID = Key{
+		Name:                "session_id",
+		Label:               "Session ID",
+		Description:         "The id of the session.",
+		KeyGroup:            KeyGroupSession,
+		ValueType:           ValueTypeUUID,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeNone,
+	}
+
+	osName = Key{
+		Name:                "os_name",
+		Label:               "OS name",
+		Description:         "The name of the operating system.",
+		KeyGroup:            KeyGroupOS,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	osVersion = Key{
+		Name:        "os_version",
+		Label:       "OS version",
+		Description: "The version of the operating system.",
+		KeyGroup:    KeyGroupOS,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	deviceName = Key{
+		Name:        "device_name",
+		Label:       "Device name",
+		Description: "The name of the device.",
+		KeyGroup:    KeyGroupDevice,
+		ValueType:   ValueTypeString,
+		Operators: []Operator{
+			OperatorIn, OperatorNotIn,
+			OperatorContains, OperatorStartsWith,
+		},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	deviceManufacturer = Key{
+		Name:                "device_manufacturer",
+		Label:               "Device manufacturer",
+		Description:         "The manufacturer of the device.",
+		KeyGroup:            KeyGroupDevice,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	locale = Key{
+		Name:                "locale",
+		Label:               "Locale",
+		Description:         "The device locale.",
+		KeyGroup:            KeyGroupDevice,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	networkType = Key{
+		Name:                "network_type",
+		Label:               "Network type",
+		Description:         "The kind of network connection: wifi, cellular and so on.",
+		KeyGroup:            KeyGroupNetwork,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	networkGeneration = Key{
+		Name:                "network_generation",
+		Label:               "Network generation",
+		Description:         "The cellular network generation: 2g, 3g, 4g and so on.",
+		KeyGroup:            KeyGroupNetwork,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	networkProvider = Key{
+		Name:                "network_provider",
+		Label:               "Network provider",
+		Description:         "The name of the network service provider.",
+		KeyGroup:            KeyGroupNetwork,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+
+	country = Key{
+		Name:                "country",
+		Label:               "Country",
+		Description:         "The country the device was in, as a country code.",
+		KeyGroup:            KeyGroupLocation,
+		ValueType:           ValueTypeString,
+		Operators:           []Operator{OperatorIn, OperatorNotIn},
+		ValueSuggestionMode: ValueSuggestionModeSample,
+	}
+)
+
+func mappingTypes() []string {
+	types := symbol.MappingTypes()
+	names := make([]string, len(types))
+	for i, mappingType := range types {
+		names[i] = mappingType.String()
+	}
+	return names
+}
+
+// An enum key carries its values itself, so no table is read.
+func narrowEnumValues(key Key, valueRequest ValueRequest) ValueList {
+	values := []Value{}
+	for _, text := range key.EnumValues {
+		if valueRequest.Search != "" && !strings.Contains(strings.ToLower(text), strings.ToLower(valueRequest.Search)) {
+			continue
+		}
+		values = append(values, Value{Text: text})
+	}
+
+	limit := valueRequest.effectiveLimit()
+	if len(values) > limit {
+		return ValueList{Values: values[:limit], Truncated: true}
+	}
+	return ValueList{Values: values}
+}

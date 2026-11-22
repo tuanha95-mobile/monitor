@@ -1,0 +1,218 @@
+"use client";
+
+import { Route, SlidersHorizontal } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import {
+  type ExceptionGroupCommonPath,
+  useErrorGroupCommonPathQuery,
+} from "../query/hooks";
+import BetaBadge from "./beta_badge";
+import { Button } from "./button";
+import CodeBlock from "./code_block";
+import EmptyState from "./empty_state";
+import { Skeleton } from "./skeleton";
+import { Slider } from "./slider";
+
+const demoErrorGroupCommonPath: ExceptionGroupCommonPath = {
+  sessions_analyzed: 50,
+  steps: [
+    {
+      description: "App moved to foreground",
+      thread_name: "main",
+      confidence_pct: 80.5,
+    },
+    {
+      description: "Activity resumed: sh.measure.demo.CheckoutActivity",
+      thread_name: "main",
+      confidence_pct: 80.5,
+    },
+    {
+      description:
+        "HTTP GET: https://payments.demo-provider.com/demo-user-id/payment-methods",
+      thread_name: "okhttp",
+      confidence_pct: 100,
+    },
+    {
+      description:
+        "User tapped on btn_payment_type (com.google.android.material.button.MaterialButton)",
+      thread_name: "main",
+      confidence_pct: 5.11,
+    },
+    {
+      description:
+        "User tapped on tab_select_discount (com.google.android.material.button.MaterialButton)",
+      thread_name: "main",
+      confidence_pct: 53.8,
+    },
+    {
+      description:
+        "User tapped on btn_order_summary (com.google.android.material.button.MaterialButton)",
+      thread_name: "main",
+      confidence_pct: 34.3,
+    },
+    {
+      description:
+        "User tapped on btn_pay (com.google.android.material.button.MaterialButton)",
+      thread_name: "main",
+      confidence_pct: 100,
+    },
+    {
+      description:
+        "Crash: java.lang.IllegalStateException -  Payment method must be specified",
+      thread_name: "main",
+      confidence_pct: 100,
+    },
+  ],
+};
+
+interface ErrorGroupCommonPathProps {
+  appId: string;
+  groupId: string;
+  demo?: boolean;
+}
+
+const ErrorGroupCommonPath: React.FC<ErrorGroupCommonPathProps> = ({
+  appId,
+  groupId,
+  demo = false,
+}) => {
+  // Query common path only on user request
+  const [requested, setRequested] = useState<boolean>(demo);
+  const { data: queryCommonPath, status: queryStatus } =
+    useErrorGroupCommonPathQuery(
+      demo ? "" : appId,
+      demo ? "" : groupId,
+      requested,
+    );
+
+  const [confidenceThreshold, setConfidenceThreshold] = useState<number>(80);
+
+  const commonPathStatus = demo ? "success" : requested ? queryStatus : "idle";
+  const errorGroupCommonPath = demo
+    ? demoErrorGroupCommonPath
+    : queryCommonPath;
+
+  // Filter steps based on confidence threshold
+  const filteredSteps = useMemo(() => {
+    if (!errorGroupCommonPath?.steps) {
+      return [];
+    }
+    return errorGroupCommonPath.steps.filter(
+      (step) => step.confidence_pct >= confidenceThreshold,
+    );
+  }, [errorGroupCommonPath, confidenceThreshold]);
+
+  const noCommonPath = (errorGroupCommonPath?.steps.length ?? 0) === 0;
+
+  return (
+    <div
+      data-testid="exception-detail-common-path"
+      className="flex flex-col font-body w-full"
+    >
+      <p className="text-3xl">
+        Common Path <BetaBadge />
+      </p>
+      {commonPathStatus === "idle" && (
+        <div className="mt-4 flex flex-col md:flex-row md:items-center gap-4 w-full border border-dashed border-border rounded-sm p-6">
+          <Route className="size-6 shrink-0 text-muted-foreground" />
+          <div className="flex flex-col gap-1">
+            <p className="text-sm">
+              Analyze the sequence of events that most sessions share before
+              this error occurs.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Searches through the latest sessions with this error, which can
+              take a few seconds.
+            </p>
+          </div>
+          <div className="grow" />
+          <Button
+            variant="outline"
+            className="w-fit"
+            onClick={() => setRequested(true)}
+          >
+            Analyze Common Path
+          </Button>
+        </div>
+      )}
+      {commonPathStatus === "pending" && (
+        <div className="py-4 flex flex-col gap-3 w-full">
+          <Skeleton className="h-4 w-48" />
+          <Skeleton className="h-96 w-full rounded-sm" />
+        </div>
+      )}
+      {commonPathStatus === "error" && (
+        <p className="font-display py-4">
+          Error fetching common path, please refresh page to try again
+        </p>
+      )}
+      {commonPathStatus === "success" && noCommonPath && (
+        <EmptyState
+          icon={Route}
+          title="No common path found"
+          description="No sessions with this error have enough events to analyze"
+          className="mt-4 h-48"
+        />
+      )}
+      {commonPathStatus === "success" && !noCommonPath && (
+        <div className="flex flex-col w-full">
+          {/* Confidence Filter */}
+          <div className="py-3" />
+          <div className="flex flex-col gap-6">
+            <div className="flex items-center text-muted-foreground justify-between">
+              <label className="text-sm">
+                Showing events that are common in at least:{" "}
+                <span className="font-semibold">{confidenceThreshold}%</span> of
+                analyzed sessions
+              </label>
+              <span className="text-xs">
+                Analyzed from latest {errorGroupCommonPath?.sessions_analyzed}{" "}
+                sessions | {filteredSteps.length} of{" "}
+                {errorGroupCommonPath?.steps.length} steps
+              </span>
+            </div>
+            <Slider
+              value={[confidenceThreshold]}
+              onValueChange={(value) => setConfidenceThreshold(value[0])}
+              min={1}
+              max={100}
+              step={1}
+              className="w-full"
+            />
+          </div>
+
+          <div className="py-4" />
+          {filteredSteps.length === 0 ? (
+            <EmptyState
+              icon={SlidersHorizontal}
+              title={`No events are common in at least ${confidenceThreshold}% of analyzed sessions`}
+              description="Lower the threshold to see less common events"
+              className="h-96"
+            />
+          ) : (
+            <div className="w-full border border-dashed border-border rounded-sm h-96 overflow-y-auto p-4">
+              <ol className="list-decimal list-outside space-y-6 ml-6 marker:text-muted-foreground">
+                {filteredSteps.map((stepInfo, index) => (
+                  <li key={index}>
+                    <CodeBlock
+                      code={stepInfo.description}
+                      language="java"
+                      className="font-code text-sm [&_pre]:px-2 [&_pre]:py-2 [&_pre]:overflow-x-auto"
+                    />
+                    {/* pl-2 lines the caption up with the code's px-2 inset. */}
+                    <p className="text-xs pl-2 text-muted-foreground">
+                      Thread: {stepInfo.thread_name} | Occurs in{" "}
+                      {stepInfo.confidence_pct}% of analyzed sessions
+                    </p>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default ErrorGroupCommonPath;

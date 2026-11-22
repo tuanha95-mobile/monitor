@@ -1,0 +1,463 @@
+package sh.measure.android
+
+import android.app.Application
+import sh.measure.android.anr.AnrCollector
+import sh.measure.android.appexit.AppExitCollector
+import sh.measure.android.appexit.AppExitProvider
+import sh.measure.android.appexit.AppExitProviderImpl
+import sh.measure.android.applaunch.AppLaunchCollector
+import sh.measure.android.applaunch.LaunchTracker
+import sh.measure.android.attributes.AppAttributeProcessor
+import sh.measure.android.attributes.AttributeProcessor
+import sh.measure.android.attributes.DeviceAttributeProcessor
+import sh.measure.android.attributes.InstallationIdAttributeProcessor
+import sh.measure.android.attributes.NetworkStateAttributeProcessor
+import sh.measure.android.attributes.PatchAttributeProcessor
+import sh.measure.android.attributes.PowerStateAttributeProcessor
+import sh.measure.android.attributes.UserAttributeProcessor
+import sh.measure.android.bugreport.AccelerometerShakeDetector
+import sh.measure.android.bugreport.BugReportCollector
+import sh.measure.android.bugreport.BugReportCollectorImpl
+import sh.measure.android.bugreport.ShakeBugReportCollector
+import sh.measure.android.config.Config
+import sh.measure.android.config.ConfigLoader
+import sh.measure.android.config.ConfigProvider
+import sh.measure.android.config.ConfigProviderImpl
+import sh.measure.android.config.MeasureConfig
+import sh.measure.android.events.CustomEventCollector
+import sh.measure.android.events.InternalSignalCollector
+import sh.measure.android.events.SignalProcessor
+import sh.measure.android.events.SignalProcessorImpl
+import sh.measure.android.events.UserTriggeredEventCollector
+import sh.measure.android.events.UserTriggeredEventCollectorImpl
+import sh.measure.android.exceptions.UnhandledExceptionCollector
+import sh.measure.android.executors.ExecutorServiceRegistry
+import sh.measure.android.executors.ExecutorServiceRegistryImpl
+import sh.measure.android.exporter.Exporter
+import sh.measure.android.exporter.ExporterImpl
+import sh.measure.android.gestures.GestureCollector
+import sh.measure.android.httpurl.HttpUrlConnectionEventCollector
+import sh.measure.android.httpurl.HttpUrlConnectionEventCollectorImpl
+import sh.measure.android.layoutinspector.LayoutSnapshotCollector
+import sh.measure.android.layoutinspector.LayoutSnapshotCollectorImpl
+import sh.measure.android.layoutinspector.LayoutSnapshotThrottler
+import sh.measure.android.lifecycle.AppLifecycleCollector
+import sh.measure.android.lifecycle.AppLifecycleManager
+import sh.measure.android.lifecycle.DefaultActivityLifecycleCollector
+import sh.measure.android.logger.AndroidLogger
+import sh.measure.android.logger.Logger
+import sh.measure.android.logs.LogEventCollector
+import sh.measure.android.nativecrash.NativeCrashFactory
+import sh.measure.android.networkchange.InitialNetworkStateProvider
+import sh.measure.android.networkchange.InitialNetworkStateProviderImpl
+import sh.measure.android.networkchange.NetworkChangesCollector
+import sh.measure.android.networkchange.NetworkStateProvider
+import sh.measure.android.networkchange.NetworkStateProviderImpl
+import sh.measure.android.okhttp.HttpEventCollector
+import sh.measure.android.okhttp.OkHttpEventCollectorImpl
+import sh.measure.android.performance.ComponentCallbacksCollector
+import sh.measure.android.performance.CpuUsageCollector
+import sh.measure.android.performance.DefaultMemoryReader
+import sh.measure.android.performance.MemoryReader
+import sh.measure.android.performance.MemoryUsageCollector
+import sh.measure.android.profiling.ProfileCollector
+import sh.measure.android.screenshot.ScreenshotCollector
+import sh.measure.android.screenshot.ScreenshotCollectorImpl
+import sh.measure.android.storage.DataCleanupService
+import sh.measure.android.storage.DataCleanupServiceImpl
+import sh.measure.android.storage.Database
+import sh.measure.android.storage.DatabaseImpl
+import sh.measure.android.storage.FileStorage
+import sh.measure.android.storage.FileStorageImpl
+import sh.measure.android.storage.PeriodicSignalStoreScheduler
+import sh.measure.android.storage.PrefsStorage
+import sh.measure.android.storage.PrefsStorageImpl
+import sh.measure.android.storage.SignalStore
+import sh.measure.android.storage.SignalStoreImpl
+import sh.measure.android.tracing.MsrSpanProcessor
+import sh.measure.android.tracing.MsrTracer
+import sh.measure.android.tracing.SpanCollector
+import sh.measure.android.tracing.SpanProcessor
+import sh.measure.android.tracing.Tracer
+import sh.measure.android.utils.AndroidSystemClock
+import sh.measure.android.utils.AndroidTimeProvider
+import sh.measure.android.utils.DebugProvider
+import sh.measure.android.utils.DefaultDebugProvider
+import sh.measure.android.utils.DefaultRuntimeProvider
+import sh.measure.android.utils.DefaultSleeper
+import sh.measure.android.utils.IdProvider
+import sh.measure.android.utils.IdProviderImpl
+import sh.measure.android.utils.LocaleProvider
+import sh.measure.android.utils.LocaleProviderImpl
+import sh.measure.android.utils.LowMemoryCheck
+import sh.measure.android.utils.ManifestMetadata
+import sh.measure.android.utils.ManifestReader
+import sh.measure.android.utils.ManifestReaderImpl
+import sh.measure.android.utils.OsSysConfProvider
+import sh.measure.android.utils.OsSysConfProviderImpl
+import sh.measure.android.utils.OsVersionProvider
+import sh.measure.android.utils.OsVersionProviderImpl
+import sh.measure.android.utils.PackageInfoProvider
+import sh.measure.android.utils.PackageInfoProviderImpl
+import sh.measure.android.utils.ProcProvider
+import sh.measure.android.utils.ProcProviderImpl
+import sh.measure.android.utils.ProcessInfoProvider
+import sh.measure.android.utils.ProcessInfoProviderImpl
+import sh.measure.android.utils.Randomizer
+import sh.measure.android.utils.RandomizerImpl
+import sh.measure.android.utils.ResumedActivityProvider
+import sh.measure.android.utils.ResumedActivityProviderImpl
+import sh.measure.android.utils.RuntimeProvider
+import sh.measure.android.utils.Sampler
+import sh.measure.android.utils.SamplerImpl
+import sh.measure.android.utils.SystemServiceProvider
+import sh.measure.android.utils.SystemServiceProviderImpl
+import sh.measure.android.utils.TimeProvider
+
+internal class TestMeasureInitializer(
+    private val application: Application,
+    inputConfig: MeasureConfig,
+    override val configProvider: ConfigProvider = ConfigProviderImpl(
+        defaultConfig = Config(
+            enableLogging = inputConfig.enableLogging,
+            autoStart = inputConfig.autoStart,
+            maxDiskUsageInMb = inputConfig.maxDiskUsageInMb,
+            trackActivityIntentData = inputConfig.trackActivityIntentData,
+            enableFullCollectionMode = inputConfig.enableFullCollectionMode,
+            requestHeadersProvider = inputConfig.requestHeadersProvider,
+        ),
+    ),
+    override val logger: Logger = AndroidLogger(configProvider.enableLogging),
+    override val timeProvider: TimeProvider = AndroidTimeProvider(AndroidSystemClock()),
+    override val executorServiceRegistry: ExecutorServiceRegistry = ExecutorServiceRegistryImpl(),
+    private val prefsStorage: PrefsStorage = PrefsStorageImpl(
+        context = application,
+    ),
+    override val fileStorage: FileStorage = FileStorageImpl(
+        rootDir = application.filesDir.path,
+        logger = logger,
+    ),
+    override val database: Database = DatabaseImpl(context = application, logger = logger),
+    override val configLoader: ConfigLoader = FakeConfigLoader(),
+    private val manifestReader: ManifestReader = ManifestReaderImpl(application, logger),
+    override val manifest: ManifestMetadata? = manifestReader.load(),
+    private val randomizer: Randomizer = RandomizerImpl(),
+    private val idProvider: IdProvider = IdProviderImpl(randomizer),
+    override val processInfoProvider: ProcessInfoProvider = ProcessInfoProviderImpl(),
+    private val packageInfoProvider: PackageInfoProvider = PackageInfoProviderImpl(application),
+    private val sampler: Sampler = SamplerImpl(configProvider, randomizer),
+    override val sessionManager: SessionManager = SessionManagerImpl(
+        logger = logger,
+        idProvider = idProvider,
+        database = database,
+        processInfo = processInfoProvider,
+        timeProvider = timeProvider,
+        configProvider = configProvider,
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        packageInfoProvider = packageInfoProvider,
+        sampler = sampler,
+    ),
+    private val procProvider: ProcProvider = ProcProviderImpl(),
+    private val debugProvider: DebugProvider = DefaultDebugProvider(),
+    private val runtimeProvider: RuntimeProvider = DefaultRuntimeProvider(),
+    private val osSysConfProvider: OsSysConfProvider = OsSysConfProviderImpl(),
+    private val osVersionProvider: OsVersionProvider = OsVersionProviderImpl(),
+    private val systemServiceProvider: SystemServiceProvider = SystemServiceProviderImpl(application),
+    private val memoryReader: MemoryReader = DefaultMemoryReader(
+        logger = logger,
+        procProvider = procProvider,
+        debugProvider = debugProvider,
+        runtimeProvider = runtimeProvider,
+        osVersionProvider = osVersionProvider,
+    ),
+    private val localeProvider: LocaleProvider = LocaleProviderImpl(),
+    private val initialNetworkStateProvider: InitialNetworkStateProvider = InitialNetworkStateProviderImpl(
+        context = application,
+        logger = logger,
+        systemServiceProvider = systemServiceProvider,
+    ),
+    private val networkStateProvider: NetworkStateProvider = NetworkStateProviderImpl(
+        initialNetworkStateProvider = initialNetworkStateProvider,
+    ),
+    override val userAttributeProcessor: UserAttributeProcessor = UserAttributeProcessor(
+        logger,
+        prefsStorage,
+        executorServiceRegistry.ioExecutor(),
+    ),
+    override val patchAttributeProcessor: PatchAttributeProcessor = PatchAttributeProcessor(),
+    private val deviceAttributeProcessor: DeviceAttributeProcessor = DeviceAttributeProcessor(
+        context = application,
+        localeProvider = localeProvider,
+        osSysConfProvider = osSysConfProvider,
+        systemServiceProvider = systemServiceProvider,
+    ),
+    private val appAttributeProcessor: AppAttributeProcessor = AppAttributeProcessor(
+        context = application,
+        packageInfoProvider = packageInfoProvider,
+    ),
+    private val installationIdAttributeProcessor: InstallationIdAttributeProcessor = InstallationIdAttributeProcessor(
+        prefsStorage = prefsStorage,
+        idProvider = idProvider,
+    ),
+    private val networkStateAttributeProcessor: NetworkStateAttributeProcessor = NetworkStateAttributeProcessor(
+        networkStateProvider = networkStateProvider,
+    ),
+    override val powerStateProvider: PowerStateProvider = PowerStateProviderImpl(
+        logger = logger,
+        context = application,
+        systemServiceProvider = systemServiceProvider,
+    ),
+    private val powerStateAttributeProcessor: PowerStateAttributeProcessor = PowerStateAttributeProcessor(
+        powerStateProvider,
+    ),
+    private val attributeProcessors: List<AttributeProcessor> = listOf(
+        userAttributeProcessor,
+        deviceAttributeProcessor,
+        appAttributeProcessor,
+        installationIdAttributeProcessor,
+        networkStateAttributeProcessor,
+        powerStateAttributeProcessor,
+    ),
+    private val signalStore: SignalStore = SignalStoreImpl(
+        logger = logger,
+        database = database,
+        fileStorage = fileStorage,
+        idProvider = idProvider,
+        configProvider = configProvider,
+    ),
+    override val periodicSignalStoreScheduler: PeriodicSignalStoreScheduler = PeriodicSignalStoreScheduler(
+        logger = logger,
+        defaultExecutor = executorServiceRegistry.defaultExecutor(),
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        signalStore = signalStore,
+        configProvider = configProvider,
+    ),
+    override val resumedActivityProvider: ResumedActivityProvider = ResumedActivityProviderImpl(
+        application,
+    ),
+    private val lowMemoryCheck: LowMemoryCheck = LowMemoryCheck(
+        activityManager = systemServiceProvider.activityManager,
+    ),
+    override val screenshotCollector: ScreenshotCollector = ScreenshotCollectorImpl(
+        logger = logger,
+        resumedActivityProvider = resumedActivityProvider,
+        lowMemoryCheck = lowMemoryCheck,
+        config = configProvider,
+    ),
+    override val workManagerAvailable: Boolean = false,
+    override val exporter: Exporter = ExporterImpl(
+        logger = logger,
+        database = database,
+        eventExportService = executorServiceRegistry.eventExportExecutor(),
+    ),
+    override val signalProcessor: SignalProcessor = SignalProcessorImpl(
+        logger = logger,
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        signalStore = signalStore,
+        idProvider = idProvider,
+        sessionManager = sessionManager,
+        attributeProcessors = attributeProcessors,
+        screenshotCollector = screenshotCollector,
+        configProvider = configProvider,
+        exporter = exporter,
+        sampler = sampler,
+    ),
+    override val layoutSnapshotCollector: LayoutSnapshotCollector = LayoutSnapshotCollectorImpl(
+        logger = logger,
+        resumedActivityProvider = resumedActivityProvider,
+        defaultExecutor = executorServiceRegistry.defaultExecutor(),
+        layoutSnapshotThrottler = LayoutSnapshotThrottler(timeProvider),
+    ),
+    override val userTriggeredEventCollector: UserTriggeredEventCollector = UserTriggeredEventCollectorImpl(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        processInfoProvider = processInfoProvider,
+        configProvider = configProvider,
+        layoutSnapshotCollector = layoutSnapshotCollector,
+    ),
+    override val unhandledExceptionCollector: UnhandledExceptionCollector = UnhandledExceptionCollector(
+        logger = logger,
+        timeProvider = timeProvider,
+        signalProcessor = signalProcessor,
+        processInfo = processInfoProvider,
+    ),
+    private val nativeBridgeImpl: NativeBridgeImpl = NativeBridgeImpl(logger),
+    override val anrCollector: AnrCollector = AnrCollector(
+        processInfo = processInfoProvider,
+        signalProcessor = signalProcessor,
+        nativeBridge = nativeBridgeImpl,
+    ),
+    private val appExitProvider: AppExitProvider = AppExitProviderImpl(
+        logger = logger,
+        systemServiceProvider = systemServiceProvider,
+        nativeCrashReporting = manifest?.nativeCrashReporting == true,
+    ),
+    override val appExitCollector: AppExitCollector = AppExitCollector(
+        logger = logger,
+        appExitProvider = appExitProvider,
+        signalProcessor = signalProcessor,
+        sessionManager = sessionManager,
+        nativeCrashFactory = NativeCrashFactory(application.packageName),
+    ),
+    override val cpuUsageCollector: CpuUsageCollector = CpuUsageCollector(
+        logger = logger,
+        timeProvider = timeProvider,
+        signalProcessor = signalProcessor,
+        processInfo = processInfoProvider,
+        configProvider = configProvider,
+        procProvider = procProvider,
+        osSysConfProvider = osSysConfProvider,
+        defaultExecutor = executorServiceRegistry.defaultExecutor(),
+    ),
+    override val memoryUsageCollector: MemoryUsageCollector = MemoryUsageCollector(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        defaultExecutor = executorServiceRegistry.defaultExecutor(),
+        configProvider = configProvider,
+        memoryReader = memoryReader,
+        processInfo = processInfoProvider,
+        sessionManager = sessionManager,
+        sampler = sampler,
+    ),
+    override val componentCallbacksCollector: ComponentCallbacksCollector = ComponentCallbacksCollector(
+        application = application,
+        timeProvider = timeProvider,
+        signalProcessor = signalProcessor,
+    ),
+    override val appLifecycleManager: AppLifecycleManager = AppLifecycleManager(
+        application = application,
+    ),
+    override val spanAttributeProcessors: List<AttributeProcessor> = emptyList(),
+    override val spanProcessor: SpanProcessor = MsrSpanProcessor(
+        signalProcessor = signalProcessor,
+        attributeProcessors = spanAttributeProcessors,
+        logger = logger,
+        configProvider = configProvider,
+        sampler = sampler,
+    ),
+    private val tracer: Tracer = MsrTracer(
+        logger = logger,
+        sessionManager = sessionManager,
+        spanProcessor = spanProcessor,
+        idProvider = idProvider,
+        timeProvider = timeProvider,
+        sampler = sampler,
+    ),
+    override val activityLifecycleCollector: DefaultActivityLifecycleCollector = DefaultActivityLifecycleCollector(
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        appLifecycleManager = appLifecycleManager,
+        configProvider = configProvider,
+        tracer = tracer,
+        layoutSnapshotCollector = layoutSnapshotCollector,
+    ),
+    override val appLifecycleCollector: AppLifecycleCollector = AppLifecycleCollector(
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        appLifecycleManager = appLifecycleManager,
+        layoutSnapshotCollector = layoutSnapshotCollector,
+    ),
+    override val gestureCollector: GestureCollector = GestureCollector(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        defaultExecutor = executorServiceRegistry.defaultExecutor(),
+        layoutSnapshotThrottler = LayoutSnapshotThrottler(timeProvider),
+        configProvider = configProvider,
+    ),
+    private val launchTracker: LaunchTracker = LaunchTracker(
+        logger,
+        timeProvider,
+        configProvider,
+    ),
+    override val appLaunchCollector: AppLaunchCollector = AppLaunchCollector(
+        application = application,
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        launchTracker = launchTracker,
+        sampler = sampler,
+    ),
+    override val profileCollector: ProfileCollector = ProfileCollector(
+        logger = logger,
+        systemServiceProvider = systemServiceProvider,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        sampler = sampler,
+        sessionManager = sessionManager,
+    ),
+    override val networkChangesCollector: NetworkChangesCollector = NetworkChangesCollector(
+        context = application,
+        signalProcessor = signalProcessor,
+        systemServiceProvider = systemServiceProvider,
+        timeProvider = timeProvider,
+        networkStateProvider = networkStateProvider,
+        logger = logger,
+    ),
+    override val dataCleanupService: DataCleanupService = DataCleanupServiceImpl(
+        logger = logger,
+        fileStorage = fileStorage,
+        database = database,
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        sessionManager = sessionManager,
+        configProvider = configProvider,
+        timeProvider = timeProvider,
+    ),
+    override val httpEventCollector: HttpEventCollector = OkHttpEventCollectorImpl(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        configProvider = configProvider,
+    ),
+    override val httpUrlConnectionEventCollector: HttpUrlConnectionEventCollector =
+        HttpUrlConnectionEventCollectorImpl(
+            logger = logger,
+            signalProcessor = signalProcessor,
+            timeProvider = timeProvider,
+            configProvider = configProvider,
+        ),
+    override val logEventCollector: LogEventCollector = LogEventCollector(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        configProvider = configProvider,
+    ),
+    override val spanCollector: SpanCollector = SpanCollector(tracer),
+    override val bugReportCollector: BugReportCollector = BugReportCollectorImpl(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        ioExecutor = executorServiceRegistry.ioExecutor(),
+        fileStorage = fileStorage,
+        idProvider = idProvider,
+        configProvider = configProvider,
+        sessionManager = sessionManager,
+        resumedActivityProvider = resumedActivityProvider,
+    ),
+    override val customEventCollector: CustomEventCollector = CustomEventCollector(
+        logger = logger,
+        signalProcessor = signalProcessor,
+        timeProvider = timeProvider,
+        configProvider = configProvider,
+        sessionManager = sessionManager,
+    ),
+    override val shakeBugReportCollector: ShakeBugReportCollector = ShakeBugReportCollector(
+        shakeDetector = AccelerometerShakeDetector(
+            sensorManager = systemServiceProvider.sensorManager,
+            configProvider = configProvider,
+            logger = logger,
+        ),
+    ),
+    override val internalSignalCollector: InternalSignalCollector = InternalSignalCollector(
+        logger = logger,
+        configProvider = configProvider,
+        signalProcessor = signalProcessor,
+        processInfoProvider = processInfoProvider,
+        sessionManager = sessionManager,
+        spanAttributeProcessors = spanAttributeProcessors,
+        layoutSnapshotCollector = layoutSnapshotCollector,
+    ),
+) : MeasureInitializer

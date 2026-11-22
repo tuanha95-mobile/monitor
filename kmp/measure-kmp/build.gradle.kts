@@ -1,0 +1,140 @@
+import com.diffplug.gradle.spotless.SpotlessExtension
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.KotlinMultiplatform
+import org.gradle.api.tasks.PathSensitivity
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.CInteropProcess
+
+plugins {
+    kotlin("multiplatform") version "2.3.20"
+    id("com.android.kotlin.multiplatform.library") version "8.13.0"
+    id("com.vanniktech.maven.publish") version "0.34.0"
+    id("com.diffplug.spotless") version "8.0.0"
+    id("org.jetbrains.kotlinx.binary-compatibility-validator") version "0.18.1"
+}
+
+private val measureKmpGroup = property("GROUP") as String
+private val measureKmpVersion = property("MEASURE_KMP_VERSION_NAME") as String
+private val measureAndroidVersion = property("MEASURE_ANDROID_VERSION") as String
+
+group = measureKmpGroup
+version = measureKmpVersion
+
+// The Measure.xcframework consumed by cinterop is produced by Scripts/build-xcframework.sh,
+// not by Gradle. The script is invoked from Xcode's Run Script build phase (for Frank) and
+// from CI workflows before any Gradle invocation that needs the xcframework. Building it
+// outside Gradle avoids nested xcodebuild contention with the parent Xcode XCBBuildService.
+val xcfDir = layout.buildDirectory.dir("xcframework")
+
+kotlin {
+    androidLibrary {
+        namespace = "sh.measure.kmp"
+        compileSdk = 36
+        minSdk = 21
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_11)
+        }
+        withHostTestBuilder { }
+    }
+
+    listOf(iosX64(), iosArm64(), iosSimulatorArm64()).forEach { target ->
+        // Binds against the native Measure module headers without embedding its
+        // binary; the consuming app links a single native Measure instance.
+        target.compilations.getByName("main").cinterops.create("Measure") {
+            defFile(project.file("src/appleMain/cinterop/Measure.def"))
+            val slice = if (target.name == "iosArm64") "ios-arm64" else "ios-arm64_x86_64-simulator"
+            val frameworkPath = "${xcfDir.get().asFile}/Measure.xcframework/$slice"
+            extraOpts("-compiler-option", "-fmodules")
+            extraOpts("-compiler-option", "-F$frameworkPath")
+        }
+    }
+
+    sourceSets {
+        androidMain.dependencies {
+            api("sh.measure:measure-android:$measureAndroidVersion")
+        }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+        getByName("androidHostTest").dependencies {
+            implementation(kotlin("test-junit"))
+        }
+    }
+}
+
+// The xcframework is built outside Gradle, so cinterop can't depend on it and by default
+// fingerprints only the .def file. A change to the iOS SDK's @objc surface then leaves the
+// cached klib stale and the shared build cache re-serves it (e.g. "Unresolved reference
+// 'LogSeverityFatal'"). Fingerprinting the framework headers makes cinterop re-run whenever
+// that surface changes.
+tasks.withType<CInteropProcess>().configureEach {
+    inputs
+        .files(xcfDir.map { it.asFileTree.matching { include("**/*.h", "**/*.modulemap") } })
+        .withPropertyName("measureXcframeworkHeaders")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+
+    configure(
+        KotlinMultiplatform(
+            javadocJar = JavadocJar.Empty(),
+            sourcesJar = true,
+        ),
+    )
+
+    pom {
+        name.set("Measure Kotlin Multiplatform SDK")
+        description.set("Measure Kotlin Multiplatform SDK")
+        inceptionYear.set("2025")
+        url.set("https://github.com/measure-sh/measure")
+        licenses {
+            license {
+                name.set("Apache-2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("repo")
+            }
+        }
+        developers {
+            developer {
+                id.set("measure")
+                name.set("measure.sh")
+            }
+        }
+        scm {
+            url.set("https://github.com/measure-sh/measure")
+            connection.set("scm:git:git://github.com/measure-sh/measure.git")
+            developerConnection.set("scm:git:ssh://git@github.com/measure-sh/measure.git")
+        }
+    }
+}
+
+apiValidation {
+    klib {
+        enabled = true
+    }
+}
+
+extensions.configure<SpotlessExtension>("spotless") {
+    plugins.withId("org.jetbrains.kotlin.multiplatform") {
+        configureSpotlessKotlin(this@configure)
+    }
+    kotlinGradle {
+        ktlint()
+    }
+}
+
+fun configureSpotlessKotlin(spotlessExtension: SpotlessExtension) {
+    spotlessExtension.kotlin {
+        ktlint().apply {
+            editorConfigOverride(
+                mapOf(
+                    "max_line_length" to 2147483647,
+                ),
+            )
+        }
+        target("src/**/*.kt")
+    }
+}

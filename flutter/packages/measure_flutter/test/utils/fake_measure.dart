@@ -1,0 +1,259 @@
+import 'dart:async';
+
+import 'package:flutter/src/widgets/framework.dart';
+import 'package:measure_flutter/measure_flutter.dart';
+import 'package:measure_flutter/src/gestures/click_data.dart';
+import 'package:measure_flutter/src/gestures/long_click_data.dart';
+import 'package:measure_flutter/src/gestures/scroll_data.dart';
+
+class FakeMeasure implements MeasureApi {
+  final List<ScreenViewCall> trackedScreenViews = [];
+  final List<BugReportCall> trackedBugReports = [];
+  int currentTime = 0;
+
+  @override
+  Future<void> init(
+    FutureOr<void> Function() action, {
+    MeasureConfig config = const MeasureConfig(),
+  }) async {
+    await action();
+  }
+
+  @override
+  void trackEvent({
+    required String name,
+    Map<String, AttributeValue> attributes = const {},
+    int? timestamp,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void log(
+    String body, {
+    LogSeverity severity = LogSeverity.info,
+    Map<String, AttributeValue> attributes = const {},
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void logDebug(String body,
+      {Map<String, AttributeValue> attributes = const {}}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void logInfo(String body,
+      {Map<String, AttributeValue> attributes = const {}}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void logWarning(String body,
+      {Map<String, AttributeValue> attributes = const {}}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void logError(String body,
+      {Map<String, AttributeValue> attributes = const {}}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void logFatal(String body,
+      {Map<String, AttributeValue> attributes = const {}}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> trackHandledError(
+    Object error,
+    StackTrace stack, {
+    Map<String, AttributeValue> attributes = const {},
+  }) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  void triggerNativeCrash() {
+    throw UnimplementedError();
+  }
+
+  @override
+  void trackScreenViewEvent({
+    required String name,
+    bool userTriggered = true,
+    int? timestamp,
+    bool captureLayoutSnapshot = true,
+  }) {
+    trackedScreenViews.add(ScreenViewCall(name, userTriggered, timestamp));
+  }
+
+  void clear() {
+    trackedScreenViews.clear();
+    trackedBugReports.clear();
+  }
+
+  @override
+  void trackHttpEvent({
+    required String url,
+    required HttpMethod method,
+    required int startTime,
+    required int endTime,
+    int? statusCode,
+    String? failureReason,
+    String? failureDescription,
+    Map<String, String>? requestHeaders,
+    Map<String, String>? responseHeaders,
+    String? requestBody,
+    String? responseBody,
+    String? client,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  bool shouldTrackHttpHeader(String key) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> start() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> stop() {
+    throw UnimplementedError();
+  }
+
+  @override
+  SpanBuilder? createSpanBuilder(String name) {
+    throw UnimplementedError();
+  }
+
+  @override
+  String getTraceParentHeaderKey() {
+    throw UnimplementedError();
+  }
+
+  @override
+  String getTraceParentHeaderValue(Span span) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Span startSpan(String name, {int? timestamp}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  int getCurrentTime() {
+    return currentTime;
+  }
+
+  @override
+  Future<void> clearUserId() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> setUserId(String userId) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<String?> getSessionId() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<MsrAttachment?> captureScreenshot() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> trackBugReport({
+    required String description,
+    required List<MsrAttachment> attachments,
+    required Map<String, AttributeValue> attributes,
+  }) async {
+    trackedBugReports.add(BugReportCall(description, attachments, attributes));
+  }
+
+  @override
+  Widget createBugReportWidget({
+    Key? key,
+    BugReportTheme theme = const BugReportTheme(),
+    required MsrAttachment? screenshot,
+    required Map<String, AttributeValue>? attributes,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  void setShakeListener(Function? onShake) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> trackClick(
+    ClickData clickData,
+    SnapshotNode? snapshot, {
+    int? timestamp,
+  }) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> trackLongClick(
+    LongClickData longClickData,
+    SnapshotNode? snapshot, {
+    int? timestamp,
+  }) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> trackScroll(ScrollData scrollData) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Map<Type, String> getLayoutSnapshotWidgetFilter() {
+    throw UnimplementedError();
+  }
+
+  @override
+  bool shouldTrackHttpEvent(String url) {
+    throw UnimplementedError();
+  }
+
+  @override
+  bool shouldTrackHttpRequestBody(String url) {
+    throw UnimplementedError();
+  }
+
+  @override
+  bool shouldTrackHttpResponseBody(String url) {
+    throw UnimplementedError();
+  }
+}
+
+class ScreenViewCall {
+  final String name;
+  final bool userTriggered;
+  final int? timestamp;
+
+  ScreenViewCall(this.name, this.userTriggered, this.timestamp);
+}
+
+class BugReportCall {
+  final String description;
+  final List<MsrAttachment> attachments;
+  final Map<String, AttributeValue> attributes;
+
+  BugReportCall(this.description, this.attachments, this.attributes);
+}

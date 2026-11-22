@@ -1,0 +1,545 @@
+package measure
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"backend/ingest/server"
+	"backend/libs/objstore"
+
+	credentials "cloud.google.com/go/iam/credentials/apiv1"
+	"cloud.google.com/go/iam/credentials/apiv1/credentialspb"
+	"cloud.google.com/go/storage"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/leporo/sqlf"
+)
+
+type Mapping struct {
+	ID        uuid.UUID         `json:"id"`
+	Type      string            `json:"type" binding:"required,oneof=proguard dsym elf_debug jsbundle"`
+	Key       string            `json:"key,omitempty"`
+	Location  string            `json:"location,omitempty"`
+	Checksum  string            `json:"checksum,omitempty"`
+	Size      int64             `json:"size,omitempty"`
+	Filename  string            `json:"filename" binding:"required"`
+	UploadURL string            `json:"upload_url,omitempty"`
+	ExpiresAt time.Time         `json:"expires_at"`
+	Headers   map[string]string `json:"headers"`
+	// PatchID echoes the build's optional patch_id back to the
+	// caller so the build script can confirm the value persisted
+	// against this mapping row.
+	PatchID uuid.UUID `json:"patch_id,omitempty"`
+	// PatchVersion echoes the build's optional patch_version
+	// back to the caller, like PatchID.
+	PatchVersion string `json:"patch_version,omitempty"`
+}
+
+type Build struct {
+	AppID       uuid.UUID
+	VersionName string     `json:"version_name" binding:"required"`
+	VersionCode string     `json:"version_code" binding:"required"`
+	Type        string     `json:"build_type" binding:"required,oneof=aab apk ipa"`
+	Size        int        `json:"build_size" binding:"required,gt=0"`
+	Mappings    []*Mapping `json:"mappings" binding:"dive,required"`
+	AppUniqueID string     `json:"app_unique_id"`
+	// PatchID identifies an Over-The-Air patch. It is set only by
+	// the OTA handler (PutOTABuilds); PUT /builds neither accepts
+	// nor returns it.
+	PatchID uuid.UUID `json:"-"`
+	// PatchVersion is the human-facing OTA patch version. Free-form
+	// text, optional. Set only by the OTA handler, like PatchID.
+	PatchVersion string `json:"-"`
+}
+
+type BuildResponse struct {
+	Mappings []*Mapping `json:"mappings"`
+}
+
+// OTABuild is the request body for PUT /builds/ota. It carries
+// only a patch_id (UUID) and the mapping files — no app version,
+// build number or build size. The app is resolved from the
+// request's API key (like PutBuilds), never from the body.
+type OTABuild struct {
+	PatchID uuid.UUID `json:"patch_id" binding:"required"`
+	// PatchVersion is the human-facing OTA patch version.
+	// Free-form text, optional. Not used for symbolication.
+	PatchVersion string     `json:"patch_version" binding:"omitempty,max=256"`
+	Mappings     []*Mapping `json:"mappings" binding:"required,dive,required"`
+}
+
+func (b Build) hasMapping() bool {
+	return len(b.Mappings) > 0
+}
+
+func (b Build) upsertSize(ctx context.Context, tx *pgx.Tx) (err error) {
+	stmt := sqlf.PostgreSQL.
+		InsertInto(`build_sizes`).
+		Set(`app_id`, b.AppID).
+		Set(`version_name`, b.VersionName).
+		Set(`version_code`, b.VersionCode).
+		Set(`build_size`, b.Size).
+		Set(`build_type`, b.Type).
+		Clause(`on conflict (app_id, version_name, version_code, build_type) do update set build_size = excluded.build_size, updated_at = excluded.updated_at`)
+
+	defer stmt.Close()
+
+	_, err = (*tx).Exec(ctx, stmt.String(), stmt.Args()...)
+
+	return
+}
+
+func (b Build) getMappingTypes() (types []string) {
+	typeMap := make(map[string]struct{})
+	for _, m := range b.Mappings {
+		typeMap[m.Type] = struct{}{}
+	}
+	for t := range typeMap {
+		types = append(types, t)
+	}
+	return
+}
+
+func (b Build) insertNewMappings(ctx context.Context, tx *pgx.Tx) (err error) {
+	if len(b.Mappings) == 0 {
+		return
+	}
+
+	stmt := sqlf.PostgreSQL.
+		InsertInto(`build_mappings`)
+
+	defer stmt.Close()
+
+	now := time.Now()
+
+	for _, m := range b.Mappings {
+		stmt.
+			NewRow().
+			Set(`id`, m.ID).
+			Set(`app_id`, b.AppID).
+			Set(`version_name`, b.VersionName).
+			Set(`version_code`, b.VersionCode).
+			Set(`mapping_type`, m.Type).
+			Set(`key`, m.Key).
+			Set(`location`, m.Location).
+			Set(`fnv1_hash`, m.Checksum).
+			Set(`patch_id`, b.PatchID).
+			Set(`patch_version`, b.PatchVersion).
+			Set(`last_updated`, now)
+	}
+
+	_, err = (*tx).Exec(ctx, stmt.String(), stmt.Args()...)
+
+	return
+}
+
+func (b *Build) upsert(ctx context.Context, tx *pgx.Tx) (err error) {
+	if err = b.upsertSize(ctx, tx); err != nil {
+		return
+	}
+
+	// return early if there are no
+	// mapping files
+	if !b.hasMapping() {
+		return
+	}
+
+	existingMappings, err := b.getMappings(ctx)
+	if err != nil {
+		return
+	}
+
+	for _, em := range existingMappings {
+		for _, rm := range b.Mappings {
+			if em.Type == rm.Type && rm.ID == uuid.Nil {
+				rm.ID = em.ID
+				break
+			}
+		}
+	}
+
+	newBuild := Build{
+		AppID:       b.AppID,
+		VersionName: b.VersionName,
+		VersionCode: b.VersionCode,
+		Mappings:    []*Mapping{},
+		PatchID:     b.PatchID,
+	}
+
+	// ensure each new mapping gets
+	// a new id
+	for _, m := range b.Mappings {
+		if m.ID != uuid.Nil {
+			continue
+		}
+		m.ID = uuid.New()
+		newBuild.Mappings = append(newBuild.Mappings, m)
+	}
+
+	// insert initial set of
+	// mapping file entries
+	err = newBuild.insertNewMappings(ctx, tx)
+
+	return
+}
+
+func (b *Build) getMappings(ctx context.Context) (mappings []*Mapping, err error) {
+	types := b.getMappingTypes()
+	typeArgs := make([]any, len(types))
+	for i, t := range types {
+		typeArgs[i] = t
+	}
+
+	stmt := sqlf.PostgreSQL.
+		Select("id").
+		Select("mapping_type").
+		Select("key").
+		Select("location").
+		Select("fnv1_hash").
+		Select("file_size").
+		From("build_mappings").
+		Where("app_id = ?", b.AppID).
+		Where("version_name = ?", b.VersionName).
+		Where("version_code = ?", b.VersionCode)
+
+	if len(typeArgs) > 0 {
+		placeholders := make([]string, len(typeArgs))
+		for i := range typeArgs {
+			placeholders[i] = "?"
+		}
+		inClause := "mapping_type in (" + strings.Join(placeholders, ", ") + ")"
+		stmt = stmt.Where(inClause, typeArgs...)
+	}
+
+	defer stmt.Close()
+
+	rows, _ := server.Server.PgPool.Query(ctx, stmt.String(), stmt.Args()...)
+
+	for rows.Next() {
+		var mapping Mapping
+
+		if errScan := rows.Scan(&mapping.ID, &mapping.Type, &mapping.Key, &mapping.Location, &mapping.Checksum, &mapping.Size); errScan != nil {
+			return
+		}
+
+		mappings = append(mappings, &mapping)
+	}
+
+	err = rows.Err()
+
+	return
+}
+
+func PutBuilds(c *gin.Context) {
+	ctx := c.Request.Context()
+	appId, err := uuid.Parse(c.GetString("appId"))
+	if err != nil {
+		msg := `failed to parse app id`
+		fmt.Println(msg, err)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   msg,
+			"details": err.Error(),
+		})
+
+		return
+	}
+
+	var build Build
+	if err := c.ShouldBindJSON(&build); err != nil {
+		msg := `failed to parse build info`
+		fmt.Println(msg, err)
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   msg,
+			"details": err.Error(),
+		})
+
+		return
+	}
+
+	build.AppID = appId
+
+	tx, err := server.Server.PgPool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.ReadCommitted,
+	})
+	if err != nil {
+		msg := fmt.Sprintf("failed to acquire db transaction while putting builds: %v", err)
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	defer tx.Rollback(ctx)
+
+	if err = build.upsert(ctx, &tx); err != nil {
+		msg := fmt.Sprintf("failed to upsert build: %v", err)
+
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		msg := fmt.Sprintf("failed to commit transaction while upserting builds: %v", err)
+
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	if err = presignMappings(ctx, server.Server.Config, &build); err != nil {
+		msg := fmt.Sprintf("failed to presign build mappings: %v", err)
+
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	if !build.hasMapping() {
+		c.JSON(http.StatusOK, gin.H{
+			"ok": "build info updated",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"mappings": build.Mappings,
+	})
+}
+
+// PutOTABuilds handles uploads of Over-The-Air patch mapping
+// files (CodePush / Shorebird). Unlike PutBuilds it is driven
+// solely by a patch_id (UUID) — it accepts no app version,
+// build number or build size. The mapping rows are stored with
+// empty version columns and the supplied patch_id, which is the
+// sole key for patch_id-based symbolication lookups.
+func PutOTABuilds(c *gin.Context) {
+	ctx := c.Request.Context()
+	appId, err := uuid.Parse(c.GetString("appId"))
+	if err != nil {
+		msg := `failed to parse app id`
+		fmt.Println(msg, err)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   msg,
+			"details": err.Error(),
+		})
+
+		return
+	}
+
+	var ota OTABuild
+	if err := c.ShouldBindJSON(&ota); err != nil {
+		msg := `failed to parse OTA build info`
+		fmt.Println(msg, err)
+
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   msg,
+			"details": err.Error(),
+		})
+
+		return
+	}
+
+	// model the OTA upload as a build with no version/size; the
+	// patch_id is the sole lookup key for these mapping rows.
+	build := Build{
+		AppID:        appId,
+		PatchID:      ota.PatchID,
+		PatchVersion: strings.TrimSpace(ota.PatchVersion),
+		Mappings:     ota.Mappings,
+	}
+
+	// each OTA mapping gets a fresh id; a re-uploaded patch_id
+	// inserts new rows and latest-wins applies at lookup time.
+	for _, m := range build.Mappings {
+		m.ID = uuid.New()
+	}
+
+	tx, err := server.Server.PgPool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.ReadCommitted,
+	})
+	if err != nil {
+		msg := fmt.Sprintf("failed to acquire db transaction while putting OTA builds: %v", err)
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	defer tx.Rollback(ctx)
+
+	if err = build.insertNewMappings(ctx, &tx); err != nil {
+		msg := fmt.Sprintf("failed to insert OTA mappings: %v", err)
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		msg := fmt.Sprintf("failed to commit transaction while putting OTA builds: %v", err)
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	if err = presignMappings(ctx, server.Server.Config, &build); err != nil {
+		msg := fmt.Sprintf("failed to presign OTA mappings: %v", err)
+		fmt.Println(msg)
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": msg,
+		})
+
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"mappings": build.Mappings,
+	})
+}
+
+// presignMappings generates presigned PUT upload URLs for each of
+// the build's mapping files and populates UploadURL, ExpiresAt,
+// PatchID and Headers on every mapping. It dispatches to the cloud
+// (GCS) or self-host (S3) implementation. Shared by PutBuilds and
+// PutOTABuilds.
+func presignMappings(ctx context.Context, config *server.ServerConfig, build *Build) (err error) {
+	if config.IsCloud() {
+		return presignMappingsGCS(ctx, config, build)
+	}
+	return presignMappingsS3(ctx, config, build)
+}
+
+// presignMappingsGCS signs each mapping's upload URL via GCS V4
+// signing. The service account identity must be tied to the
+// credentials, otherwise the signed URLs won't work.
+func presignMappingsGCS(ctx context.Context, config *server.ServerConfig, build *Build) (err error) {
+	client, err := objstore.CreateGCSClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create GCS client: %w", err)
+	}
+
+	iamClient, err := credentials.NewIamCredentialsClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create IAM client: %w", err)
+	}
+	defer iamClient.Close()
+
+	signBytes := func(b []byte) ([]byte, error) {
+		resp, signErr := iamClient.SignBlob(ctx, &credentialspb.SignBlobRequest{
+			Name:    "projects/-/serviceAccounts/" + config.ServiceAccountEmail,
+			Payload: b,
+		})
+		if signErr != nil {
+			return nil, signErr
+		}
+		return resp.SignedBlob, nil
+	}
+
+	for _, mapping := range build.Mappings {
+		ext := filepath.Ext(mapping.Filename)
+		key := fmt.Sprintf("incoming/%s%s", mapping.ID.String(), ext)
+		expiry := time.Now().Add(time.Hour)
+		metadata := []string{
+			fmt.Sprintf("x-goog-meta-mapping_id: %s", mapping.ID.String()),
+			fmt.Sprintf("x-goog-meta-original_file_name: %s", mapping.Filename),
+		}
+
+		signOptions := &storage.SignedURLOptions{
+			GoogleAccessID: config.ServiceAccountEmail,
+			SignBytes:      signBytes,
+			Scheme:         storage.SigningSchemeV4,
+			Method:         "PUT",
+			Expires:        expiry,
+			Headers:        metadata,
+		}
+
+		url, signErr := objstore.CreateGCSPUTPreSignedURL(client, config.SymbolsBucket, key, signOptions)
+		if signErr != nil {
+			return fmt.Errorf("failed to create PUT pre-signed URL for %v: %w", mapping.Filename, signErr)
+		}
+
+		mapping.UploadURL = url
+		mapping.ExpiresAt = expiry
+		mapping.PatchID = build.PatchID
+		mapping.PatchVersion = build.PatchVersion
+		mapping.Headers = make(map[string]string)
+		mapping.Headers["x-goog-meta-mapping_id"] = mapping.ID.String()
+		mapping.Headers["x-goog-meta-original_file_name"] = mapping.Filename
+	}
+
+	return
+}
+
+// presignMappingsS3 signs each mapping's upload URL via the S3 SDK
+// presigner, then wraps it in the API proxy URL used on self-host.
+func presignMappingsS3(ctx context.Context, config *server.ServerConfig, build *Build) (err error) {
+	client := objstore.CreateS3Client(ctx, config.SymbolsAccessKey, config.SymbolsSecretAccessKey, config.SymbolsBucketRegion, config.AWSEndpoint)
+
+	for _, mapping := range build.Mappings {
+		ext := filepath.Ext(mapping.Filename)
+		key := fmt.Sprintf("incoming/%s%s", mapping.ID.String(), ext)
+		signedUrl, signErr := objstore.CreateS3PUTPreSignedURL(ctx, client, &s3.PutObjectInput{
+			Bucket: aws.String(config.SymbolsBucket),
+			Key:    aws.String(key),
+			Metadata: map[string]string{
+				"mapping_id":         mapping.ID.String(),
+				"original_file_name": mapping.Filename,
+			},
+		}, s3.WithPresignExpires(time.Duration(time.Hour)))
+		if signErr != nil {
+			return fmt.Errorf("failed to create PUT pre-signed URL for %v: %w", mapping.Filename, signErr)
+		}
+
+		// proxy the url
+		proxyUrl := fmt.Sprintf("%s/proxy/symbols?payload=%s", config.APIOrigin, url.QueryEscape(signedUrl))
+
+		mapping.UploadURL = proxyUrl
+		mapping.ExpiresAt = time.Now().Add(time.Hour)
+		mapping.PatchID = build.PatchID
+		mapping.PatchVersion = build.PatchVersion
+		mapping.Headers = make(map[string]string)
+		mapping.Headers["x-amz-meta-mapping_id"] = mapping.ID.String()
+		mapping.Headers["x-amz-meta-original_file_name"] = mapping.Filename
+	}
+
+	return
+}

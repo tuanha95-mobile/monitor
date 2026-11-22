@@ -1,0 +1,906 @@
+//go:build integration
+
+package measure
+
+import (
+	"backend/libs/artdump"
+	"backend/libs/event"
+	"backend/libs/group"
+	"backend/testinfra"
+	"context"
+	"encoding/json"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// --------------------------------------------------------------------------
+// Pure function tests
+// --------------------------------------------------------------------------
+
+func TestFormatExceptionMessage(t *testing.T) {
+	cases := []struct {
+		name       string
+		exType     string
+		message    string
+		fileName   string
+		methodName string
+		want       string
+	}{
+		{"type and message", "NullPointerException", "null ref", "", "", "NullPointerException - null ref"},
+		{"type only", "NullPointerException", "", "", "", "NullPointerException"},
+		{"message only", "", "null ref", "", "", "null ref"},
+		{"file and method", "", "", "Foo.java", "bar", "Foo.java:bar()"},
+		{"file only", "", "", "Foo.java", "", "Foo.java"},
+		{"method only", "", "", "", "bar", "bar()"},
+		{"all empty", "", "", "", "", "Unknown error"},
+		{"type+message wins over file+method", "NPE", "msg", "F.java", "m", "NPE - msg"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatExceptionMessage(tc.exType, tc.message, tc.fileName, tc.methodName)
+			if got != tc.want {
+				t.Errorf("formatExceptionMessage(%q, %q, %q, %q) = %q, want %q",
+					tc.exType, tc.message, tc.fileName, tc.methodName, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCleanNullBytes(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"trailing null bytes", "hello\x00\x00", "hello"},
+		{"embedded unicode null", "he\u0000llo", "hello"},
+		{"both trailing and embedded", "he\u0000llo\x00", "hello"},
+		{"clean string", "clean", "clean"},
+		{"empty string", "", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanNullBytes(tc.input)
+			if got != tc.want {
+				t.Errorf("cleanNullBytes(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// Core function tests
+// --------------------------------------------------------------------------
+
+func TestGetIssueGroupCommonPath(t *testing.T) {
+	ctx := context.Background()
+	deps.ChPool = th.ChConn
+
+	t.Run("nonexistent crash group", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+
+		_, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, "fp-does-not-exist")
+		if err == nil {
+			t.Fatal("expected error for nonexistent crash group")
+		}
+		if !strings.Contains(err.Error(), "no crash group found") {
+			t.Errorf("error = %q, want substring %q", err.Error(), "no crash group found")
+		}
+	})
+
+	t.Run("nonexistent ANR group", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+
+		_, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, "fp-does-not-exist")
+		if err == nil {
+			t.Fatal("expected error for nonexistent ANR group")
+		}
+		if !strings.Contains(err.Error(), "no anr group found") {
+			t.Errorf("error = %q, want substring %q", err.Error(), "no anr group found")
+		}
+	})
+
+	t.Run("crash group exists but no session events", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-empty-crash-sessions-12345"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []any  `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.SessionsAnalyzed != 0 {
+			t.Errorf("sessions_analyzed = %d, want 0", result.SessionsAnalyzed)
+		}
+		if len(result.Steps) != 0 {
+			t.Errorf("steps length = %d, want 0", len(result.Steps))
+		}
+	})
+
+	t.Run("ANR group exists but no session events", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-empty-anr-sessions-123456"
+		th.SeedAnrGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []any  `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.SessionsAnalyzed != 0 {
+			t.Errorf("sessions_analyzed = %d, want 0", result.SessionsAnalyzed)
+		}
+		if len(result.Steps) != 0 {
+			t.Errorf("steps length = %d, want 0", len(result.Steps))
+		}
+	})
+
+	t.Run("crash path with seeded session data", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-crash-with-sessions-12345"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		// Seed a session with multiple events (minEventsInSession=2):
+		// 1. A navigation event
+		// 2. A crash event with matching fingerprint
+		// Both share the same session_id.
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedEventWithSession(ctx, t, teamID.String(), appID.String(), sessionID, now.Add(-2*time.Second))
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []any  `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.SessionsAnalyzed < 1 {
+			t.Errorf("sessions_analyzed = %d, want >= 1", result.SessionsAnalyzed)
+		}
+	})
+
+	t.Run("ANR path with seeded session data", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-anr-with-sessions-1234567"
+		th.SeedAnrGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedEventWithSession(ctx, t, teamID.String(), appID.String(), sessionID, now.Add(-2*time.Second))
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "anr", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []any  `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.SessionsAnalyzed < 1 {
+			t.Errorf("sessions_analyzed = %d, want >= 1", result.SessionsAnalyzed)
+		}
+	})
+
+	t.Run("duplicate descriptions are deduplicated", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-dedup-crash-sessions-1234"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		now := time.Now().UTC()
+
+		// Seed 2 sessions with identical navigation events (same type and
+		// timestamp offset so they land at the same position_from_end), then crash.
+		for i := 0; i < 2; i++ {
+			sessionID := uuid.New().String()
+			seedEventWithSession(ctx, t, teamID.String(), appID.String(), sessionID, now.Add(-2*time.Second))
+			seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+		}
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		// Check no duplicate descriptions
+		seen := make(map[string]bool)
+		for _, step := range result.Steps {
+			if seen[step.Description] {
+				t.Errorf("duplicate description found: %q", step.Description)
+			}
+			seen[step.Description] = true
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: severity-derived prefixes
+	// ------------------------------------------------------------------
+
+	t.Run("legacy handled exception shows Handled error prefix", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-handled-ex-data-12345678"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		// Navigation event to satisfy minEventsInSession=2
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "HomeScreen", now.Add(-2*time.Second))
+		// Legacy handled exception (explicit handled=true, no severity) with JSON data
+		excJSON := `[{"type":"NullPointerException","message":"null ref","frames":[]}]`
+		seedIssueEventWithDataInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, true, excJSON, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "Handled error: NullPointerException - null ref") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with 'Handled error: NullPointerException - null ref', got steps: %+v", result.Steps)
+		}
+	})
+
+	t.Run("new-SDK severity=handled shows Handled error prefix", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-severity-handled-12345678"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "HomeScreen", now.Add(-2*time.Second))
+		// New-SDK shape: severity set, handled absent (defaults false). Without
+		// the severity fix this renders "Crash: " since handled=false.
+		excJSON := `[{"type":"NullPointerException","message":"null ref","frames":[]}]`
+		seedIssueEventWithSeverityInSession(ctx, t, teamID.String(), appID.String(), sessionID, fingerprint, "handled", excJSON, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "Handled error: NullPointerException - null ref") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with 'Handled error: NullPointerException - null ref', got steps: %+v", result.Steps)
+		}
+	})
+
+	t.Run("new-SDK severity=unhandled shows Unhandled error prefix", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-severity-unhandled-1234567"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "HomeScreen", now.Add(-2*time.Second))
+		excJSON := `[{"type":"NullPointerException","message":"null ref","frames":[]}]`
+		seedIssueEventWithSeverityInSession(ctx, t, teamID.String(), appID.String(), sessionID, fingerprint, "unhandled", excJSON, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "Unhandled error: NullPointerException - null ref") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with 'Unhandled error: NullPointerException - null ref', got steps: %+v", result.Steps)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: ANR with data
+	// ------------------------------------------------------------------
+
+	t.Run("ANR with data shows ANR prefix", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-anr-data-12345678901234"
+		th.SeedAnrGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "SettingsScreen", now.Add(-2*time.Second))
+		anrJSON := `[{"type":"ANR","message":"Input dispatching timed out","frames":[]}]`
+		seedIssueEventWithDataInSession(ctx, t, teamID.String(), appID.String(), sessionID, "anr", fingerprint, false, anrJSON, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "ANR: ANR - Input dispatching timed out") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with 'ANR: ANR - Input dispatching timed out', got steps: %+v", result.Steps)
+		}
+	})
+
+	t.Run("ANR with thread dump shows its cause", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-anr-dump-123456789012345"
+		th.SeedAnrGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "SettingsScreen", now.Add(-2*time.Second))
+		dump, err := json.Marshal(artdump.Dump{Cause: artdump.CauseBlocked})
+		if err != nil {
+			t.Fatalf("marshal thread dump: %v", err)
+		}
+		seedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+			Type:           "anr",
+			SessionID:      sessionID,
+			Fingerprint:    fingerprint,
+			Subject:        "Broadcast of Intent { flg=0x10000010 cmp=sh.foo/.Receiver }",
+			ThreadDumpJSON: string(dump),
+			Timestamp:      now,
+		})
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if s.Description == "ANR: "+artdump.CauseBlocked {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step 'ANR: %s', got steps: %+v", artdump.CauseBlocked, result.Steps)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: empty exception_data fallback
+	// ------------------------------------------------------------------
+
+	t.Run("empty exception data falls back to Crash occurred", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-empty-excdata-123456789"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "LoginScreen", now.Add(-2*time.Second))
+		// No exceptions JSON, SeedIssueEventInSession leaves it empty
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if s.Description == "Crash occurred" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with description 'Crash occurred', got steps: %+v", result.Steps)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: empty anr_data fallback
+	// ------------------------------------------------------------------
+
+	t.Run("empty ANR data falls back to ANR occurred", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-empty-anrdata-123456789"
+		th.SeedAnrGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "ProfileScreen", now.Add(-2*time.Second))
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "anr", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeANR, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if s.Description == "ANR (Application Not Responding) occurred" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step with description 'ANR (Application Not Responding) occurred', got steps: %+v", result.Steps)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: app hangs
+	// ------------------------------------------------------------------
+
+	appHangPath := func(t *testing.T, exceptionsJSON string, states ...string) []string {
+		t.Helper()
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "0000000000000000000000000000a001"
+		th.SeedAppHangGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		now := time.Now().UTC()
+		for _, state := range states {
+			sessionID := uuid.New().String()
+			seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "HomeScreen", now.Add(-2*time.Second))
+			seedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+				Type: "app_hang", SessionID: sessionID, Timestamp: now, Fingerprint: fingerprint,
+				AppHangState: state, AppHangDuration: 2500, ExceptionsJSON: exceptionsJSON,
+			})
+		}
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeError, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		descriptions := make([]string, len(result.Steps))
+		for i, step := range result.Steps {
+			descriptions[i] = step.Description
+		}
+		return descriptions
+	}
+
+	const appHangJSON = `[{"thread_name":"main","frames":[{"method_name":"blockMainThread()","file_name":"ViewController.swift","line_num":319,"in_app":true,"frame_index":3,"binary_name":"DemoApp","binary_address":"0x104a10000","symbol_address":"0x104a3f5c0","offset":192}]}]`
+
+	t.Run("killed app hang with data shows App hang (killed) prefix", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		got := appHangPath(t, appHangJSON, event.AppHangStateKilled)
+		want := []string{"Navigated to screen: HomeScreen", "App hang (killed): ViewController.swift: blockMainThread()"}
+		if !slices.Equal(got, want) {
+			t.Errorf("steps = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("killed and recovered app hangs show App hang prefix without a state", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		got := appHangPath(t, appHangJSON, event.AppHangStateKilled, event.AppHangStateRecovered)
+		want := []string{"Navigated to screen: HomeScreen", "App hang: ViewController.swift: blockMainThread()"}
+		if !slices.Equal(got, want) {
+			t.Errorf("steps = %q, want %q", got, want)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Row scanning: default event type uses rawDescription
+	// ------------------------------------------------------------------
+
+	t.Run("navigation event uses rawDescription from ClickHouse multiIf", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-nav-description-12345678"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		sessionID := uuid.New().String()
+		now := time.Now().UTC()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "CheckoutScreen", now.Add(-2*time.Second))
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			Steps []struct {
+				Description string `json:"description"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		found := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "Navigated to screen: CheckoutScreen") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected step containing 'Navigated to screen: CheckoutScreen', got steps: %+v", result.Steps)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Boundary: session with only 1 event excluded by minEventsInSession
+	// ------------------------------------------------------------------
+
+	t.Run("session with only 1 event excluded by minEventsInSession", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-min-events-boundary-12345"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		now := time.Now().UTC()
+		// Session with only 1 event (the crash itself), should be excluded
+		sessionID := uuid.New().String()
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.SessionsAnalyzed != 0 {
+			t.Errorf("sessions_analyzed = %d, want 0 (1-event session should be excluded)", result.SessionsAnalyzed)
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Boundary: minConfidencePct filtering
+	// ------------------------------------------------------------------
+
+	t.Run("steps below minConfidencePct threshold are filtered out", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-confidence-threshold-12345"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		now := time.Now().UTC()
+		// Seed 4 sessions. 3 navigate to "CommonScreen" before crash,
+		// 1 navigates to "RareScreen" before crash (25% confidence < 30%).
+		for i := 0; i < 3; i++ {
+			sessionID := uuid.New().String()
+			seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "CommonScreen", now.Add(-2*time.Second))
+			seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, now)
+		}
+		rareSessionID := uuid.New().String()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), rareSessionID, "RareScreen", now.Add(-2*time.Second))
+		seedIssueEventInSession(ctx, t, teamID.String(), appID.String(), rareSessionID, "exception", fingerprint, false, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []struct {
+				Description   string  `json:"description"`
+				ConfidencePct float64 `json:"confidence_pct"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		for _, s := range result.Steps {
+			if s.ConfidencePct < float64(minConfidencePct) {
+				t.Errorf("step %q has confidence_pct=%.1f, want >= %d", s.Description, s.ConfidencePct, minConfidencePct)
+			}
+		}
+
+		// "RareScreen" appears in only 1/4 sessions = 25% < 30%, should be filtered
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "RareScreen") {
+				t.Errorf("step containing 'RareScreen' should be filtered (25%% < %d%% threshold), got: %+v", minConfidencePct, s)
+			}
+		}
+	})
+
+	// ------------------------------------------------------------------
+	// Content validation: step descriptions, confidence_pct, thread_name
+	// ------------------------------------------------------------------
+
+	t.Run("step content has correct description and confidence_pct", func(t *testing.T) {
+		defer cleanupAll(ctx, t)
+
+		teamID := uuid.New()
+		appID := uuid.New()
+		fingerprint := "fp-content-validation-1234567"
+		th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+		now := time.Now().UTC()
+		excJSON := `[{"type":"IllegalStateException","message":"bad state","frames":[]}]`
+		// Seed 1 session: navigation then crash with data
+		sessionID := uuid.New().String()
+		seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "DetailScreen", now.Add(-2*time.Second))
+		seedIssueEventWithDataInSession(ctx, t, teamID.String(), appID.String(), sessionID, "exception", fingerprint, false, excJSON, now)
+
+		data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var result struct {
+			SessionsAnalyzed uint64 `json:"sessions_analyzed"`
+			Steps            []struct {
+				Description   string  `json:"description"`
+				ThreadName    string  `json:"thread_name"`
+				ConfidencePct float64 `json:"confidence_pct"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+
+		if result.SessionsAnalyzed != 1 {
+			t.Errorf("sessions_analyzed = %d, want 1", result.SessionsAnalyzed)
+		}
+
+		// With 1 session, every step should have 100% confidence
+		for _, s := range result.Steps {
+			if s.ConfidencePct != 100.0 {
+				t.Errorf("step %q has confidence_pct=%.1f, want 100.0 (single session)", s.Description, s.ConfidencePct)
+			}
+		}
+
+		// Check crash description includes exception data
+		foundCrash := false
+		foundNav := false
+		for _, s := range result.Steps {
+			if strings.Contains(s.Description, "Crash: IllegalStateException - bad state") {
+				foundCrash = true
+			}
+			if strings.Contains(s.Description, "Navigated to screen: DetailScreen") {
+				foundNav = true
+			}
+		}
+		if !foundCrash {
+			t.Errorf("expected step with 'Crash: IllegalStateException - bad state', got steps: %+v", result.Steps)
+		}
+		if !foundNav {
+			t.Errorf("expected step with 'Navigated to screen: DetailScreen', got steps: %+v", result.Steps)
+		}
+	})
+
+	t.Run("native crash shows signal and cause", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			cause string
+			want  string
+		}{
+			{
+				name:  "with cause",
+				cause: "null pointer dereference",
+				want:  "Crash: SIGSEGV - null pointer dereference",
+			},
+			{
+				name: "without cause",
+				want: "Crash: SIGSEGV",
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				defer cleanupAll(ctx, t)
+
+				teamID := uuid.New()
+				appID := uuid.New()
+				fingerprint := "fp-native-crash-" + strings.ReplaceAll(test.name, " ", "-")
+				th.SeedExceptionGroup(ctx, t, teamID.String(), appID.String(), fingerprint)
+
+				sessionID := uuid.New().String()
+				now := time.Now().UTC()
+				seedNavigationEventInSession(ctx, t, teamID.String(), appID.String(), sessionID, "DetailScreen", now.Add(-2*time.Second))
+				th.SeedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+					Type:           "exception",
+					SessionID:      sessionID,
+					Fingerprint:    fingerprint,
+					ExceptionsJSON: `[{"type":"SIGSEGV","message":"SEGV_MAPERR at 0x0","frames":[]}]`,
+					Framework:      "ndk",
+					Cause:          test.cause,
+					Timestamp:      now,
+				})
+
+				data, err := GetIssueGroupCommonPath(ctx, deps.RchPool, teamID, appID, group.GroupTypeCrash, fingerprint)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				var result struct {
+					Steps []struct {
+						Description string `json:"description"`
+					} `json:"steps"`
+				}
+				if err := json.Unmarshal(data, &result); err != nil {
+					t.Fatalf("unmarshal: %v", err)
+				}
+				if len(result.Steps) == 0 {
+					t.Fatal("want steps, got none")
+				}
+				if got := result.Steps[len(result.Steps)-1].Description; got != test.want {
+					t.Errorf("crash step = %q, want %q", got, test.want)
+				}
+			})
+		}
+	})
+}

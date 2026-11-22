@@ -1,0 +1,678 @@
+import {
+  AlertTriangle,
+  CheckCircle,
+  TrendingDown,
+  TrendingUp,
+} from "lucide-react";
+import React from "react";
+import { numberToKMB, toKiloBytes, toMegaBytes } from "../utils/number_utils";
+import { Card, CardContent, CardFooter } from "./card";
+import { SkeletonMetricsCard } from "./skeleton";
+import SimpleTooltip from "./simple_tooltip";
+
+// Style constants
+const STYLES = {
+  icon: {
+    status: "w-5 h-5",
+    trend: "w-4 h-4",
+    tooltipIcon: "w-4 h-4",
+    green: "text-green-600 dark:text-green-400",
+    yellow: "text-yellow-600 dark:text-yellow-400",
+    red: "text-red-600 dark:text-red-400",
+  },
+  text: {
+    mainValue: "font-code font-semibold text-3xl",
+    trendText: "ml-2 font-code text-sm",
+    subtitle: "font-code text-sm",
+    error: "font-display font-semibold text-3xl",
+    footerTitle: "font-display text-sm select-none",
+    tooltipContent: "p-2",
+  },
+  layout: {
+    trendContainer: "flex flex-row items-center",
+    iconTextGap: "gap-2",
+    spacer: "py-1",
+    cardSize: "w-full md:w-[300px] h-fit",
+    cardContent: "p-4 h-[100px] relative",
+    cardFooter: "p-4",
+    contentFlex: "flex flex-col h-full",
+    statusIconPosition: "absolute top-2 right-2",
+    tooltipIconRow: "flex items-center gap-2 mt-2",
+    tooltipIconRowSmall: "flex items-center gap-2 mt-1",
+    tooltipSpacer: "py-2",
+  },
+} as const;
+
+export type MetricType =
+  | "crash_free_sessions"
+  | "perceived_crash_free_sessions"
+  | "anr_free_sessions"
+  | "perceived_anr_free_sessions"
+  | "app_start_time"
+  | "app_size"
+  | "app_adoption";
+
+export type MetricsCardStatus = "pending" | "success" | "error";
+
+export interface BaseMetricsCardProps {
+  status: MetricsCardStatus;
+  noData: boolean;
+  type: MetricType;
+}
+
+export interface CrashFreeSessionsProps extends BaseMetricsCardProps {
+  type: "crash_free_sessions";
+  value: number;
+  unselectedValue: number;
+  noComparison: boolean;
+  errorGoodThreshold: number;
+  errorCautionThreshold: number;
+}
+
+export interface PerceivedCrashFreeSessionsProps extends BaseMetricsCardProps {
+  type: "perceived_crash_free_sessions";
+  value: number;
+  unselectedValue: number;
+  noComparison: boolean;
+  errorGoodThreshold: number;
+  errorCautionThreshold: number;
+}
+
+export interface AnrFreeSessionsProps extends BaseMetricsCardProps {
+  type: "anr_free_sessions";
+  value: number;
+  unselectedValue: number;
+  noComparison: boolean;
+  errorGoodThreshold: number;
+  errorCautionThreshold: number;
+}
+
+export interface PerceivedAnrFreeSessionsProps extends BaseMetricsCardProps {
+  type: "perceived_anr_free_sessions";
+  value: number;
+  unselectedValue: number;
+  noComparison: boolean;
+  errorGoodThreshold: number;
+  errorCautionThreshold: number;
+}
+
+export interface AppStartTimeProps extends BaseMetricsCardProps {
+  type: "app_start_time";
+  value: number;
+  unselectedValue: number;
+  noComparison: boolean;
+  launchType: string;
+}
+
+export interface AppSizeProps extends BaseMetricsCardProps {
+  type: "app_size";
+  multiVersion: boolean;
+  valueInBytes: number;
+  deltaInBytes: number;
+}
+
+export interface AppAdoptionProps extends BaseMetricsCardProps {
+  type: "app_adoption";
+  value: number;
+  sessions: number;
+  totalSessions: number;
+}
+
+export type MetricsCardProps =
+  | CrashFreeSessionsProps
+  | PerceivedCrashFreeSessionsProps
+  | AnrFreeSessionsProps
+  | PerceivedAnrFreeSessionsProps
+  | AppStartTimeProps
+  | AppSizeProps
+  | AppAdoptionProps;
+
+// Title mapping function
+const getMetricTitle = (type: MetricType, launchType?: string): string => {
+  switch (type) {
+    case "crash_free_sessions":
+      return "Crash free sessions";
+    case "perceived_crash_free_sessions":
+      return "Perceived crash free sessions";
+    case "anr_free_sessions":
+      return "ANR free sessions";
+    case "perceived_anr_free_sessions":
+      return "Perceived ANR free sessions";
+    case "app_start_time":
+      return `App ${launchType?.toLowerCase()} launch time`;
+    case "app_size":
+      return "App size";
+    case "app_adoption":
+      return "App adoption";
+    default:
+      return "Unknown metric";
+  }
+};
+
+const StatusIconRow: React.FC<{
+  icon: React.ReactNode;
+  text: string;
+  first?: boolean;
+}> = ({ icon, text, first = false }) => (
+  <span
+    className={
+      first ? STYLES.layout.tooltipIconRow : STYLES.layout.tooltipIconRowSmall
+    }
+  >
+    {icon} <span>{text}</span>
+  </span>
+);
+
+// Reusable status icon rows for metrics with thresholds
+const renderThresholdStatusIcons = (
+  goodThreshold: number,
+  cautionThreshold: number,
+) => (
+  <>
+    <StatusIconRow
+      first
+      icon={
+        <CheckCircle
+          className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.green}`}
+        />
+      }
+      text={`Good (> ${goodThreshold}%)`}
+    />
+    <StatusIconRow
+      icon={
+        <AlertTriangle
+          className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.yellow}`}
+        />
+      }
+      text={`Caution (> ${cautionThreshold}%)`}
+    />
+    <StatusIconRow
+      icon={
+        <AlertTriangle
+          className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.red}`}
+        />
+      }
+      text={`Poor (≤ ${cautionThreshold}%)`}
+    />
+  </>
+);
+
+function getStatusIcon(
+  value: number,
+  goodThreshold: number,
+  cautionThreshold: number,
+) {
+  const iconClasses = `${STYLES.icon.status}`;
+  if (value > goodThreshold) {
+    return <CheckCircle className={`${iconClasses} ${STYLES.icon.green}`} />;
+  } else if (value > cautionThreshold) {
+    return <AlertTriangle className={`${iconClasses} ${STYLES.icon.yellow}`} />;
+  } else {
+    return <AlertTriangle className={`${iconClasses} ${STYLES.icon.red}`} />;
+  }
+}
+
+function getAppStartTimeStatusIcon(
+  value: number,
+  unselectedValue: number,
+  noComparison: boolean,
+) {
+  const iconClasses = `${STYLES.icon.status}`;
+  if (!noComparison && value > unselectedValue) {
+    return <AlertTriangle className={`${iconClasses} ${STYLES.icon.yellow}`} />;
+  } else {
+    return <CheckCircle className={`${iconClasses} ${STYLES.icon.green}`} />;
+  }
+}
+
+function getAppSizeStatusIcon(multiVersion: boolean, deltaInBytes: number) {
+  if (multiVersion) {
+    return null;
+  }
+  const iconClasses = `${STYLES.icon.status}`;
+  if (deltaInBytes <= 0) {
+    return <CheckCircle className={`${iconClasses} ${STYLES.icon.green}`} />;
+  } else {
+    return <AlertTriangle className={`${iconClasses} ${STYLES.icon.yellow}`} />;
+  }
+}
+
+// Equality between the selected and unselected values is decided on the
+// rendered strings, so two values that display identically never show a
+// trend direction the reader cannot see in the numbers.
+function getExceptionRateComparisonWithTrendIcon(
+  value: number,
+  unselectedValue: number,
+) {
+  const selectedText = `${value}%`;
+  const unselectedText = `${unselectedValue}%`;
+  if (selectedText === unselectedText) {
+    return (
+      <p className={`${STYLES.text.subtitle} text-muted-foreground`}>
+        Same as other versions
+      </p>
+    );
+  }
+  const isBetter = value > unselectedValue;
+  const Icon = isBetter ? TrendingUp : TrendingDown;
+  const colorClass = isBetter ? STYLES.icon.green : STYLES.icon.yellow;
+  return (
+    <div className={STYLES.layout.trendContainer}>
+      <Icon className={`${STYLES.icon.trend} ${colorClass}`} />
+      <p className={`${STYLES.text.trendText} ${colorClass}`}>
+        {unselectedText}
+      </p>
+    </div>
+  );
+}
+
+function getAppStartTimeComparisonWithTrendIcon(
+  value: number,
+  unselectedValue: number,
+) {
+  const selectedText = `${value}ms`;
+  const unselectedText = `${unselectedValue}ms`;
+  if (selectedText === unselectedText) {
+    return (
+      <p className={`${STYLES.text.subtitle} text-muted-foreground`}>
+        Same as other versions
+      </p>
+    );
+  }
+  const isFaster = value < unselectedValue;
+  const Icon = isFaster ? TrendingDown : TrendingUp;
+  const colorClass = isFaster ? STYLES.icon.green : STYLES.icon.yellow;
+  return (
+    <div className={STYLES.layout.trendContainer}>
+      <Icon className={`${STYLES.icon.trend} ${colorClass}`} />
+      <p className={`${STYLES.text.trendText} ${colorClass}`}>
+        {unselectedText}
+      </p>
+    </div>
+  );
+}
+
+function getAppSizeDeltaWithTrendIcon(deltaInBytes: number) {
+  if (deltaInBytes === 0) {
+    return null;
+  }
+
+  const isNegative = deltaInBytes < 0;
+  const absBytes = Math.abs(deltaInBytes);
+
+  let value: string;
+  let unit: string;
+
+  if (absBytes >= 1024 * 1024) {
+    // ≥ 1 MB → show in MB with 3 significant digits
+    value = toMegaBytes(deltaInBytes).toPrecision(3);
+    unit = "MB";
+  } else if (absBytes >= 1024) {
+    // ≥ 1 KB → show in KB with 2 significant digits
+    value = toKiloBytes(deltaInBytes).toFixed(2);
+    unit = "KB";
+  } else {
+    // < 1 KB → show raw bytes (no decimal)
+    value = deltaInBytes.toString();
+    unit = "B";
+  }
+
+  const Icon = isNegative ? TrendingDown : TrendingUp;
+  const colorClass = isNegative ? STYLES.icon.green : STYLES.icon.yellow;
+  const sign = isNegative ? "" : "+";
+
+  return (
+    <div className={STYLES.layout.trendContainer}>
+      <Icon className={`${STYLES.icon.trend} ${colorClass}`} />
+      <p className={`${STYLES.text.trendText} ${colorClass}`}>
+        {sign}
+        {value} {unit}
+      </p>
+    </div>
+  );
+}
+
+const MetricsCard: React.FC<MetricsCardProps> = (props) => {
+  const { status, noData, type } = props;
+  const title = getMetricTitle(
+    type,
+    "launchType" in props ? props.launchType : undefined,
+  );
+  const renderCardContent = () => {
+    if (status === "pending") {
+      return <SkeletonMetricsCard />;
+    }
+
+    if (status === "error") {
+      return <p className={STYLES.text.error}>Error</p>;
+    }
+
+    if (noData) {
+      return (
+        <p className="font-code font-semibold text-3xl text-muted-foreground">
+          --
+        </p>
+      );
+    }
+
+    switch (type) {
+      case "crash_free_sessions":
+      case "perceived_crash_free_sessions":
+      case "anr_free_sessions":
+      case "perceived_anr_free_sessions":
+        const exceptionProps = props as
+          | CrashFreeSessionsProps
+          | PerceivedCrashFreeSessionsProps
+          | AnrFreeSessionsProps
+          | PerceivedAnrFreeSessionsProps;
+        return (
+          <>
+            <p className={STYLES.text.mainValue}> {exceptionProps.value}%</p>
+            <div className={STYLES.layout.spacer} />
+            {!exceptionProps.noComparison &&
+              getExceptionRateComparisonWithTrendIcon(
+                exceptionProps.value,
+                exceptionProps.unselectedValue,
+              )}
+          </>
+        );
+
+      case "app_start_time":
+        const startTimeProps = props as AppStartTimeProps;
+        return (
+          <>
+            <p className={STYLES.text.mainValue}> {startTimeProps.value}ms</p>
+            <div className={STYLES.layout.spacer} />
+            {!startTimeProps.noComparison &&
+              getAppStartTimeComparisonWithTrendIcon(
+                startTimeProps.value,
+                startTimeProps.unselectedValue,
+              )}
+          </>
+        );
+
+      case "app_size":
+        const sizeProps = props as AppSizeProps;
+        if (sizeProps.multiVersion) {
+          return (
+            <>
+              <p className={STYLES.text.mainValue}> N/A</p>
+              <div className={STYLES.layout.spacer} />
+              <p className={`text-xs font-body`}>
+                Current filters match data from multiple app versions. App size
+                is only shown for a single version.
+              </p>
+            </>
+          );
+        } else {
+          return (
+            <>
+              <p className={STYLES.text.mainValue}>
+                {" "}
+                {(sizeProps.valueInBytes / (1024 * 1024)).toPrecision(3)} MB
+              </p>
+              <div className={STYLES.layout.spacer} />
+              {getAppSizeDeltaWithTrendIcon(sizeProps.deltaInBytes)}
+            </>
+          );
+        }
+
+      case "app_adoption":
+        const adoptionProps = props as AppAdoptionProps;
+        return (
+          <>
+            <p className={STYLES.text.mainValue}> {adoptionProps.value}%</p>
+            <div className={STYLES.layout.spacer} />
+            <p className={STYLES.text.subtitle}>
+              {numberToKMB(adoptionProps.sessions)}/
+              {numberToKMB(adoptionProps.totalSessions)} sessions
+            </p>
+          </>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  const renderTooltipContent = () => {
+    const exceptionProps = props as
+      | CrashFreeSessionsProps
+      | PerceivedCrashFreeSessionsProps
+      | AnrFreeSessionsProps
+      | PerceivedAnrFreeSessionsProps;
+    switch (type) {
+      case "crash_free_sessions":
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              Crash free sessions = (1 - Sessions which experienced a crash in
+              selected app versions / Total sessions of selected app versions) *
+              100
+              <br />
+              <br />
+              Comparison = Crash free sessions percentage of unselected app
+              versions
+            </p>
+            <br />
+            {renderThresholdStatusIcons(
+              exceptionProps.errorGoodThreshold,
+              exceptionProps.errorCautionThreshold,
+            )}
+          </div>
+        );
+
+      case "perceived_crash_free_sessions":
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              Perceived crash free sessions = (1 - Sessions which experienced a
+              visible crash in selected app versions / Total sessions of
+              selected app versions) * 100
+              <br />
+              <br />
+              Comparison = Perceived crash free sessions percentage of
+              unselected app versions
+            </p>
+            <br />
+            {renderThresholdStatusIcons(
+              exceptionProps.errorGoodThreshold,
+              exceptionProps.errorCautionThreshold,
+            )}
+          </div>
+        );
+
+      case "anr_free_sessions":
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              ANR free sessions = (1 - Sessions which experienced an ANR in
+              selected app versions / Total sessions of selected app versions) *
+              100
+              <br />
+              <br />
+              Comparison = ANR free sessions percentage of unselected app
+              versions
+            </p>
+            <br />
+            {renderThresholdStatusIcons(
+              exceptionProps.errorGoodThreshold,
+              exceptionProps.errorCautionThreshold,
+            )}
+          </div>
+        );
+
+      case "perceived_anr_free_sessions":
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              Perceived ANR free sessions = (1 - Sessions which experienced a
+              visible ANR in selected app versions / Total sessions of selected
+              app versions) * 100
+              <br />
+              <br />
+              Comparison = Perceived ANR free sessions percentage of unselected
+              app versions
+            </p>
+            <br />
+            {renderThresholdStatusIcons(
+              exceptionProps.errorGoodThreshold,
+              exceptionProps.errorCautionThreshold,
+            )}
+          </div>
+        );
+
+      case "app_start_time":
+        const startTimeProps = props as AppStartTimeProps;
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              App start time = p95 {startTimeProps.launchType} launch time of
+              selected app versions
+              <br />
+              <br />
+              Comparison = p95 {startTimeProps.launchType} launch time of
+              unselected app versions
+            </p>
+            <br />
+            <StatusIconRow
+              first
+              icon={
+                <CheckCircle
+                  className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.green}`}
+                />
+              }
+              text="Good (faster than or unchanged compared to unselected app versions)"
+            />
+            <StatusIconRow
+              icon={
+                <AlertTriangle
+                  className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.yellow}`}
+                />
+              }
+              text="Caution (slower than unselected app versions)"
+            />
+          </div>
+        );
+
+      case "app_size":
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              Delta value = App size of selected app version - Average app size
+              of unselected app versions
+            </p>
+            <br />
+            <StatusIconRow
+              first
+              icon={
+                <CheckCircle
+                  className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.green}`}
+                />
+              }
+              text="Good (size decreased or unchanged compared to unselected app versions)"
+            />
+            <StatusIconRow
+              icon={
+                <AlertTriangle
+                  className={`${STYLES.icon.tooltipIcon} ${STYLES.icon.yellow}`}
+                />
+              }
+              text="Caution (size increased compared to unselected app versions)"
+            />
+          </div>
+        );
+
+      case "app_adoption":
+        const adoptionProps = props as AppAdoptionProps;
+        return (
+          <div className={STYLES.text.tooltipContent}>
+            <p>
+              Adoption = (Sessions of selected app versions / Sessions of all
+              app versions) * 100
+            </p>
+            <div className={STYLES.layout.tooltipSpacer} />
+            <p>Selected Sessions = {adoptionProps.sessions}</p>
+            <p>Total Sessions = {adoptionProps.totalSessions}</p>
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  const showStatusIcon = () => {
+    return (
+      [
+        "crash_free_sessions",
+        "perceived_crash_free_sessions",
+        "anr_free_sessions",
+        "perceived_anr_free_sessions",
+        "app_start_time",
+        "app_size",
+      ].includes(type) &&
+      status === "success" &&
+      !noData
+    );
+  };
+
+  const getStatusIconForType = () => {
+    switch (type) {
+      case "crash_free_sessions":
+      case "perceived_crash_free_sessions":
+      case "anr_free_sessions":
+      case "perceived_anr_free_sessions":
+        const exceptionProps = props as
+          | CrashFreeSessionsProps
+          | PerceivedCrashFreeSessionsProps
+          | AnrFreeSessionsProps
+          | PerceivedAnrFreeSessionsProps;
+        return getStatusIcon(
+          exceptionProps.value,
+          exceptionProps.errorGoodThreshold,
+          exceptionProps.errorCautionThreshold,
+        );
+      case "app_start_time":
+        const startTimeProps = props as AppStartTimeProps;
+        return getAppStartTimeStatusIcon(
+          startTimeProps.value,
+          startTimeProps.unselectedValue,
+          startTimeProps.noComparison,
+        );
+      case "app_size":
+        return getAppSizeStatusIcon(
+          (props as AppSizeProps).multiVersion,
+          (props as AppSizeProps).deltaInBytes,
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <SimpleTooltip
+      triggerClassName="transition-all"
+      content={renderTooltipContent()}
+    >
+      <Card
+        className={`${STYLES.layout.cardSize} bg-card text-card-foreground hover:bg-muted/50 dark:hover:bg-card/50`}
+      >
+        <CardContent className={STYLES.layout.cardContent}>
+          {showStatusIcon() && (
+            <div className={STYLES.layout.statusIconPosition}>
+              {getStatusIconForType()}
+            </div>
+          )}
+
+          <div className={STYLES.layout.contentFlex}>{renderCardContent()}</div>
+        </CardContent>
+        <CardFooter className={STYLES.layout.cardFooter}>
+          <p className={STYLES.text.footerTitle}>{title}</p>
+        </CardFooter>
+      </Card>
+    </SimpleTooltip>
+  );
+};
+
+export default MetricsCard;

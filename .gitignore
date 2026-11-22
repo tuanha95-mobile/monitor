@@ -1,0 +1,50 @@
+# claude code
+.claude/
+
+# macOS
+.DS_Store
+
+# .idea
+.idea/
+
+# node/bun
+node_modules
+
+# vscode multi-root workspace
+*.code-workspace
+.vscode/
+
+# ios
+.build/
+.swiftpm/
+Package.resolved
+
+# go
+go.work.sum
+
+# flutter
+.index-build/
+
+# zed editor
+.zed
+# but share the dashboard's project-level Zed settings (formatter config)
+!frontend/dashboard/.zed/
+!frontend/dashboard/.zed/settings.json
+
+# email preview output
+backend/libs/email/cmd/preview/output/
+
+# Xcode user-specific data
+xcuserdata/
+
+# repo-root scratch space (design docs, debug dumps)
+/tmp/
+
+# gradle / android build
+**/.gradle/
+android/**/build/
+android/**/.cxx/
+android/**/.externalNativeBuild/
+
+# agent eval reports
+backend/agent/evals/results/

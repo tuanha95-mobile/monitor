@@ -1,0 +1,32 @@
+class DefaultConfig {
+  static const bool enableLogging = false;
+  static const bool enableDiagnosticMode = false;
+  static const bool autoInitializeNativeSDK = true;
+  static const bool autoStart = true;
+  static const bool trackHttpHeaders = false;
+  static const bool trackHttpBody = false;
+  static const List<String> httpHeadersBlocklist = [];
+  static const List<String> httpUrlBlocklist = [];
+  static const List<String> httpUrlAllowlist = [];
+  static const bool trackActivityIntentData = false;
+  static const double sessionSamplingRate = 100;
+  static const double traceSamplingRate = 100;
+  static const int maxCheckpointsPerSpan = 100;
+  static const int maxSpanNameLength = 64;
+  static const int maxCheckpointNameLength = 64;
+  static const int maxAttachmentsInBugReport = 5;
+  static const int maxDescriptionLengthInBugReport = 1000;
+  static const int screenshotCompressionQuality = 20;
+  static const int maxEventNameLength = 64;
+  static const String customEventNameRegex = "^[a-zA-Z0-9_-]+\$";
+  static const int maxDiskUsageInMb = 50;
+  static const int maxUserDefinedAttributesPerEvent = 100;
+  static const int maxUserDefinedAttributeKeyLength = 256;
+  static const int maxUserDefinedAttributeValueLength = 256;
+  static const int maxLogBodyLength = 1000;
+  static const double coldLaunchSamplingRate = 100;
+  static const double warmLaunchSamplingRate = 100;
+  static const double hotLaunchSamplingRate = 100;
+  static const double journeySamplingRate = 100;
+  static const Map<Type, String> widgetFilter = {};
+}

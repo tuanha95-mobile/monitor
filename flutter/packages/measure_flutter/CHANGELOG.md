@@ -1,0 +1,172 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [measure_flutter-v0.9.1] - 2026-10-13
+
+### :bug: Bug fixes
+
+- (**flutter**): Enforce validation limits on event fields (#4612) by @adwinross in #4612
+
+### :hammer: Misc
+
+- (**flutter**): Prepare next measure_flutter version 0.9.0 by @abhaysood in #4507
+
+## [measure_flutter-v0.8.0] - 2026-09-23
+
+### :sparkles: New features
+
+- (**flutter**): Attach layout snapshots to screen view events (#4419) by @abhaysood in #4419
+
+### :bug: Bug fixes
+
+- (**flutter**): Record layout snapshots in device pixels (#4448) by @abhaysood in #4448
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter release 0.8.0 by @abhaysood in #4504
+- (**flutter**): Prepare next measure_flutter version 0.8.0 (#4368) by @abhaysood in #4368
+
+## [measure_flutter-v0.7.0] - 2026-09-02
+
+### :sparkles: New features
+
+- (**flutter**): Implement logging (#4021) by @abhaysood
+
+### :bug: Bug fixes
+
+- (**flutter**): Pass widgetFilter from MeasureConfig to config provider by @abhaysood in #4147
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter release 0.7.0 (#4367) by @abhaysood in #4367
+- (**flutter**): Add Swift Package Manager support to measure_flutter by @abhaysood in #4008
+- (**flutter**): Collect http body only for json content type (#3963) by @abhaysood in #3963
+- (**flutter**): Prepare next measure_flutter version 0.7.0 (#3890) by @abhaysood in #3890
+
+## [measure_flutter-v0.6.0] - 2026-06-11
+
+### :sparkles: New features
+
+- (**flutter**): Mask sensitive content in screenshots (#3779) by @abhaysood in #3779
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter release 0.6.0 (#3889) by @abhaysood in #3889
+- (**flutter**): Update exception schema (#3728) by @abhaysood in #3728
+- (**flutter**): Add diagnostic mode for SDK logging (#3593) by @abhaysood in #3593
+- (**flutter**): Fix screenshot rendering in bug reports (#3615) by @abhaysood in #3615
+- (**flutter**): Compress flutter screenshots to webp (#3545) by @abhaysood in #3545
+- (**flutter**): Prepare next measure_flutter version 0.6.0 (#3450) by @abhaysood in #3450
+
+## [measure_flutter-v0.5.0] - 2026-04-08
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter release 0.5.0 (#3449) by @abhaysood in #3449
+- (**flutter**): Prepare measure_dio-v0.4.0 (#3317) by @abhaysood in #3317
+
+## [measure_flutter-v0.4.0] - 2026-02-19
+
+### :sparkles: New features
+
+- (**flutter**): Add layout snapshot with widget analyzer (#2751) by @abhaysood in #2751
+- (**flutter**): Add dynamic config and modify initialization (#3090) by @abhaysood in #3090
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.4.0 (#3147) by @abhaysood in #3147
+- (**flutter**): Fix layout snapshots for release builds (#3145) by @abhaysood in #3145
+
+## [measure_flutter-v0.3.2] - 2026-01-13
+
+### :bug: Bug fixes
+
+- (**flutter**): Update compatibility and dependency constraints (#3088) by @abhaysood in #3088
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.3.2 (#3089) by @abhaysood in #3089
+
+## [measure_flutter-v0.3.1] - 2025-12-10
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.3.1 (#3014) by @abhaysood in #3014
+- (**flutter**): Upgrade to measure-android v0.15.1 (#3013) by @abhaysood in #3013
+
+## [measure_flutter-v0.3.0] - 2025-12-09
+
+### :bug: Bug fixes
+
+- (**flutter**): Compatibility with older flutter versions (#3001) by @abhaysood in #3001
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.3.0 (#3002) by @abhaysood in #3002
+- (**flutter**): Update measure config and default event collection (#2933) by @abhaysood in #2933
+
+## [measure_flutter-v0.2.1] - 2025-10-29
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.2.1 (#2864) by @abhaysood in #2864
+- (**flutter**): Expose measure-android SDK as api dependency (#2828) by @abhaysood in #2828
+
+## [measure_flutter-v0.2.0] - 2025-10-22
+
+### :sparkles: New features
+
+- (**flutter**): Add custom attributes to trackHandledError (#2523) by @abhaysood in #2523
+- (**flutter**): Add custom attributes to trackScreenView (#2522) by @abhaysood in #2522
+- (**flutter**): Provide configurable storage limits (#2454) by @abhaysood in #2454
+
+### :hammer: Misc
+
+- (**flutter**): Prepare measure_flutter-v0.2.0 (#2792) by @abhaysood in #2792
+- (**flutter**): Update native SDK dependencies (#2769) by @abhaysood in #2769
+- (**flutter**): Fix changelog and prepare new release (#2438) by @abhaysood in #2438
+
+## [measure_flutter-v0.1.1] - 2025-07-21
+
+### :hammer: Misc
+
+- (**flutter**): Add validations for custom events (#2437) by @abhaysood in #2437
+- (**flutter**): Improve pub listing score (#2436) by @abhaysood in #2436
+
+## [measure_flutter-v0.1.0] - 2025-07-21
+
+### :sparkles: New features
+
+- (**flutter**): Add screenshots to crashes (#2375) by @abhaysood in #2375
+- (**flutter**): Track gestures (#2367) by @abhaysood in #2367
+- (**flutter**): Implement bug reporting (#2353) by @abhaysood in #2353
+- (**flutter**): Expose api to get session id (#2338) by @abhaysood in #2338
+- (**flutter**): Expose apis to set and clear user id (#2337) by @abhaysood in #2337
+- (**flutter**): Implement tracing (#2316) by @abhaysood in #2316
+- (**flutter**): Manually start or stop the SDK (#2320) by @abhaysood in #2320
+
+### :bug: Bug fixes
+
+- (**flutter**): Fix measure config (#2390) by @abhaysood in #2390
+- (**flutter**): Gesture positions to represent device coordinates (#2387) by @abhaysood in #2387
+
+### :hammer: Misc
+
+- (**flutter**): Explicitly set ios sdk version (#2430) by @abhaysood in #2430
+- (**flutter**): Prepare measure_flutter-v0.1.0 (#2428) by @abhaysood in #2428
+- (**flutter**): Gesture events reporting (#2395) by @abhaysood in #2395
+- (**flutter**): Prepare for pub.dev listing (#2389) by @abhaysood in #2389
+- (**flutter**): Validate http events (#2385) by @abhaysood in #2385
+- (**flutter**): Improve span end api (#2378) by @abhaysood in #2378
+- (**flutter**): Implement sdk configuration (#2302) by @abhaysood in #2302
+- (**flutter**): Add example app (#2301) by @abhaysood in #2301
+- (**flutter**): Implement http tracking using dio (#2294) by @abhaysood in #2294
+
+### :recycle: Refactor
+
+- (**flutter**): Use time provider (#2383) by @abhaysood in #2383
+

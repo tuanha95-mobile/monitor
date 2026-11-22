@@ -1,0 +1,125 @@
+name: 'KMP: Prepare Release'
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.1.0)'
+        required: true
+        type: string
+      next_version:
+        description: 'Next SNAPSHOT version (e.g., 0.2.0-SNAPSHOT)'
+        required: true
+        type: string
+      android_version:
+        description: 'Native Android SDK version this release builds against (e.g., 0.18.0). Must be a released android-v tag.'
+        required: true
+        type: string
+      ios_version:
+        description: 'Native iOS SDK version this release builds against (e.g., 0.11.0). Must be a released ios-v tag.'
+        required: true
+        type: string
+
+jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: 'main'
+          fetch-depth: 0
+          token: ${{ secrets.SDK_RELEASE }}
+
+      - name: Setup Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Validate inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          ANDROID_VERSION: ${{ inputs.android_version }}
+          IOS_VERSION: ${{ inputs.ios_version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-((alpha|beta)\.[0-9]+))?$ ]]; then
+            echo "Error: version must match x.y.z or x.y.z-(alpha|beta).n. Got: $VERSION"
+            exit 1
+          fi
+          if ! [[ "$ANDROID_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: android_version must match x.y.z. Got: $ANDROID_VERSION"
+            exit 1
+          fi
+          if ! [[ "$IOS_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: ios_version must match x.y.z. Got: $IOS_VERSION"
+            exit 1
+          fi
+          # The KMP release must pin published native versions to build against.
+          for tag in "android-v$ANDROID_VERSION" "ios-v$IOS_VERSION"; do
+            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "Error: tag $tag does not exist."
+              exit 1
+            fi
+          done
+
+      - name: Update version in gradle.properties
+        env:
+          VERSION: ${{ inputs.version }}
+          ANDROID_VERSION: ${{ inputs.android_version }}
+          IOS_VERSION: ${{ inputs.ios_version }}
+        run: |
+          sed -i "s/MEASURE_KMP_VERSION_NAME=.*/MEASURE_KMP_VERSION_NAME=$VERSION/" kmp/measure-kmp/gradle.properties
+          sed -i "s/MEASURE_ANDROID_VERSION=.*/MEASURE_ANDROID_VERSION=$ANDROID_VERSION/" kmp/measure-kmp/gradle.properties
+          sed -i "s/MEASURE_IOS_VERSION=.*/MEASURE_IOS_VERSION=$IOS_VERSION/" kmp/measure-kmp/gradle.properties
+
+      - name: Update version in getting started docs
+        env:
+          VERSION: ${{ inputs.version }}
+          ANDROID_VERSION: ${{ inputs.android_version }}
+          IOS_VERSION: ${{ inputs.ios_version }}
+        run: |
+          # The onboarding snippet in the dashboard reads this version at build
+          # time (scripts/extract_sdk_versions.js), so keep it in sync here.
+          GUIDE=frontend/dashboard/content/docs/getting-started/kotlin-multiplatform.mdx
+          KOTLIN_PATTERN='implementation("sh.measure:measure-kmp:.*")'
+          KOTLIN_REPLACEMENT="implementation(\"sh.measure:measure-kmp:$VERSION\")"
+          sed -i "s/$KOTLIN_PATTERN/$KOTLIN_REPLACEMENT/" "$GUIDE"
+          sed -i "/^| Measure Android/ s/[0-9]*\.[0-9]*\.[0-9]*/$ANDROID_VERSION/" "$GUIDE"
+          sed -i "/^| Measure iOS/ s/[0-9]*\.[0-9]*\.[0-9]*/$IOS_VERSION/" "$GUIDE"
+          sed -i -E "s|(\.package\(url: \"https://github\.com/measure-sh/measure\.git\", branch: \"ios-v)[^\"]*|\1$IOS_VERSION|" "$GUIDE"
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: kmp/measure-kmp/cliff.toml
+          args: --output kmp/CHANGELOG.md --tag kmp-v${{ inputs.version }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.SDK_RELEASE }}
+          commit-message: "chore(kmp): prepare sdk release ${{ inputs.version }}"
+          branch: kmp-v${{ inputs.version }}
+          delete-branch: false
+          title: "chore(kmp): prepare sdk release ${{ inputs.version }}"
+          body: |
+            This PR prepares the KMP SDK for release version ${{ inputs.version }}.
+
+            Changes:
+            - Updated version to ${{ inputs.version }} in gradle.properties
+            - Pinned native Android SDK version to ${{ inputs.android_version }} (android-v${{ inputs.android_version }})
+            - Pinned native iOS SDK version to ${{ inputs.ios_version }} (ios-v${{ inputs.ios_version }})
+            - Updated measure-kmp version and the pinned native versions in frontend/dashboard/content/docs/getting-started/kotlin-multiplatform.mdx
+            - Generated changelog for version ${{ inputs.version }}
+
+            <!-- release-meta
+            NEXT_VERSION=${{ inputs.next_version }}
+            -->
+          base: main
+          labels: kmp
+          assignees: abhaysood

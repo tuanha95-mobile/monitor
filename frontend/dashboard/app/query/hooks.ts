@@ -1,0 +1,2131 @@
+"use client";
+
+import {
+  SdkConfig,
+  Team,
+  changeAppApiKeyFromServer,
+  changeAppNameFromServer,
+  changeRoleFromServer,
+  changeTeamNameFromServer,
+  createAppFromServer,
+  createFunnelFromServer,
+  createTeamFromServer,
+  defaultAppThresholdPrefs,
+  deleteFunnelFromServer,
+  downgradeToFreeFromServer,
+  emptyAppRetention,
+  emptyNotifPrefs,
+  fetchAlertsOverviewFromServer,
+  fetchAppRetentionFromServer,
+  fetchAppThresholdPrefsFromServer,
+  fetchAuthzAndMembersFromServer,
+  fetchBillingInfoFromServer,
+  fetchBugReportFromServer,
+  fetchBugReportsOverviewFromServer,
+  fetchBugReportsOverviewPlotFromServer,
+  fetchBuildsFromServer,
+  fetchCheckoutSessionFromServer,
+  fetchCustomerPortalUrlFromServer,
+  fetchErrorsAttributeDistributionPlotFromServer,
+  fetchErrorGroupCommonPathFromServer,
+  fetchErrorsDetailsFromServer,
+  fetchErrorsDetailsPlotFromServer,
+  fetchErrorsDistributionPlotFromServer,
+  fetchErrorsOverviewFromServer,
+  fetchErrorsOverviewPlotFromServer,
+  fetchFunnelConversionFromServer,
+  fetchFunnelEventNamesFromServer,
+  fetchFunnelFromServer,
+  fetchFunnelCadenceFromServer,
+  fetchFunnelsFromServer,
+  fetchFunnelStepErrorsFromServer,
+  fetchFunnelStepNetworkFromServer,
+  fetchFunnelStepSessionsFromServer,
+  fetchFunnelStepTracesFromServer,
+  fetchFunnelTrendFromServer,
+  fetchHighMemoryUsageSessionsFromServer,
+  fetchJourneyFromServer,
+  fetchMemoryUsageBreakdownFromServer,
+  fetchMemoryUsagePlotFromServer,
+  fetchMetricsFromServer,
+  fetchNetworkEndpointsFromServer,
+  fetchNetworkEndpointStatusCodesPlotFromServer,
+  fetchNetworkLatencyPlotFromServer,
+  fetchNetworkStatusCodesPlotFromServer,
+  fetchNetworkTimelinePlotFromServer,
+  fetchNetworkTrendsFromServer,
+  fetchNotifPrefsFromServer,
+  fetchPendingInvitesFromServer,
+  fetchPinnedFunnelsFromServer,
+  fetchProfilesFromServer,
+  fetchSdkConfigFromServer,
+  fetchSdkConfigHistoryFromServer,
+  fetchSessionReplayFromServer,
+  fetchSessionReplayOverviewFromServer,
+  fetchSessionReplayOverviewPlotFromServer,
+  fetchAppHealthPlotFromServer,
+  fetchSpanMetricsPlotFromServer,
+  fetchSpansFromServer,
+  fetchTeamSlackConnectUrlFromServer,
+  fetchTeamSlackStatusFromServer,
+  fetchTeamsFromServer,
+  fetchTraceFromServer,
+  fetchUsageFromServer,
+  inviteMemberFromServer,
+  removeMemberFromServer,
+  removePendingInviteFromServer,
+  removeTeamSlackFromServer,
+  reorderPinnedFunnelsFromServer,
+  resendPendingInviteFromServer,
+  sendTestSlackAlertFromServer,
+  setFunnelPinnedFromServer,
+  undoDowngradeFromServer,
+  updateAppRetentionFromServer,
+  updateAppThresholdPrefsFromServer,
+  updateBugReportStatusFromServer,
+  updateFunnelFromServer,
+  updateNotifPrefsFromServer,
+  updateSdkConfigFromServer,
+  updateTeamSlackStatusFromServer,
+  type AttributeDistributionResponse,
+  type ErrorDistributionResponse,
+  type Funnel,
+  type FunnelDraft,
+  type FunnelStepOutcome,
+  type FunnelTrendPeriod,
+  type MemoryUsagePlotPoint,
+  type PinnedFunnelsResponse,
+} from "@/app/api/api_calls";
+import {
+  App,
+  fetchAppsFromServer,
+  fetchFilterKeys,
+  fetchFilterValues,
+  fetchRootSpanNamesFromServer,
+} from "@/app/api/api_calls";
+import type { FilterKeysResponse } from "@/app/api/filter_types";
+import { ApiError } from "@/app/api/api_error";
+import { apiClient } from "@/app/api/api_client";
+import {
+  Query,
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+
+export function useAppsQuery(teamId: string | undefined) {
+  return useQuery<App[]>({
+    queryKey: ["filterApps", teamId] as const,
+    queryFn: () => fetchAppsFromServer(teamId!),
+    enabled: !!teamId,
+  });
+}
+
+// ─── Dynamic filters ─────────────────────────────────────────────────────
+
+export function useFilterKeysQuery(
+  appId: string | undefined,
+  entity: string,
+  keyNames: string[],
+) {
+  return useQuery<FilterKeysResponse>({
+    queryKey: ["filterKeys", appId, entity, keyNames] as const,
+    queryFn: () => fetchFilterKeys(appId!, entity, keyNames),
+    enabled: !!appId,
+    // The key names grow while the user types a custom key into the filter
+    // text editor; keeping the last response stops every loaded key from
+    // being flagged unknown during the refetch.
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Kept fresh for a minute so reopening a picker does not refetch what was
+ * just shown.
+ */
+export function useFilterValuesQuery(
+  appId: string | undefined,
+  entity: string,
+  keyName: string | null,
+  search: string,
+) {
+  return useQuery({
+    queryKey: ["filterValues", appId, entity, keyName, search] as const,
+    queryFn: () => fetchFilterValues(appId!, entity, keyName!, search),
+    enabled: !!appId && !!keyName,
+    staleTime: 60 * 1000,
+  });
+}
+
+export function useRootSpanNamesQuery(app: App | null | undefined) {
+  return useQuery<string[] | null>({
+    queryKey: ["rootSpanNames", app?.id] as const,
+    queryFn: () => fetchRootSpanNamesFromServer(app!),
+    enabled: !!app,
+  });
+}
+
+export type SessionUser = {
+  id: string;
+  own_team_id: string;
+  name: string;
+  email: string;
+  avatar_url: string;
+  confirmed_at: string;
+  last_sign_in_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type Session = { user: SessionUser };
+
+export async function fetchCurrentSession(): Promise<Session | null> {
+  try {
+    const res = await apiClient.fetch(`/api/auth/session`);
+    if (!res.ok) {
+      return null;
+    }
+    const data = await res.json();
+    if (!data.user) {
+      return null;
+    }
+    const user: SessionUser = {
+      id: data.user.id,
+      own_team_id: data.user.own_team_id,
+      name: data.user.name,
+      email: data.user.email,
+      avatar_url: data.user.avatar_url,
+      confirmed_at: data.user.confirmed_at,
+      last_sign_in_at: data.user.last_sign_in_at,
+      created_at: data.user.created_at,
+      updated_at: data.user.updated_at,
+    };
+    return { user };
+  } catch {
+    // apiClient may navigate on auth failure; treat any throw as "no session"
+    return null;
+  }
+}
+
+export function useSessionQuery() {
+  return useQuery<Session>({
+    queryKey: ["session"] as const,
+    queryFn: async () => {
+      const session = await fetchCurrentSession();
+      if (!session) {
+        throw new Error("No session");
+      }
+      return session;
+    },
+    // Session info doesn't change often; keep it warm to avoid extra
+    // /api/auth/session round-trips on every page navigation.
+    staleTime: 5 * 60 * 1000,
+    gcTime: 5 * 60 * 1000,
+  });
+}
+
+export async function signOut(): Promise<void> {
+  await fetch(`/auth/logout`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  apiClient.redirectToLogin();
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────
+
+export type ExceptionGroupCommonPath = {
+  sessions_analyzed: number;
+  steps: Array<{
+    description: string;
+    thread_name: string;
+    confidence_pct: number;
+  }>;
+};
+
+// ─── Constants re-exported for components ────────────────────────────────
+
+export const paginationOffsetUrlKey = "po";
+
+/**
+ * Query inputs for the pages whose filter lives in the URL. The page derives
+ * these from searchParams, so a query's filter and pagination offset always
+ * come from the same URL snapshot.
+ */
+export type FilterParams = {
+  appId: string;
+  startDate: string;
+  endDate: string;
+  filterExpr: string | null;
+};
+
+export enum TrendsTab {
+  Latency = "Latency",
+  ErrorRate = "Error Rate",
+  Frequency = "Frequency",
+}
+
+export enum RootSpanMetricsQuantile {
+  p50 = "p50",
+  p90 = "p90",
+  p95 = "p95",
+  p99 = "p99",
+}
+
+export enum MemoryUsageQuantile {
+  p50 = "p50",
+  p90 = "p90",
+  p95 = "p95",
+  p99 = "p99",
+}
+
+// ─── Shared helpers ──────────────────────────────────────────────────────
+
+/** Standard plot transformation: datetime/instances → x/y */
+function mapPlotData(data: any[] | null) {
+  if (data === null) {
+    return null;
+  }
+  return data.map((item: any) => ({
+    id: item.id,
+    data: item.data.map((d: any) => ({ x: d.datetime, y: d.instances })),
+  }));
+}
+
+/** Span metrics: pick quantile value for y-axis */
+function getYBasedOnQuantile(
+  data: any,
+  quantile: RootSpanMetricsQuantile,
+): number {
+  switch (quantile) {
+    case RootSpanMetricsQuantile.p50:
+      return data.p50;
+    case RootSpanMetricsQuantile.p90:
+      return data.p90;
+    case RootSpanMetricsQuantile.p95:
+      return data.p95;
+    case RootSpanMetricsQuantile.p99:
+      return data.p99;
+  }
+}
+
+export function transformSpanMetricsPlotData(
+  rawData: any,
+  quantile: RootSpanMetricsQuantile,
+) {
+  return rawData.map((item: any) => ({
+    id: item.id,
+    data: item.data.map((data: any, index: number) => ({
+      id: item.id + "." + index,
+      x: data.datetime,
+      y: getYBasedOnQuantile(data, quantile),
+    })),
+  }));
+}
+
+export function transformMemoryUsagePlotData(
+  rawData: MemoryUsagePlotPoint[],
+  quantile: MemoryUsageQuantile,
+) {
+  const pointsByVersion = new Map<
+    string,
+    { id: string; x: string; y: number | null }[]
+  >();
+  for (const point of rawData) {
+    const data = pointsByVersion.get(point.version) ?? [];
+    data.push({
+      id: `${point.version}.${data.length}`,
+      x: point.datetime,
+      y: point[quantile],
+    });
+    pointsByVersion.set(point.version, data);
+  }
+  return Array.from(pointsByVersion, ([id, data]) => ({ id, data }));
+}
+
+export const distributionAttributes = [
+  "app_version",
+  "os_version",
+  "country",
+  "network_type",
+  "locale",
+  "device",
+] as const;
+
+export type DistributionAttribute = (typeof distributionAttributes)[number];
+
+export interface AttributeDistribution {
+  attribute: DistributionAttribute;
+  label: string;
+  values: { label: string; count: number }[];
+  otherCount: number;
+  distinctCount: number;
+  total: number;
+}
+
+const distributionAttributeLabels: Record<DistributionAttribute, string> = {
+  app_version: "App Version",
+  os_version: "OS Version",
+  country: "Country",
+  network_type: "Network Type",
+  locale: "Locale",
+  device: "Device",
+};
+
+function formatOsVersionKey(key: string): string {
+  const parts = key.toLowerCase().split(" ");
+  if (parts.length >= 2) {
+    const osName = parts[0];
+    const version = parts[1];
+    const displayName =
+      osName === "android"
+        ? "Android API Level"
+        : osName === "ios"
+          ? "iOS"
+          : osName === "ipados"
+            ? "iPadOS"
+            : osName;
+    return `${displayName} ${version}`;
+  }
+  return key;
+}
+
+export function parseAttributeDistribution(
+  attribute: DistributionAttribute,
+  response: AttributeDistributionResponse,
+): AttributeDistribution {
+  const values = response.values.map(({ value, count }) => ({
+    label:
+      value === ""
+        ? "Unknown"
+        : attribute === "os_version"
+          ? formatOsVersionKey(value)
+          : value,
+    count,
+  }));
+  const hasAndroidData =
+    attribute === "os_version" &&
+    response.values.some(({ value }) =>
+      value.toLowerCase().startsWith("android"),
+    );
+  return {
+    attribute,
+    label: hasAndroidData
+      ? "API Level"
+      : distributionAttributeLabels[attribute],
+    values,
+    otherCount: response.other_count,
+    distinctCount: response.distinct_count,
+    total: values.reduce((sum, { count }) => sum + count, response.other_count),
+  };
+}
+
+function parseDistributionPlot(
+  response: ErrorDistributionResponse | null,
+): AttributeDistribution[] | null {
+  if (response === null) {
+    return null;
+  }
+  return distributionAttributes.map((attribute) =>
+    parseAttributeDistribution(attribute, response[attribute]),
+  );
+}
+
+// ─── Metrics ─────────────────────────────────────────────────────────────
+
+export function useMetricsQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "metrics",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchMetricsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useAppThresholdPrefsQuery(appId: string | undefined) {
+  return useQuery({
+    queryKey: ["appThresholdPrefs", appId] as const,
+    queryFn: () => fetchAppThresholdPrefsFromServer(appId!),
+    enabled: !!appId,
+  });
+}
+
+// ─── Journey ─────────────────────────────────────────────────────────────
+
+export function useJourneyQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "journey",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchJourneyFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Funnels ─────────────────────────────────────────────────────────────
+
+export const FUNNELS_LIMIT = 5;
+
+// Both funnel lists have keys that start with ["funnels", appId], so
+// invalidating that prefix refreshes the pinned funnels and the paged list.
+export function useFunnelsQuery(
+  appId: string | undefined,
+  search: string,
+  offset: number,
+) {
+  return useQuery({
+    queryKey: ["funnels", appId, "all", search, offset] as const,
+    queryFn: () =>
+      fetchFunnelsFromServer(appId!, search, FUNNELS_LIMIT, offset),
+    placeholderData: keepPreviousData,
+    enabled: !!appId,
+  });
+}
+
+function pinnedFunnelsQueryKey(appId: string | undefined) {
+  return ["funnels", appId, "pinned"] as const;
+}
+
+export function usePinnedFunnelsQuery(appId: string | undefined) {
+  return useQuery({
+    queryKey: pinnedFunnelsQueryKey(appId),
+    queryFn: () => fetchPinnedFunnelsFromServer(appId!),
+    enabled: !!appId,
+  });
+}
+
+export function useSetFunnelPinnedMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: {
+      appId: string;
+      funnelId: string;
+      pinned: boolean;
+    }) =>
+      setFunnelPinnedFromServer(params.appId, params.funnelId, params.pinned),
+    onSuccess: (_data, variables) =>
+      Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["funnels", variables.appId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["funnel", variables.appId, variables.funnelId],
+          exact: true,
+        }),
+      ]),
+  });
+}
+
+// The new order shows as soon as the user saves it. If the server rejects it,
+// for example because someone else pinned or unpinned a funnel meanwhile, the
+// pinned funnels are fetched again.
+export function useReorderPinnedFunnelsMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { appId: string; funnels: Funnel[] }) =>
+      reorderPinnedFunnelsFromServer(
+        params.appId,
+        params.funnels.map((funnel) => funnel.id),
+      ),
+    onMutate: async ({ appId, funnels }) => {
+      const queryKey = pinnedFunnelsQueryKey(appId);
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueryData<PinnedFunnelsResponse>(queryKey, {
+        results: funnels,
+      });
+    },
+    onSuccess: (data, { appId }) =>
+      queryClient.setQueryData(pinnedFunnelsQueryKey(appId), data),
+    onError: (_error, { appId }) =>
+      queryClient.invalidateQueries({
+        queryKey: pinnedFunnelsQueryKey(appId),
+      }),
+  });
+}
+
+// Every query about one funnel has a key that starts with
+// ["funnel", appId, funnelId], so invalidating ["funnel", appId] after a save
+// refreshes the funnel and everything computed from it.
+export function useFunnelQuery(appId: string, funnelId: string) {
+  return useQuery({
+    queryKey: ["funnel", appId, funnelId] as const,
+    queryFn: () => fetchFunnelFromServer(appId, funnelId),
+  });
+}
+
+export function useFunnelEventNamesQuery(
+  appId: string | undefined,
+  search: string,
+) {
+  return useQuery({
+    queryKey: ["funnelEventNames", appId, search] as const,
+    queryFn: () => fetchFunnelEventNamesFromServer(appId!, search),
+    enabled: !!appId,
+    staleTime: 60 * 1000,
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useFunnelConversionQuery(
+  params: FilterParams | null,
+  funnelId: string,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params?.appId,
+      funnelId,
+      "conversion",
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchFunnelConversionFromServer(
+        params!.appId,
+        funnelId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: enabled && params !== null,
+    retry: false,
+  });
+}
+
+export const FUNNEL_STEP_LIST_LIMIT = 5;
+
+export function useFunnelStepErrorsQuery(
+  params: FilterParams,
+  funnelId: string,
+  step: number | null,
+  paginationOffset: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params.appId,
+      funnelId,
+      "errors",
+      step,
+      params.startDate,
+      params.endDate,
+      params.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchFunnelStepErrorsFromServer(
+        params.appId,
+        funnelId,
+        step,
+        params.startDate,
+        params.endDate,
+        params.filterExpr,
+        FUNNEL_STEP_LIST_LIMIT,
+        paginationOffset,
+      ),
+    enabled,
+    retry: false,
+  });
+}
+
+export function useFunnelStepSessionsQuery(
+  params: FilterParams,
+  funnelId: string,
+  step: number | null,
+  outcome: FunnelStepOutcome,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params.appId,
+      funnelId,
+      "sessions",
+      step,
+      outcome,
+      params.startDate,
+      params.endDate,
+      params.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchFunnelStepSessionsFromServer(
+        params.appId,
+        funnelId,
+        step,
+        outcome,
+        params.startDate,
+        params.endDate,
+        params.filterExpr,
+        FUNNEL_STEP_LIST_LIMIT,
+        paginationOffset,
+      ),
+    retry: false,
+  });
+}
+
+export function useFunnelStepTracesQuery(
+  params: FilterParams,
+  funnelId: string,
+  step: number | null,
+  quantile: RootSpanMetricsQuantile,
+  paginationOffset: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params.appId,
+      funnelId,
+      "traces",
+      step,
+      quantile,
+      params.startDate,
+      params.endDate,
+      params.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchFunnelStepTracesFromServer(
+        params.appId,
+        funnelId,
+        step,
+        quantile,
+        params.startDate,
+        params.endDate,
+        params.filterExpr,
+        FUNNEL_STEP_LIST_LIMIT,
+        paginationOffset,
+      ),
+    enabled,
+    retry: false,
+  });
+}
+
+export function useFunnelStepNetworkQuery(
+  params: FilterParams,
+  funnelId: string,
+  step: number | null,
+  quantile: RootSpanMetricsQuantile,
+  paginationOffset: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params.appId,
+      funnelId,
+      "network",
+      step,
+      quantile,
+      params.startDate,
+      params.endDate,
+      params.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchFunnelStepNetworkFromServer(
+        params.appId,
+        funnelId,
+        step,
+        quantile,
+        params.startDate,
+        params.endDate,
+        params.filterExpr,
+        FUNNEL_STEP_LIST_LIMIT,
+        paginationOffset,
+      ),
+    enabled,
+    retry: false,
+  });
+}
+
+export function useFunnelTrendQuery(
+  params: FilterParams | null,
+  funnelId: string,
+  period: FunnelTrendPeriod,
+  withBuilds: boolean,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params?.appId,
+      funnelId,
+      "trend",
+      period,
+      withBuilds,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchFunnelTrendFromServer(
+        params!.appId,
+        funnelId,
+        period,
+        params!.filterExpr,
+        withBuilds,
+      ),
+    enabled: enabled && params !== null,
+    retry: false,
+  });
+}
+
+export function useFunnelCadenceQuery(
+  params: FilterParams | null,
+  funnelId: string,
+  weeks: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "funnel",
+      params?.appId,
+      funnelId,
+      "cadence",
+      weeks,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchFunnelCadenceFromServer(
+        params!.appId,
+        funnelId,
+        weeks,
+        params!.filterExpr,
+      ),
+    enabled: enabled && params !== null,
+    retry: false,
+  });
+}
+
+export function useSaveFunnelMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: {
+      appId: string;
+      funnelId: string | null;
+      draft: FunnelDraft;
+    }) =>
+      params.funnelId === null
+        ? createFunnelFromServer(params.appId, params.draft)
+        : updateFunnelFromServer(params.appId, params.funnelId, params.draft),
+    onSuccess: (saved, variables) => {
+      // The funnel page checks its selected step against the funnel's steps,
+      // so the saved funnel goes into the cache before the step lists refetch,
+      // and they don't ask for a step the edit removed.
+      queryClient.setQueryData(["funnel", variables.appId, saved.id], saved);
+      return Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["funnels", variables.appId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["funnel", variables.appId],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteFunnelMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { appId: string; funnelId: string }) =>
+      deleteFunnelFromServer(params.appId, params.funnelId),
+    onSuccess: (_data, variables) =>
+      queryClient.invalidateQueries({ queryKey: ["funnels", variables.appId] }),
+  });
+}
+
+// ─── Network ─────────────────────────────────────────────────────────────
+
+// The network plot queries are scoped by an endpoint selection: an empty domain
+// is every endpoint, a domain on its own is one domain, and a domain with a
+// path is one endpoint.
+
+const NETWORK_TRENDS_LIMIT = 10;
+
+export function useNetworkEndpointsQuery(
+  params: FilterParams | null,
+  query: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: [
+      "networkEndpoints",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      query,
+    ] as const,
+    queryFn: ({ signal }) =>
+      fetchNetworkEndpointsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        query,
+        signal,
+      ),
+    enabled: enabled && params !== null,
+    retry: false,
+  });
+}
+
+export function useNetworkLatencyQuery(
+  params: FilterParams | null,
+  domain: string,
+  path: string,
+) {
+  return useQuery({
+    queryKey: [
+      "networkLatency",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      domain,
+      path,
+    ] as const,
+    queryFn: () =>
+      fetchNetworkLatencyPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        domain,
+        path,
+      ),
+    // Latency only renders once a domain or path scope is picked, so a page
+    // without either has nothing to fetch.
+    enabled: params !== null && (domain !== "" || path !== ""),
+    retry: false,
+  });
+}
+
+export function useNetworkStatusCodesQuery(
+  params: FilterParams | null,
+  domain: string,
+  path: string,
+) {
+  return useQuery({
+    queryKey: [
+      "networkStatusCodes",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      domain,
+      path,
+    ] as const,
+    queryFn: () =>
+      fetchNetworkStatusCodesPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        domain,
+        path,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useNetworkEndpointStatusCodesQuery(
+  params: FilterParams | null,
+  domain: string,
+  path: string,
+) {
+  return useQuery({
+    queryKey: [
+      "networkEndpointStatusCodes",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      domain,
+      path,
+    ] as const,
+    queryFn: () =>
+      fetchNetworkEndpointStatusCodesPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        domain,
+        path,
+      ),
+    enabled: params !== null && (domain !== "" || path !== ""),
+    retry: false,
+  });
+}
+
+export function useNetworkTimelineQuery(
+  params: FilterParams | null,
+  domain: string,
+  path: string,
+) {
+  return useQuery({
+    queryKey: [
+      "networkTimeline",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      domain,
+      path,
+    ] as const,
+    queryFn: () =>
+      fetchNetworkTimelinePlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        domain,
+        path,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useNetworkTrendsQuery(
+  params: FilterParams | null,
+  active: boolean,
+) {
+  return useQuery({
+    queryKey: [
+      "networkTrends",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchNetworkTrendsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        NETWORK_TRENDS_LIMIT,
+      ),
+    enabled: active && params !== null,
+    retry: false,
+  });
+}
+
+// ─── Plot: Overview ──────────────────────────────────────────────────────
+
+export function useBugReportsOverviewPlotQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "bugReportsOverviewPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchBugReportsOverviewPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      );
+      return mapPlotData(result);
+    },
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useSessionReplayOverviewPlotQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "sessionReplayOverviewPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchSessionReplayOverviewPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      );
+      return mapPlotData(result);
+    },
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useAppHealthPlotQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "appHealthPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchAppHealthPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Plot: Span Metrics ──────────────────────────────────────────────────
+
+export function useSpanMetricsPlotQuery(
+  params: FilterParams | null,
+  spanName: string | null,
+) {
+  return useQuery({
+    queryKey: [
+      "spanMetricsPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      spanName,
+    ] as const,
+    queryFn: () =>
+      fetchSpanMetricsPlotFromServer(
+        params!.appId,
+        spanName!,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null && spanName !== null,
+    retry: false,
+  });
+}
+
+export function useMemoryUsagePlotQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "memoryUsagePlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchMemoryUsagePlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useMemoryUsageBreakdownQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "memoryUsageBreakdown",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: () =>
+      fetchMemoryUsageBreakdownFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export const HIGH_MEMORY_USAGE_SESSIONS_LIMIT = 5;
+
+export function useHighMemoryUsageSessionsQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "highMemoryUsageSessions",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    queryFn: () =>
+      fetchHighMemoryUsageSessionsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        HIGH_MEMORY_USAGE_SESSIONS_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Profiles ─────────────────────────────────────────────────
+
+export const PROFILES_LIMIT = 10;
+
+export function useProfilesQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "profiles",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    queryFn: () =>
+      fetchProfilesFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        PROFILES_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Alerts ───────────────────────────────────────────────────
+
+const ALERTS_LIMIT = 5;
+
+export function useAlertsOverviewQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "alertsOverview",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchAlertsOverviewFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        ALERTS_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Bug Reports ──────────────────────────────────────────────
+
+const BUG_REPORTS_LIMIT = 5;
+
+export function useBugReportsOverviewQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "bugReportsOverview",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchBugReportsOverviewFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        BUG_REPORTS_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Builds ───────────────────────────────────────────────────
+
+const BUILDS_LIMIT = 10;
+
+export function useBuildsQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "builds",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchBuildsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        BUILDS_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Traces ───────────────────────────────────────────────────
+
+const TRACES_LIMIT = 5;
+
+export function useSpansQuery(
+  params: FilterParams | null,
+  spanName: string | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "spans",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      spanName,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchSpansFromServer(
+        params!.appId,
+        spanName!,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        TRACES_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null && spanName !== null,
+    retry: false,
+  });
+}
+
+// ─── Paginated: Session Replay ────────────────────────────────────────
+
+const SESSION_REPLAY_LIMIT = 5;
+
+export function useSessionReplayOverviewQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "sessionReplayOverview",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchSessionReplayOverviewFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        SESSION_REPLAY_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+// ─── Errors (unified Crashes + ANRs) ─────────────────────────────────────
+
+const ERRORS_OVERVIEW_LIMIT = 5;
+const ERRORS_DETAILS_LIMIT = 1;
+
+export function useErrorsOverviewQuery(
+  params: FilterParams | null,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "errorsOverview",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchErrorsOverviewFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        ERRORS_OVERVIEW_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useErrorsOverviewPlotQuery(params: FilterParams | null) {
+  return useQuery({
+    queryKey: [
+      "errorsOverviewPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchErrorsOverviewPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+      );
+      return mapPlotData(result);
+    },
+    enabled: params !== null,
+    retry: false,
+  });
+}
+
+export function useErrorsDetailsQuery(
+  params: FilterParams | null,
+  errorGroupId: string,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: [
+      "errorsDetails",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      errorGroupId,
+      paginationOffset,
+    ] as const,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      fetchErrorsDetailsFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        errorGroupId,
+        ERRORS_DETAILS_LIMIT,
+        paginationOffset,
+      ),
+    enabled: params !== null && errorGroupId !== "",
+    retry: false,
+  });
+}
+
+export function useErrorsDetailsPlotQuery(
+  params: FilterParams | null,
+  errorGroupId: string,
+) {
+  return useQuery({
+    queryKey: [
+      "errorsDetailsPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      errorGroupId,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchErrorsDetailsPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        errorGroupId,
+      );
+      return mapPlotData(result);
+    },
+    enabled: params !== null && errorGroupId !== "",
+    retry: false,
+  });
+}
+
+export function useErrorsDistributionPlotQuery(
+  params: FilterParams | null,
+  errorGroupId: string,
+) {
+  return useQuery({
+    queryKey: [
+      "errorsDistributionPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      errorGroupId,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchErrorsDistributionPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        errorGroupId,
+      );
+      return parseDistributionPlot(result);
+    },
+    enabled: params !== null && errorGroupId !== "",
+    retry: false,
+  });
+}
+
+export function useErrorsAttributeDistributionPlotQuery(
+  params: FilterParams | null,
+  errorGroupId: string,
+  attribute: DistributionAttribute | null,
+  placeholder?: AttributeDistribution,
+) {
+  return useQuery({
+    queryKey: [
+      "errorsAttributeDistributionPlot",
+      params?.appId,
+      params?.startDate,
+      params?.endDate,
+      params?.filterExpr,
+      errorGroupId,
+      attribute,
+    ] as const,
+    queryFn: async () => {
+      const result = await fetchErrorsAttributeDistributionPlotFromServer(
+        params!.appId,
+        params!.startDate,
+        params!.endDate,
+        params!.filterExpr,
+        errorGroupId,
+        attribute!,
+      );
+      return parseAttributeDistribution(attribute!, result);
+    },
+    enabled: params !== null && errorGroupId !== "" && attribute !== null,
+    placeholderData: placeholder,
+    retry: false,
+  });
+}
+
+export function useErrorGroupCommonPathQuery(
+  appId: string,
+  errorGroupId: string,
+  enabled = true,
+) {
+  return useQuery<ExceptionGroupCommonPath>({
+    queryKey: ["errorGroupCommonPath", appId, errorGroupId] as const,
+    queryFn: async () => {
+      const result = await fetchErrorGroupCommonPathFromServer(
+        appId,
+        errorGroupId,
+      );
+      return result as ExceptionGroupCommonPath;
+    },
+    enabled: enabled && !!appId && !!errorGroupId,
+  });
+}
+
+// ─── Teams ──────────────────────────────────────────────────────────────
+
+export function useTeamsQuery() {
+  return useQuery({
+    queryKey: ["teams"] as const,
+    queryFn: () => fetchTeamsFromServer(),
+  });
+}
+
+// ─── Trace Details ──────────────────────────────────────────────────────
+
+export function useTraceQuery(appId: string, traceId: string) {
+  return useQuery({
+    queryKey: ["trace", appId, traceId] as const,
+    queryFn: () => fetchTraceFromServer(appId, traceId),
+    enabled: !!appId && !!traceId,
+  });
+}
+
+// ─── Session Replay ───────────────────────────────────────────────────
+
+export function useSessionReplayQuery(appId: string, sessionId: string) {
+  return useQuery({
+    queryKey: ["sessionReplay", appId, sessionId] as const,
+    queryFn: () => fetchSessionReplayFromServer(appId, sessionId),
+    enabled: !!appId && !!sessionId,
+    // Attachment URLs are presigned for 48 hours, so returning to a tab left
+    // open longer than that draws against expired ones. Coming back to the tab
+    // refetches and re-signs them, and the staleness window keeps a quick
+    // switch away and back from asking for the whole session again.
+    refetchOnWindowFocus: true,
+    staleTime: 30 * 60 * 1000,
+  });
+}
+
+// ─── Bug Report ─────────────────────────────────────────────────────────
+
+export function useBugReportQuery(appId: string, bugReportId: string) {
+  return useQuery({
+    queryKey: ["bugReport", appId, bugReportId] as const,
+    queryFn: () => fetchBugReportFromServer(appId, bugReportId),
+    enabled: !!appId && !!bugReportId,
+  });
+}
+
+export function useToggleBugReportStatusMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      appId: string;
+      bugReportId: string;
+      newStatus: number;
+    }) => {
+      await updateBugReportStatusFromServer(
+        params.appId,
+        params.bugReportId,
+        params.newStatus,
+      );
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["bugReport", variables.appId, variables.bugReportId],
+      });
+      queryClient.invalidateQueries({ queryKey: ["bugReportsOverview"] });
+    },
+  });
+}
+
+// ─── Notification Preferences ───────────────────────────────────────────
+
+export function useNotifPrefsQuery() {
+  return useQuery({
+    queryKey: ["notifPrefs"] as const,
+    queryFn: () => fetchNotifPrefsFromServer(),
+  });
+}
+
+export function useSaveNotifPrefsMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { notifPrefs: typeof emptyNotifPrefs }) => {
+      try {
+        await updateNotifPrefsFromServer(params.notifPrefs);
+      } catch {
+        // The preferences page shows this message below its own heading.
+        // The message therefore names the user's task, and does not repeat
+        // the server's words for the same failure.
+        throw new Error("Failed to save notification preferences");
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["notifPrefs"] });
+    },
+  });
+}
+
+// ─── Create App ─────────────────────────────────────────────────────────
+
+export function useCreateAppMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { teamId: string; appName: string }) =>
+      createAppFromServer(params.teamId, params.appName),
+    // Returned so callers run only after the apps list has refetched
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["teams"] }),
+        queryClient.invalidateQueries({ queryKey: ["filterApps"] }),
+      ]),
+  });
+}
+
+// ─── Create Team ────────────────────────────────────────────────────────
+
+export function useCreateTeamMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamName: string }) => {
+      const result = await createTeamFromServer(params.teamName);
+      return result as Team;
+    },
+    onSuccess: (newTeam) => {
+      queryClient.setQueryData<Team[]>(["teams"], (old) =>
+        old ? [...old, newTeam] : [newTeam],
+      );
+      queryClient.invalidateQueries({ queryKey: ["teams"] });
+    },
+  });
+}
+
+// ─── Apps Store: Reads ──────────────────────────────────────────────────
+
+export function useAuthzAndMembersQuery(teamId: string | undefined) {
+  return useQuery({
+    queryKey: ["authzAndMembers", teamId] as const,
+    queryFn: () => fetchAuthzAndMembersFromServer(teamId!),
+    enabled: !!teamId,
+  });
+}
+
+export function useAppRetentionQuery(appId: string | undefined) {
+  return useQuery({
+    queryKey: ["appRetention", appId] as const,
+    queryFn: () => fetchAppRetentionFromServer(appId!),
+    enabled: !!appId,
+  });
+}
+
+export function useSdkConfigQuery(appId: string | undefined) {
+  return useQuery({
+    queryKey: ["sdkConfig", appId] as const,
+    queryFn: () => fetchSdkConfigFromServer(appId!),
+    enabled: !!appId,
+  });
+}
+
+export const SDK_CONFIG_HISTORY_LIMIT = 5;
+
+export function useSdkConfigHistoryQuery(
+  appId: string,
+  paginationOffset: number,
+) {
+  return useQuery({
+    queryKey: ["sdkConfigHistory", appId, paginationOffset] as const,
+    queryFn: () =>
+      fetchSdkConfigHistoryFromServer(
+        appId,
+        SDK_CONFIG_HISTORY_LIMIT,
+        paginationOffset,
+      ),
+    placeholderData: keepPreviousData,
+    // When the user saves the SDK config, the history gets a new change.
+    // Remove the history from the cache when it is not on the screen, so the
+    // next time it is shown, it includes the new change.
+    gcTime: 0,
+  });
+}
+
+type BillingInfoData = Awaited<ReturnType<typeof fetchBillingInfoFromServer>>;
+
+type RefetchInterval =
+  | number
+  | false
+  | ((q: Query<BillingInfoData>) => number | false);
+
+export function useBillingInfoQuery(
+  teamId: string | undefined,
+  opts?: { refetchInterval?: RefetchInterval },
+) {
+  return useQuery({
+    queryKey: ["billingInfo", teamId] as const,
+    queryFn: () => fetchBillingInfoFromServer(teamId!),
+    enabled: !!teamId,
+    refetchInterval: opts?.refetchInterval,
+  });
+}
+
+// ─── Apps Store: Mutations ──────────────────────────────────────────────
+
+export function useUpdateAppRetentionMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      appId: string;
+      retention: typeof emptyAppRetention;
+    }) => {
+      await updateAppRetentionFromServer(params.appId, params.retention);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["appRetention", variables.appId],
+      });
+    },
+  });
+}
+
+export function useChangeAppNameMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { appId: string; appName: string }) => {
+      await changeAppNameFromServer(params.appId, params.appName);
+    },
+    // Returned so callers run only after the apps list has refetched
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["teams"] }),
+        queryClient.invalidateQueries({ queryKey: ["filterApps"] }),
+      ]),
+  });
+}
+
+export function useChangeAppApiKeyMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { appId: string }) => {
+      await changeAppApiKeyFromServer(params.appId);
+    },
+    // Returned so callers run only after the apps list has refetched
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["teams"] }),
+        queryClient.invalidateQueries({ queryKey: ["filterApps"] }),
+      ]),
+  });
+}
+
+export function useUpdateAppThresholdPrefsMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      appId: string;
+      prefs: typeof defaultAppThresholdPrefs;
+    }) => {
+      await updateAppThresholdPrefsFromServer(params.appId, params.prefs);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["appThresholdPrefs", variables.appId],
+      });
+    },
+  });
+}
+
+// ─── SDK Configurator ───────────────────────────────────────────────────
+
+export function useSaveSdkConfigMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { appId: string; config: Partial<SdkConfig> }) =>
+      updateSdkConfigFromServer(params.appId, params.config),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["sdkConfig", variables.appId],
+      });
+    },
+  });
+}
+
+// ─── Team Page: Reads ───────────────────────────────────────────────────
+
+export function usePendingInvitesQuery(teamId: string | undefined) {
+  return useQuery({
+    queryKey: ["pendingInvites", teamId] as const,
+    queryFn: () => fetchPendingInvitesFromServer(teamId!),
+    enabled: !!teamId,
+  });
+}
+
+export function useTeamSlackConnectUrlQuery(
+  teamId: string | undefined,
+  enabled: boolean = true,
+) {
+  return useQuery({
+    queryKey: ["teamSlackConnectUrl", teamId] as const,
+    queryFn: async () => {
+      const result = await fetchTeamSlackConnectUrlFromServer(teamId!);
+      return result.url as string;
+    },
+    enabled: !!teamId && enabled,
+  });
+}
+
+export function useTeamSlackStatusQuery(teamId: string | undefined) {
+  return useQuery({
+    queryKey: ["teamSlackStatus", teamId] as const,
+    queryFn: () => fetchTeamSlackStatusFromServer(teamId!),
+    enabled: !!teamId,
+  });
+}
+
+// ─── Team Page: Mutations ───────────────────────────────────────────────
+
+export function useChangeTeamNameMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string; newName: string }) => {
+      await changeTeamNameFromServer(params.teamId, params.newName);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["teams"] });
+    },
+  });
+}
+
+export function useInviteMemberMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      teamId: string;
+      email: string;
+      role: string;
+    }) => {
+      await inviteMemberFromServer(params.teamId, params.email, params.role);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["authzAndMembers", variables.teamId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["pendingInvites", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useRemoveMemberMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string; memberId: string }) => {
+      await removeMemberFromServer(params.teamId, params.memberId);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["authzAndMembers", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useResendPendingInviteMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string; inviteId: string }) => {
+      await resendPendingInviteFromServer(params.teamId, params.inviteId);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["pendingInvites", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useRemovePendingInviteMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string; inviteId: string }) => {
+      await removePendingInviteFromServer(params.teamId, params.inviteId);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["pendingInvites", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useChangeRoleMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      teamId: string;
+      newRole: string;
+      memberId: string;
+    }) => {
+      await changeRoleFromServer(
+        params.teamId,
+        params.newRole,
+        params.memberId,
+      );
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["authzAndMembers", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useUpdateSlackStatusMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string; status: boolean }) => {
+      await updateTeamSlackStatusFromServer(params.teamId, params.status);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["teamSlackStatus", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useRemoveTeamSlackMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { teamId: string }) => {
+      await removeTeamSlackFromServer(params.teamId);
+    },
+    // Settled, not just success: a failed remove can mean the integration is
+    // already gone (removed from another session) or that the response was
+    // lost after the server deleted the row, so refetch the status in either
+    // case.
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["teamSlackStatus", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useTestSlackAlertMutation() {
+  return useMutation({
+    mutationFn: async (params: { teamId: string }) => {
+      await sendTestSlackAlertFromServer(params.teamId);
+    },
+  });
+}
+
+// ─── Usage Store: Reads ─────────────────────────────────────────────────
+
+export function useUsageQuery(teamId: string | undefined) {
+  return useQuery({
+    queryKey: ["usage", teamId] as const,
+    queryFn: () => fetchUsageFromServer(teamId!),
+    enabled: !!teamId,
+  });
+}
+
+export function useUsagePermissionsQuery(teamId: string | undefined) {
+  return useQuery({
+    queryKey: ["usagePermissions", teamId] as const,
+    queryFn: async () => {
+      const result = await fetchAuthzAndMembersFromServer(teamId!);
+      return { canChangePlan: result.can_change_billing === true };
+    },
+    enabled: !!teamId,
+  });
+}
+
+// ─── Usage Store: Mutations ─────────────────────────────────────────────
+
+export function useHandleUpgradeMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { teamId: string; successUrl: string }) =>
+      fetchCheckoutSessionFromServer(params.teamId, params.successUrl),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["billingInfo", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useDowngradeToFreeMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { teamId: string }) =>
+      downgradeToFreeFromServer(params.teamId),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["billingInfo", variables.teamId],
+      });
+    },
+  });
+}
+
+export function useUndoDowngradeMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { teamId: string }) =>
+      undoDowngradeFromServer(params.teamId),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["billingInfo", variables.teamId],
+      });
+    },
+  });
+}
+
+export async function fetchCustomerPortalUrl(
+  teamId: string,
+  returnUrl: string,
+): Promise<{ redirect?: string; error?: string }> {
+  try {
+    const result = await fetchCustomerPortalUrlFromServer(teamId, returnUrl);
+    if (result?.url) {
+      return { redirect: result.url };
+    }
+    return { error: "No portal URL returned." };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      return { error: "Please try again." };
+    }
+    return { error: "Request was cancelled." };
+  }
+}

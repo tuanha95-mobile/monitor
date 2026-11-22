@@ -1,0 +1,220 @@
+package symbolicator
+
+// Source represents a symbolicator source.
+//
+// It is designed to be abstracted over different
+// kinds of sources like S3 & GCS sources for all
+// app platforms. The idea is to re-use a common
+// struct as much as possible.
+//
+// If in future, more complex need arises where
+// it is not possible to re-use or the cost of re-use
+// outweighs the benefits, then refactor as necessary.
+type Source struct {
+	// ID is the id of the source. Can be freely
+	// chosen and is used to identify cache files
+	// in the cache folder.
+	ID string `json:"id"`
+	// Type defines the type of the source
+	// http, s3 or gcs
+	Type string `json:"type"`
+	// Bucket is the name of the bucket.
+	Bucket string `json:"bucket"`
+	// Prefix is the path prefix to put
+	// in front of all keys.
+	Prefix string `json:"prefix"`
+	// Region is the AWS region where the
+	// bucket is located. For S3 compatible
+	// service pass a tuple:
+	// ["custom-region-name", "http://minio-address/"]
+	Region []string `json:"region,omitempty"`
+	// AccessKey is the AWS access key to use.
+	AccessKey string `json:"access_key,omitempty"`
+	// SecretKey is the AWS secret key to use.
+	SecretKey string `json:"secret_key,omitempty"`
+	// PrivateKey is the Google Cloud Storage private
+	// key.
+	PrivateKey string `json:"private_key,omitempty"`
+	// ClientEmail is the Google Cloud Storage email
+	// for authentication.
+	ClientEmail string `json:"client_email,omitempty"`
+	// BearerToken is the authorization token that can be
+	// used instead of `private_key` & `client_email`.
+	BearerToken string `json:"bearer_token,omitempty"`
+	// Url is the base URL for http type sources.
+	Url string `json:"url,omitempty"`
+	// Token is the authorization token for http type sources.
+	Token string `json:"token,omitempty"`
+	// Filters are a set of filters to reduce the
+	// number of unnecessary hits on a symbol server.
+	Filters struct {
+		// FileTypes is a list of file types to restrict
+		// the server to.
+		FileTypes []string `json:"filetypes"`
+		// PathPatterns is a list of glob matches to be
+		// matched on the image name. If the debug image
+		// has no name it will never match.
+		PathPatterns []string `json:"path_patterns"`
+	} `json:"filters"`
+	// Layout configures the file system layout of the
+	// sources.
+	Layout struct {
+		// Type defines the general layout of the
+		// directory.
+		Type string `json:"type"`
+		// Casing enforces a casing style.
+		Casing string `json:"casing"`
+	} `json:"layout"`
+}
+
+// NewS3SourceApple creates an S3 source
+// for Apple platform.
+func NewS3SourceApple(id, bucket, region, origin, accessKey, secretKey string) (source Source) {
+	source.ID = id
+	source.Type = "s3"
+	source.Bucket = bucket
+	source.Prefix = ""
+	source.Region = []string{region, origin}
+	source.AccessKey = accessKey
+	source.SecretKey = secretKey
+	source.Filters.FileTypes = []string{"mach_debug"}
+	source.Filters.PathPatterns = []string{}
+	source.Layout.Type = "unified"
+	source.Layout.Casing = "lowercase"
+
+	return
+}
+
+// NewS3SourceAndroid creates an S3 source
+// for Android platform.
+func NewS3SourceAndroid(id, bucket, region, origin, accessKey, secretKey string) (source Source) {
+	source.ID = id
+	source.Type = "s3"
+	source.Bucket = bucket
+	source.Prefix = ""
+	source.Region = []string{region, origin}
+	source.AccessKey = accessKey
+	source.SecretKey = secretKey
+	source.Filters.FileTypes = []string{"proguard", "elf_debug"}
+	source.Filters.PathPatterns = []string{}
+	source.Layout.Type = "unified"
+	source.Layout.Casing = "lowercase"
+
+	return
+}
+
+// NewGCSSourceApple creates a GCS source
+// for Apple platform.
+func NewGCSSourceApple(id, bucket, bearerToken string) (source Source) {
+	source.ID = id
+	source.Type = "gcs"
+	source.Bucket = bucket
+	source.Prefix = ""
+	source.BearerToken = bearerToken
+	source.Filters.FileTypes = []string{"mach_debug"}
+	source.Filters.PathPatterns = []string{}
+	source.Layout.Type = "unified"
+	source.Layout.Casing = "lowercase"
+
+	return
+}
+
+// NewGCSSourceAndroid creates a GCS source for
+// Android platform.
+func NewGCSSourceAndroid(id, bucket, bearerToken string) (source Source) {
+	source.ID = id
+	source.Type = "gcs"
+	source.Bucket = bucket
+	source.Prefix = ""
+	source.BearerToken = bearerToken
+	source.Filters.FileTypes = []string{"proguard", "elf_debug"}
+	source.Filters.PathPatterns = []string{}
+	source.Layout.Type = "unified"
+	source.Layout.Casing = "lowercase"
+
+	return
+}
+
+// SentrySource represents a Sentry-type symbolicator source.
+// The symbolicator uses this source to fetch symbols via HTTP
+// requests to a Sentry-compatible API endpoint.
+//
+// This is needed for ProGuard symbol lookups on symbolicator
+// 26.3.1+ where S3/GCS sources cannot resolve ProGuard files.
+type SentrySource struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// NewSentrySource creates a Sentry source for ProGuard
+// symbol lookups via HTTP.
+func NewSentrySource(id, url, token string) SentrySource {
+	return SentrySource{
+		ID:    id,
+		Type:  "sentry",
+		URL:   url,
+		Token: token,
+	}
+}
+
+// secretPlaceholder is substituted for sensitive source fields
+// before a request is logged. Real values are still sent over
+// the wire; only the logged copy is redacted.
+const secretPlaceholder = "[redacted]"
+
+// maskSecret replaces a non-empty secret with a placeholder,
+// leaving empty values untouched so the redacted shape matches
+// the original.
+func maskSecret(v string) string {
+	if v == "" {
+		return ""
+	}
+	return secretPlaceholder
+}
+
+// redactSecrets returns a copy of the source with its secret fields
+// masked. Identifiers and non-secret fields — id, bucket, region, and
+// the access key ID (the public half of an AWS key pair) — are kept so
+// the log stays useful for debugging.
+func (s Source) redactSecrets() Source {
+	s.SecretKey = maskSecret(s.SecretKey)
+	s.PrivateKey = maskSecret(s.PrivateKey)
+	s.BearerToken = maskSecret(s.BearerToken)
+	s.Token = maskSecret(s.Token)
+	return s
+}
+
+// redactSecrets returns a copy of the Sentry source with its auth
+// token masked, safe for logging.
+func (s SentrySource) redactSecrets() SentrySource {
+	s.Token = maskSecret(s.Token)
+	return s
+}
+
+// redactSources returns a copy of the sources with every credential
+// masked, safe for logging.
+func redactSources(sources []Source) []Source {
+	if sources == nil {
+		return nil
+	}
+	out := make([]Source, len(sources))
+	for i := range sources {
+		out[i] = sources[i].redactSecrets()
+	}
+	return out
+}
+
+// redactSentrySources returns a copy of the Sentry sources with
+// every token masked, safe for logging.
+func redactSentrySources(sources []SentrySource) []SentrySource {
+	if sources == nil {
+		return nil
+	}
+	out := make([]SentrySource, len(sources))
+	for i := range sources {
+		out[i] = sources[i].redactSecrets()
+	}
+	return out
+}

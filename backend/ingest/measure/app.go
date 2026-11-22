@@ -1,0 +1,65 @@
+package measure
+
+import (
+	"backend/ingest/server"
+	"context"
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/leporo/sqlf"
+)
+
+type App struct {
+	ID           *uuid.UUID `json:"id"`
+	TeamId       uuid.UUID  `json:"team_id"`
+	OSNames      []string   `json:"os_names"`
+	FirstVersion string     `json:"first_version"`
+	Onboarded    bool       `json:"onboarded"`
+	OnboardedAt  time.Time  `json:"onboarded_at"`
+}
+
+// SelectApp selects app by its id.
+func SelectApp(ctx context.Context, id uuid.UUID) (app *App, err error) {
+	var onboarded pgtype.Bool
+	var firstVersion pgtype.Text
+
+	stmt := sqlf.PostgreSQL.
+		Select("id").
+		Select("team_id").
+		Select("onboarded").
+		Select("os_names").
+		Select("first_version").
+		From("apps").
+		Where("id = ?", id)
+
+	defer stmt.Close()
+
+	if app == nil {
+		app = &App{}
+	}
+
+	if err := server.Server.PgPool.QueryRow(ctx, stmt.String(), stmt.Args()...).Scan(&app.ID, &app.TeamId, &onboarded, &app.OSNames, &firstVersion); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		} else {
+			return nil, err
+		}
+	}
+
+	if onboarded.Valid {
+		app.Onboarded = onboarded.Bool
+	} else {
+		app.Onboarded = false
+	}
+
+	if firstVersion.Valid {
+		app.FirstVersion = firstVersion.String
+	} else {
+		app.FirstVersion = ""
+	}
+
+	return
+}

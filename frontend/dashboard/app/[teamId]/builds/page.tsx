@@ -1,0 +1,68 @@
+"use client";
+
+import FilterBar from "@/app/components/filter_bar/filter_bar";
+import { useFilterPage } from "@/app/components/filter_bar/use_filter_page";
+import { filterExprIssuesIn } from "@/app/api/api_error";
+import { useBuildsQuery } from "@/app/query/hooks";
+import { isSandboxTeamId } from "@/app/utils/sandbox";
+import { use } from "react";
+import BuildsResults from "./builds_results";
+
+const PAGINATION_LIMIT = 10;
+
+export default function Builds(props: { params: Promise<{ teamId: string }> }) {
+  const params = use(props.params);
+
+  const {
+    value,
+    apps,
+    keys,
+    keyGroups,
+    keysUnavailable,
+    status,
+    filterParams,
+    paginationOffset,
+    onChange,
+    nextPage,
+    prevPage,
+  } = useFilterPage({
+    teamId: params.teamId,
+    entity: "builds",
+    paginationLimit: PAGINATION_LIMIT,
+    onboarding: false,
+  });
+
+  const buildsQuery = useBuildsQuery(filterParams, paginationOffset);
+
+  const filterExprIssues = filterExprIssuesIn(buildsQuery.error);
+
+  return (
+    <div className="flex flex-col items-start">
+      <div className="py-4" />
+
+      <FilterBar
+        entity="builds"
+        teamId={params.teamId}
+        placeholder="Filter builds…"
+        value={value}
+        apps={apps}
+        keys={keys}
+        keyGroups={keyGroups}
+        keysUnavailable={keysUnavailable}
+        filterExprIssues={filterExprIssues}
+        status={status}
+        onChange={onChange}
+      />
+      <div className="py-4" />
+
+      <BuildsResults
+        status={status}
+        query={buildsQuery}
+        filterExprHasIssues={filterExprIssues !== null}
+        downloadsDisabled={isSandboxTeamId(params.teamId)}
+        onNextPage={nextPage}
+        onPrevPage={prevPage}
+      />
+    </div>
+  );
+}

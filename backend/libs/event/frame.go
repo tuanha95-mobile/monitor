@@ -1,0 +1,298 @@
+package event
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"backend/libs/text"
+)
+
+// FramePrefix is the prefix string that
+// appears in Android stacktrace frames.
+const FramePrefix = "\tat "
+
+// JsFramePrefix is the indent string that
+// appears before each frame in a standard
+// JavaScript stacktrace. The frame body
+// itself starts with "at " (produced by
+// Frame.String for FrameworkJS), so this
+// constant only contributes the leading
+// whitespace.
+const JsFramePrefix = "    "
+
+// GenericPrefix is the prefix string
+// that appears in Android stacktraces.
+const GenericPrefix = ": "
+
+type FrameiOS struct {
+	// FrameIndex is the sequence of the frame.
+	FrameIndex int `json:"frame_index"`
+	// BinaryName is the name of the binary.
+	BinaryName string `json:"binary_name"`
+	// BinaryAddress is the binary load address.
+	BinaryAddress string `json:"binary_address"`
+	// SymbolAddress is the address to symbolicate.
+	SymbolAddress string `json:"symbol_address"`
+	// Offset is the byte offset.
+	Offset int `json:"offset"`
+}
+
+type Frame struct {
+	// LineNum is the line number of the method.
+	LineNum int `json:"line_num"`
+	// ColNum is the column number of the method.
+	ColNum int `json:"col_num"`
+	// ModuleName is the name of the originating module.
+	ModuleName string `json:"module_name"`
+	// FileName is the name of the originating file.
+	FileName string `json:"file_name"`
+	// ClassName is the name of the originating class.
+	ClassName string `json:"class_name"`
+	// MethodName is the name of the originating method.
+	MethodName string `json:"method_name"`
+	// InApp is `true` if the frame originates
+	// from the app module.
+	InApp bool `json:"in_app"`
+	// InstructionAddr is the instruction address
+	// of the frame.
+	InstructionAddr string `json:"instruction_address"`
+	*FrameiOS
+}
+
+type Frames []Frame
+
+// ImageOffset provides the frame's address relative to the start of the
+// binary image it belongs to, as hex, and whether it could be computed.
+func (f Frame) ImageOffset() (string, bool) {
+	if f.FrameiOS == nil {
+		return "", false
+	}
+
+	address, err := strconv.ParseUint(f.SymbolAddress, 16, 64)
+	if err != nil {
+		return "", false
+	}
+
+	base, err := strconv.ParseUint(f.BinaryAddress, 16, 64)
+	if err != nil || address < base {
+		return "", false
+	}
+
+	return strconv.FormatUint(address-base, 16), true
+}
+
+// CodeInfo provides a serialized
+// version of the frame's code information.
+func (f Frame) CodeInfo() string {
+	className := f.ClassName
+	methodName := f.MethodName
+
+	return text.JoinNonEmptyStrings(".", className, methodName)
+}
+
+// FileInfo provides a serialized
+// version of the frame's file information.
+func (f Frame) FileInfo() string {
+	fileName := f.FileName
+	lineNum := ""
+
+	if f.LineNum != 0 {
+		lineNum = strconv.Itoa(f.LineNum)
+	}
+
+	return text.JoinNonEmptyStrings(":", fileName, lineNum)
+}
+
+// String provides a serialized
+// version of the frame based on
+// the given framework.
+func (f Frame) String(frmwrk string) string {
+	switch frmwrk {
+	default:
+		codeInfo := f.CodeInfo()
+		fileInfo := f.FileInfo()
+
+		if fileInfo != "" {
+			fileInfo = fmt.Sprintf(`(%s)`, fileInfo)
+		}
+
+		return fmt.Sprintf(`%s%s`, codeInfo, fileInfo)
+	case FrameworkJS:
+		fileParts := []string{}
+		if f.FileName != "" {
+			fileParts = append(fileParts, f.FileName)
+		}
+		if f.LineNum != 0 {
+			fileParts = append(fileParts, strconv.Itoa(f.LineNum))
+		}
+		if f.ColNum != 0 {
+			fileParts = append(fileParts, strconv.Itoa(f.ColNum))
+		}
+		fileInfo := strings.Join(fileParts, ":")
+		if fileInfo != "" {
+			fileInfo = "(" + fileInfo + ")"
+		}
+		if f.MethodName != "" && fileInfo != "" {
+			return fmt.Sprintf("at %s %s", f.MethodName, fileInfo)
+		} else if f.MethodName != "" {
+			return fmt.Sprintf("at %s", f.MethodName)
+		}
+		return fmt.Sprintf("at %s", fileInfo)
+	case FrameworkNDK:
+		// #00 pc 0x00000000000008f4  libfoo.so (crash_now) (foo.cpp:42)
+		index := 0
+		if f.FrameiOS != nil {
+			index = f.FrameIndex
+		}
+		offset, _ := f.nativeOffset()
+		line := fmt.Sprintf("#%02d pc 0x%016x  %s", index, offset, f.binaryName())
+		if f.MethodName != "" {
+			line += " (" + f.MethodName + ")"
+		}
+		if fileInfo := f.FileInfo(); fileInfo != "" {
+			line += " (" + fileInfo + ")"
+		}
+		return line
+	case FrameworkApple:
+		binaryName := f.BinaryName
+		methodName := f.MethodName
+		className := f.ClassName
+		fileInfo := f.FileInfo()
+
+		// fallbacks for unsymbolicated frames
+		if methodName == "" {
+			methodName = f.SymbolAddress
+		}
+
+		if className == "" {
+			className = f.BinaryAddress
+		}
+
+		// graceful handling for completely unsymbolicated
+		// frames
+		if binaryName == "" {
+			binaryName = "???"
+		}
+
+		// normalize address to 0x prefix
+		addr := normalizeAddress(className)
+
+		// build the tail
+		var tail string
+		if fileInfo != "" {
+			tail = fmt.Sprintf("   (%s)", fileInfo)
+		} else {
+			tail = fmt.Sprintf(" + %d", f.Offset)
+		}
+
+		// long symbol handling
+		const maxSymbolLen = 55
+		displayMethod := methodName
+		extraLine := ""
+		if len(methodName) > maxSymbolLen {
+			displayMethod = methodName[:maxSymbolLen-3] + "..."
+			extraLine = "\n    Full symbol:" + methodName
+		}
+
+		// final line in classic Apple .crash style:
+		//   0   BinaryName   0xaddr   method + offset   (file:line)
+		// keep module + address + (truncated) symbol on one line for scannability.
+		// only the rare monster SwiftUI symbols get a second "Full symbol:" line.
+		line := fmt.Sprintf("%3d   %-28s  %s   %s%s",
+			f.FrameIndex,
+			binaryName,
+			addr,
+			displayMethod,
+			tail,
+		)
+
+		return line + extraLine
+	}
+}
+
+// normalizeAddress ensures a memory address string is correctly
+// formatted with a "0x" prefix and lowercase characters.
+func normalizeAddress(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return strings.ToLower(s)
+	}
+	if len(s) == 16 && isHexString(s) {
+		return "0x" + strings.ToLower(s)
+	}
+	return s
+}
+
+// isHexString checks if the given string consists
+// entirely of valid hexadecimal digits.
+func isHexString(s string) bool {
+	for _, r := range s {
+		if !unicode.Is(unicode.Hex_Digit, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// binaryName returns BinaryName, or "???"
+// when it is not set.
+func (f Frame) binaryName() string {
+	if f.FrameiOS == nil || f.BinaryName == "" {
+		return "???"
+	}
+	return f.BinaryName
+}
+
+// nativeOffset provides the frame's instruction
+// address relative to its binary's load address.
+func (f Frame) nativeOffset() (uint64, bool) {
+	if f.FrameiOS == nil {
+		return 0, false
+	}
+
+	address, err := strconv.ParseUint(strings.TrimPrefix(f.InstructionAddr, "0x"), 16, 64)
+	if err != nil {
+		return 0, false
+	}
+
+	base, err := strconv.ParseUint(strings.TrimPrefix(f.BinaryAddress, "0x"), 16, 64)
+	if err != nil || address < base {
+		return 0, false
+	}
+
+	return address - base, true
+}
+
+// nativeFunctionName returns a C++ function name
+// without its parameters and qualifiers, so
+// "Foo::bar(int) const" becomes "Foo::bar".
+func nativeFunctionName(name string) string {
+	name = strings.TrimSpace(name)
+	for trimmed := ""; trimmed != name; {
+		trimmed = name
+		for _, qualifier := range []string{" const", " volatile", " &&", " &"} {
+			name = strings.TrimSuffix(name, qualifier)
+		}
+	}
+	if !strings.HasSuffix(name, ")") {
+		return name
+	}
+	depth := 0
+	for i := len(name) - 1; i >= 0; i-- {
+		switch name[i] {
+		case ')':
+			depth++
+		case '(':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(name[:i])
+			}
+		}
+	}
+	return name
+}

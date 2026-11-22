@@ -1,0 +1,421 @@
+//go:build integration
+
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"backend/libs/filter"
+	"backend/testinfra"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// The fingerprint columns are FixedString(32).
+const (
+	fpOverviewCrash   = "0000000000000000000000000000e001"
+	fpOverviewANR     = "0000000000000000000000000000e002"
+	fpOverviewAppHang = "0000000000000000000000000000e003"
+)
+
+// Events are seeded at this instant and the group rows at insert time, so
+// the queried range must cover both.
+var errorsOverviewTestTime = time.Now().UTC()
+
+var anrOnlyFilterQuery = "filter_expr=" + url.QueryEscape(`error_type:in:[ANR]`)
+
+func errorsOverviewTimeRangeQuery() string {
+	from := errorsOverviewTestTime.Add(-time.Hour).Format("2006-01-02T15:04:05.000Z")
+	to := errorsOverviewTestTime.Add(time.Hour).Format("2006-01-02T15:04:05.000Z")
+	return "from=" + from + "&to=" + to
+}
+
+func newErrorsOverviewContext(callerID string, appID uuid.UUID, rawQuery string) (*gin.Context, *httptest.ResponseRecorder) {
+	path := "/apps/" + appID.String() + "/errors"
+	if rawQuery != "" {
+		path += "?" + rawQuery
+	}
+	c, w := newTestGinContext("GET", path, nil)
+	c.Set("userId", callerID)
+	c.Params = gin.Params{{Key: "id", Value: appID.String()}}
+	return c, w
+}
+
+func newErrorsPlotInstancesContext(callerID string, appID uuid.UUID, rawQuery string) (*gin.Context, *httptest.ResponseRecorder) {
+	path := "/apps/" + appID.String() + "/errors/plots/instances"
+	if rawQuery != "" {
+		path += "?" + rawQuery
+	}
+	c, w := newTestGinContext("GET", path, nil)
+	c.Set("userId", callerID)
+	c.Params = gin.Params{{Key: "id", Value: appID.String()}}
+	return c, w
+}
+
+func newErrorDetailErrorsContext(callerID string, appID uuid.UUID, fingerprint, rawQuery string) (*gin.Context, *httptest.ResponseRecorder) {
+	path := "/apps/" + appID.String() + "/errorGroups/" + fingerprint + "/errors"
+	if rawQuery != "" {
+		path += "?" + rawQuery
+	}
+	c, w := newTestGinContext("GET", path, nil)
+	c.Set("userId", callerID)
+	c.Params = gin.Params{{Key: "id", Value: appID.String()}, {Key: "errorGroupId", Value: fingerprint}}
+	return c, w
+}
+
+// seedErrorsOverviewApp seeds one crash and one ANR with their group rows.
+func seedErrorsOverviewApp(ctx context.Context, t *testing.T, teamID, appID uuid.UUID) {
+	t.Helper()
+	now := errorsOverviewTestTime
+
+	seedExceptionGroup(ctx, t, teamID.String(), appID.String(), fpOverviewCrash)
+	seedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+		Type: "exception", Fingerprint: fpOverviewCrash, Severity: "fatal", Timestamp: now,
+	})
+
+	seedAnrGroup(ctx, t, teamID.String(), appID.String(), fpOverviewANR)
+	seedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+		Type: "anr", Fingerprint: fpOverviewANR, Timestamp: now,
+	})
+}
+
+func TestGetErrorOverview(t *testing.T) {
+	ctx := context.Background()
+	defer cleanupAll(ctx, t)
+
+	ownerID, teamID := seedTeamAndMemberWithRole(t, ctx, "owner")
+	appID := uuid.New()
+	seedApp(ctx, t, appID, teamID, 90)
+	seedErrorsOverviewApp(ctx, t, teamID, appID)
+
+	groupIDs := func(t *testing.T, rawQuery string) []string {
+		t.Helper()
+		c, w := newErrorsOverviewContext(ownerID, appID, rawQuery)
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Results []struct {
+				ID string `json:"id"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+
+		ids := make([]string, len(body.Results))
+		for i, r := range body.Results {
+			ids[i] = r.ID
+		}
+		return ids
+	}
+
+	t.Run("every error group of the app", func(t *testing.T) {
+		got := groupIDs(t, errorsOverviewTimeRangeQuery())
+		if len(got) != 2 {
+			t.Fatalf("results = %v, want both error groups", got)
+		}
+	})
+
+	t.Run("each row has its aggregates and, when asked, its trend", func(t *testing.T) {
+		c, w := newErrorsOverviewContext(ownerID, appID, errorsOverviewTimeRangeQuery()+"&timezone=UTC&include_trend=true")
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Results []struct {
+				Count    uint64    `json:"count"`
+				Sessions uint64    `json:"sessions"`
+				LastSeen time.Time `json:"last_seen"`
+				Trend    []struct {
+					Instances uint64 `json:"instances"`
+				} `json:"trend"`
+			} `json:"results"`
+			Meta struct {
+				PlotTimeGroup string `json:"plot_time_group"`
+			} `json:"meta"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if body.Meta.PlotTimeGroup != filter.PlotTimeGroupHours {
+			t.Errorf("plot_time_group = %q, want %q", body.Meta.PlotTimeGroup, filter.PlotTimeGroupHours)
+		}
+		for _, r := range body.Results {
+			if r.Count != 1 || r.Sessions != 1 || r.LastSeen.IsZero() {
+				t.Errorf("want one instance in one session with a last seen time, got %+v", r)
+			}
+			var total uint64
+			for _, point := range r.Trend {
+				total += point.Instances
+			}
+			if total != r.Count {
+				t.Errorf("trend total = %d, want the count %d", total, r.Count)
+			}
+		}
+	})
+
+	t.Run("the trend is left out unless asked for", func(t *testing.T) {
+		c, w := newErrorsOverviewContext(ownerID, appID, errorsOverviewTimeRangeQuery())
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Results []map[string]any `json:"results"`
+			Meta    map[string]any   `json:"meta"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if _, ok := body.Meta["plot_time_group"]; ok {
+			t.Errorf("meta has plot_time_group: %s", w.Body.String())
+		}
+		for _, r := range body.Results {
+			if _, ok := r["trend"]; ok {
+				t.Errorf("row has a trend: %s", w.Body.String())
+			}
+		}
+	})
+
+	t.Run("a filter expression narrows the results", func(t *testing.T) {
+		got := groupIDs(t, errorsOverviewTimeRangeQuery()+"&"+anrOnlyFilterQuery)
+		if len(got) != 1 || got[0] != fpOverviewANR {
+			t.Errorf("results = %v, want only the anr group %q", got, fpOverviewANR)
+		}
+	})
+
+	t.Run("a filter expression on a key the entity does not have is refused", func(t *testing.T) {
+		c, w := newErrorsOverviewContext(ownerID, appID, errorsOverviewTimeRangeQuery()+"&filter_expr=span_status:in:error")
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Error  string `json:"error"`
+			Issues []struct {
+				Message string `json:"message"`
+			} `json:"filter_expr_issues"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if body.Error != "invalid_filter_expr" || len(body.Issues) != 1 {
+			t.Fatalf("want one filter expression issue, got %s", w.Body.String())
+		}
+		if !strings.Contains(body.Issues[0].Message, "span_status") {
+			t.Errorf("want the unknown key named, got %q", body.Issues[0].Message)
+		}
+	})
+
+	t.Run("an error type the key does not offer is refused", func(t *testing.T) {
+		c, w := newErrorsOverviewContext(ownerID, appID, errorsOverviewTimeRangeQuery()+"&filter_expr=error_type:in:crash")
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body: %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+func TestGetErrorOverviewAppHangs(t *testing.T) {
+	ctx := context.Background()
+	defer cleanupAll(ctx, t)
+
+	ownerID, teamID := seedTeamAndMemberWithRole(t, ctx, "owner")
+	appID := uuid.New()
+	seedApp(ctx, t, appID, teamID, 90)
+
+	th.SeedAppHangGroup(ctx, t, teamID.String(), appID.String(), fpOverviewAppHang)
+	for _, state := range []string{"killed", "recovered"} {
+		seedEventRows(ctx, t, teamID.String(), appID.String(), 1, testinfra.EventRow{
+			Type: "app_hang", Fingerprint: fpOverviewAppHang, AppHangState: state, Timestamp: errorsOverviewTestTime,
+		})
+	}
+
+	type row struct {
+		ID        string `json:"id"`
+		ErrorType string `json:"error_type"`
+		Severity  string `json:"severity"`
+		Count     uint64 `json:"count"`
+	}
+	rows := func(t *testing.T, rawQuery string) []row {
+		t.Helper()
+		c, w := newErrorsOverviewContext(ownerID, appID, rawQuery)
+		h.GetErrorOverview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Results []row `json:"results"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		return body.Results
+	}
+
+	t.Run("a killed and a recovered app hang are one row", func(t *testing.T) {
+		got := rows(t, errorsOverviewTimeRangeQuery())
+		if len(got) != 1 {
+			t.Fatalf("results = %+v, want one app hang row", got)
+		}
+		if r := got[0]; r.ID != fpOverviewAppHang || r.ErrorType != "app_hang" || r.Severity != "" || r.Count != 2 {
+			t.Errorf("want one app hang with no severity and both instances, got %+v", r)
+		}
+	})
+
+	t.Run("the app hang detail lists both states", func(t *testing.T) {
+		c, w := newErrorDetailErrorsContext(ownerID, appID, fpOverviewAppHang, errorsOverviewTimeRangeQuery())
+		h.GetErrorDetailErrors(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+		var body struct {
+			Results []struct {
+				Type    string `json:"type"`
+				AppHang struct {
+					State string `json:"state"`
+				} `json:"app_hang"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		states := map[string]bool{}
+		for _, r := range body.Results {
+			if r.Type != "app_hang" {
+				t.Errorf("type = %q, want app_hang", r.Type)
+			}
+			states[r.AppHang.State] = true
+		}
+		if len(body.Results) != 2 || !states["killed"] || !states["recovered"] {
+			t.Errorf("want a killed and a recovered event, got %s", w.Body.String())
+		}
+	})
+}
+
+func TestGetErrorDetailErrors(t *testing.T) {
+	ctx := context.Background()
+	defer cleanupAll(ctx, t)
+
+	ownerID, teamID := seedTeamAndMemberWithRole(t, ctx, "owner")
+	appID := uuid.New()
+	seedApp(ctx, t, appID, teamID, 90)
+	seedErrorsOverviewApp(ctx, t, teamID, appID)
+
+	t.Run("a filter expression narrows the events", func(t *testing.T) {
+		c, w := newErrorDetailErrorsContext(ownerID, appID, fpOverviewCrash, errorsOverviewTimeRangeQuery()+"&filter_expr=os_name:in:ios")
+		h.GetErrorDetailErrors(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+		var body struct {
+			Results []any `json:"results"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(body.Results) != 0 {
+			t.Errorf("want no events on ios, got %d", len(body.Results))
+		}
+	})
+
+	t.Run("one group's events cannot be filtered by error type", func(t *testing.T) {
+		c, w := newErrorDetailErrorsContext(ownerID, appID, fpOverviewCrash, errorsOverviewTimeRangeQuery()+"&"+anrOnlyFilterQuery)
+		h.GetErrorDetailErrors(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "error_type") {
+			t.Errorf("want the unknown key named, got %s", w.Body.String())
+		}
+	})
+}
+
+func TestGetErrorOverviewPlotInstances(t *testing.T) {
+	ctx := context.Background()
+	defer cleanupAll(ctx, t)
+
+	ownerID, teamID := seedTeamAndMemberWithRole(t, ctx, "owner")
+	appID := uuid.New()
+	seedApp(ctx, t, appID, teamID, 90)
+	seedErrorsOverviewApp(ctx, t, teamID, appID)
+
+	totalInstances := func(t *testing.T, rawQuery string) uint64 {
+		t.Helper()
+		c, w := newErrorsPlotInstancesContext(ownerID, appID, rawQuery)
+		h.GetErrorOverviewPlotInstances(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		}
+
+		var body []struct {
+			ID   string `json:"id"`
+			Data []struct {
+				Datetime  string `json:"datetime"`
+				Instances uint64 `json:"instances"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+
+		var total uint64
+		for _, entry := range body {
+			for _, d := range entry.Data {
+				total += d.Instances
+			}
+		}
+		return total
+	}
+
+	t.Run("every error of the app", func(t *testing.T) {
+		if got := totalInstances(t, "timezone=Etc/UTC&"+errorsOverviewTimeRangeQuery()); got != 2 {
+			t.Errorf("total instances = %d, want 2", got)
+		}
+	})
+
+	t.Run("a filter expression narrows the plot", func(t *testing.T) {
+		rawQuery := "timezone=Etc/UTC&" + errorsOverviewTimeRangeQuery() + "&" + anrOnlyFilterQuery
+		if got := totalInstances(t, rawQuery); got != 1 {
+			t.Errorf("total instances = %d, want 1", got)
+		}
+	})
+
+	t.Run("a request without a timezone is refused", func(t *testing.T) {
+		c, w := newErrorsPlotInstancesContext(ownerID, appID, errorsOverviewTimeRangeQuery())
+		h.GetErrorOverviewPlotInstances(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "timezone") {
+			t.Errorf("want the missing field named, got %s", w.Body.String())
+		}
+	})
+}

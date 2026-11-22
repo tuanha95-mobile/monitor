@@ -1,0 +1,69 @@
+package logcomment
+
+// Root is the name of the `root`
+// logcomment key.
+const Root = "root"
+
+// Name is the name of the `name`
+// logcomment key.
+const Name = "name"
+
+// Crashes is the root key for `crashes`
+// logcomment.
+const Crashes = "crashes"
+
+// Errors is the root key for `errors`
+// logcomment.
+const Errors = "errors"
+
+// Sessions is the root key for `sessions`
+// logcomment.
+const Sessions = "sessions"
+
+// ANRs is the root key for `anrs`
+// logcomment.
+const ANRs = "anrs"
+
+// Filters is the root key for `filters`
+// logcomment.
+const Filters = "filters"
+
+// Metrics is the root key for `metrics`
+// logcomment.
+const Metrics = "metrics"
+
+// Health is the root key for `health`
+// logcomment.
+const Health = "health"
+
+// Journeys is the root key for the `journeys`
+// logcomment.
+const Journeys = "journeys"
+
+// Spans is the root key for the `spans`
+// logcomment.
+const Spans = "spans"
+
+// BugReports is the root key for the `bug_reports`
+// logcomment.
+const BugReports = "bug_reports"
+
+// Network is the root key for the `network`
+// logcomment.
+const Network = "network"
+
+// Alerts is the root key for the `alerts`
+// logcomment.
+const Alerts = "alerts"
+
+// Memory is the root key for the `memory`
+// logcomment.
+const Memory = "memory"
+
+// Profiles is the root key for the `profiles`
+// logcomment.
+const Profiles = "profiles"
+
+// Funnels is the root key for the `funnels`
+// logcomment.
+const Funnels = "funnels"

@@ -1,0 +1,2101 @@
+import SdkConfigurator from "@/app/components/sdk_configurator";
+import { beforeEach, describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+
+// Mock API calls
+jest.mock("@/app/api/api_calls", () => ({
+  __esModule: true,
+}));
+
+// The component calls saveSdkConfigMutation.mutate({ appId, config }, { onSuccess, onError })
+// We capture these calls and invoke the callbacks ourselves.
+const mockMutate = jest.fn();
+
+jest.mock("@/app/query/hooks", () => ({
+  __esModule: true,
+  useSaveSdkConfigMutation: () => ({
+    mutate: mockMutate,
+    mutateAsync: jest.fn(),
+    isPending: false,
+    isSuccess: false,
+    isError: false,
+    status: "idle" as string,
+    error: null as Error | null,
+    data: undefined as any,
+    reset: jest.fn(),
+  }),
+}));
+
+// Mock toast utilities
+jest.mock("@/app/components/toast", () => ({
+  toastPositive: jest.fn(),
+  toastNegative: jest.fn(),
+}));
+
+jest.mock("@/app/components/sdk_config_history", () => ({
+  __esModule: true,
+  default: ({ appId }: any) => (
+    <div data-testid="sdk-config-history-mock">{appId}</div>
+  ),
+}));
+
+// Mock Accordion to keep all items open for testing
+jest.mock("@/app/components/accordion", () => ({
+  Accordion: ({ children }: any) => <div>{children}</div>,
+  AccordionContent: ({ children }: any) => <div>{children}</div>,
+  AccordionItem: ({ children, value }: any) => (
+    <div data-testid={`accordion-item-${value}`}>{children}</div>
+  ),
+  AccordionTrigger: ({ children }: any) => <div>{children}</div>,
+}));
+
+jest.mock("@/app/components/dropdown_select", () => ({
+  __esModule: true,
+  default: ({
+    initialSelected,
+    onChangeSelected,
+    "data-testid": testId,
+  }: any) => (
+    <select
+      data-testid={testId}
+      value={initialSelected}
+      onChange={(e) => onChangeSelected?.(e.target.value)}
+    >
+      <option value="All text and media">All text and media</option>
+      <option value="All text">All text</option>
+      <option value="All text except clickable">
+        All text except clickable
+      </option>
+      <option value="Sensitive fields only">Sensitive fields only</option>
+      <option value="Debug">Debug</option>
+      <option value="Info">Info</option>
+      <option value="Warning">Warning</option>
+      <option value="Error">Error</option>
+      <option value="Fatal">Fatal</option>
+    </select>
+  ),
+  DropdownSelectType: { SingleString: "single_string" },
+}));
+
+jest.mock("@/app/components/danger_confirmation_dialog", () => ({
+  __esModule: true,
+  default: ({
+    open,
+    body,
+    affirmativeText,
+    cancelText,
+    onAffirmativeAction,
+    onCancelAction,
+  }: any) =>
+    open ? (
+      <div data-testid="danger-confirmation-dialog">
+        <div>{body}</div>
+        <button
+          data-testid="dialog-affirmative-button"
+          onClick={onAffirmativeAction}
+        >
+          {affirmativeText}
+        </button>
+        <button data-testid="dialog-cancel-button" onClick={onCancelAction}>
+          {cancelText}
+        </button>
+      </div>
+    ) : null,
+}));
+
+const mockInitialConfig = {
+  error_fatal_take_screenshot: true,
+  error_replay_duration: 5,
+  error_fatal_replay_enabled: true,
+  error_unhandled_replay_enabled: true,
+  error_handled_replay_enabled: false,
+  error_fatal_sampling_rate: 100,
+  error_unhandled_sampling_rate: 100,
+  error_handled_sampling_rate: 0,
+  anr_take_screenshot: true,
+  anr_timeline_duration: 5,
+  app_hang_threshold_millis: 2000,
+  app_hang_timeline_duration: 5,
+  app_hang_sampling_rate: 100,
+  app_hang_replay_enabled: true,
+  bug_report_timeline_duration: 5,
+  trace_sampling_rate: 0.1,
+  launch_sampling_rate: 0.1,
+  journey_sampling_rate: 0.1,
+  http_sampling_rate: 0.1,
+  http_disable_event_for_urls: [],
+  http_track_request_for_urls: [],
+  http_track_response_for_urls: [],
+  http_blocked_headers: [],
+  screenshot_mask_level: "sensitive_fields_only",
+  profile_sampling_rate: 100,
+  memory_usage_interval: 5,
+  memory_usage_background_interval: 10,
+  memory_usage_session_sampling_rate: 100,
+  log_autocollect_enabled: true,
+  log_min_severity: 12,
+  log_ignore_patterns: [],
+};
+
+// Helper: simulate the mutation.mutate call succeeding
+function simulateMutateSuccess() {
+  mockMutate.mockImplementation((_params: any, options: any) => {
+    if (options?.onSuccess) {
+      options.onSuccess();
+    }
+  });
+}
+
+// Helper: simulate the mutation.mutate call failing
+function simulateMutateError() {
+  mockMutate.mockImplementation((_params: any, options: any) => {
+    if (options?.onError) {
+      options.onError(new Error("Failed"));
+    }
+  });
+}
+
+describe("SdkConfigurator Component", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("renders the heading and all accordion sections", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Check heading
+    expect(screen.getByText("Configure Data Collection")).toBeInTheDocument();
+
+    // Check all accordion sections are rendered
+    expect(screen.getByText("Errors")).toBeInTheDocument();
+    expect(screen.getByText("ANRs")).toBeInTheDocument();
+    expect(screen.getByText("App Hangs")).toBeInTheDocument();
+    expect(screen.getByText("Bug Reports")).toBeInTheDocument();
+    expect(screen.getByText("Traces")).toBeInTheDocument();
+    expect(screen.getByText("Launch Metrics")).toBeInTheDocument();
+    expect(screen.getByText("Profiles")).toBeInTheDocument();
+    expect(screen.getByText("User Journeys")).toBeInTheDocument();
+    expect(screen.getByText("HTTP")).toBeInTheDocument();
+    expect(screen.getByText("Screenshot Masking")).toBeInTheDocument();
+    expect(screen.getByText("Memory")).toBeInTheDocument();
+    expect(screen.getByText("Logs")).toBeInTheDocument();
+  });
+
+  it("switches between the settings and the history", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("History"));
+
+    expect(screen.getByText("Data Collection History")).toBeInTheDocument();
+    expect(screen.getByTestId("sdk-config-history-mock")).toHaveTextContent(
+      "test-app-id",
+    );
+    expect(screen.getByText("Errors")).not.toBeVisible();
+
+    fireEvent.click(screen.getByText("Configure Data Collection"));
+
+    expect(
+      screen.queryByTestId("sdk-config-history-mock"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Errors")).toBeVisible();
+  });
+
+  it("shows the ANR section only when osName is Android", () => {
+    const renderWith = (osNames: string[] | null) =>
+      render(
+        <SdkConfigurator
+          appId="test-app-id"
+          appName="Test App"
+          initialConfig={mockInitialConfig}
+          currentUserCanChangeAppSettings={true}
+          osNames={osNames}
+        />,
+      );
+
+    const { unmount } = renderWith(["android"]);
+    expect(screen.getByText("ANRs")).toBeInTheDocument();
+    unmount();
+
+    for (const osNames of [["ios"], [], null]) {
+      const { unmount: unmountNext } = renderWith(osNames);
+      expect(screen.queryByText("ANRs")).not.toBeInTheDocument();
+      unmountNext();
+    }
+  });
+
+  it("shows the App Hangs section only when osName is ios.", () => {
+    const renderWith = (osNames: string[] | null) =>
+      render(
+        <SdkConfigurator
+          appId="test-app-id"
+          appName="Test App"
+          initialConfig={mockInitialConfig}
+          currentUserCanChangeAppSettings={true}
+          osNames={osNames}
+        />,
+      );
+
+    for (const osNames of [["ios"], ["ipados"]]) {
+      const { unmount } = renderWith(osNames);
+      expect(screen.getByText("App Hangs")).toBeInTheDocument();
+      unmount();
+    }
+
+    for (const osNames of [["android"], [], null]) {
+      const { unmount } = renderWith(osNames);
+      expect(screen.queryByText("App Hangs")).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it.each([
+    { platform: "iOS", osNames: ["ios"], showBackgroundInterval: false },
+    { platform: "Android", osNames: ["android"], showBackgroundInterval: true },
+    { platform: "unknown OS", osNames: null, showBackgroundInterval: false },
+    { platform: "no reported OS", osNames: [], showBackgroundInterval: false },
+  ])(
+    "shows the supported memory settings for $platform",
+    ({ osNames, showBackgroundInterval }) => {
+      render(
+        <SdkConfigurator
+          appId="test-app-id"
+          appName="Test App"
+          initialConfig={mockInitialConfig}
+          currentUserCanChangeAppSettings={true}
+          osNames={osNames}
+        />,
+      );
+
+      expect(
+        screen.getByTestId("memory-usage-interval-input"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByTestId("memory-usage-session-sampling-rate-input"),
+      ).toBeInTheDocument();
+      const backgroundInterval = screen.queryByTestId(
+        "memory-usage-background-interval-input",
+      );
+      if (showBackgroundInterval) {
+        expect(backgroundInterval).toBeInTheDocument();
+      } else {
+        expect(backgroundInterval).not.toBeInTheDocument();
+      }
+    },
+  );
+
+  it("initializes with correct config values and all save buttons disabled", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Check that all save buttons are initially disabled
+    expect(screen.getByTestId("errors-save-button")).toBeDisabled();
+    expect(screen.getByTestId("anrs-save-button")).toBeDisabled();
+    expect(screen.getByTestId("app-hangs-save-button")).toBeDisabled();
+    expect(screen.getByTestId("bug-reports-save-button")).toBeDisabled();
+    expect(screen.getByTestId("traces-save-button")).toBeDisabled();
+    expect(screen.getByTestId("launch-save-button")).toBeDisabled();
+    expect(screen.getByTestId("journey-save-button")).toBeDisabled();
+    expect(screen.getByTestId("memory-save-button")).toBeDisabled();
+    expect(screen.getByTestId("http-save-button")).toBeDisabled();
+    expect(screen.getByTestId("masking-save-button")).toBeDisabled();
+  });
+
+  it("disables all inputs when currentUserCanChangeAppSettings is false", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={false}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Check that switches are disabled
+    expect(screen.getByTestId("error-fatal-screenshot-switch")).toBeDisabled();
+    expect(screen.getByTestId("anr-screenshot-switch")).toBeDisabled();
+
+    // Check that inputs are disabled
+    expect(screen.getByTestId("error-replay-duration-input")).toBeDisabled();
+    expect(screen.getByTestId("anr-timeline-duration-input")).toBeDisabled();
+    expect(screen.getByTestId("app-hang-replay-switch")).toBeDisabled();
+    expect(screen.getByTestId("app-hang-threshold-input")).toBeDisabled();
+    expect(
+      screen.getByTestId("app-hang-timeline-duration-input"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("app-hang-sampling-rate-input")).toBeDisabled();
+    expect(
+      screen.getByTestId("bug-report-timeline-duration-input"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("error-handled-replay-switch")).toBeDisabled();
+    expect(
+      screen.getByTestId("error-fatal-sampling-rate-input"),
+    ).toBeDisabled();
+    expect(
+      screen.getByTestId("error-unhandled-sampling-rate-input"),
+    ).toBeDisabled();
+    expect(
+      screen.getByTestId("error-handled-sampling-rate-input"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("trace-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("launch-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("journey-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("memory-usage-interval-input")).toBeDisabled();
+    expect(
+      screen.getByTestId("memory-usage-session-sampling-rate-input"),
+    ).toBeDisabled();
+
+    // Check that textareas are disabled
+    expect(screen.getByTestId("http-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("http-disable-urls-textarea")).toBeDisabled();
+    expect(
+      screen.getByTestId("http-track-request-urls-textarea"),
+    ).toBeDisabled();
+    expect(
+      screen.getByTestId("http-track-response-urls-textarea"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("http-blocked-headers-textarea")).toBeDisabled();
+  });
+
+  it("saves errors config with correct payload, shows loading state, and displays success toast", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make changes to errors config
+    const errorSwitch = screen.getByTestId("error-fatal-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    const errorTimelineInput = screen.getByTestId(
+      "error-replay-duration-input",
+    );
+    await act(async () => {
+      fireEvent.change(errorTimelineInput, { target: { value: "50" } });
+      fireEvent.blur(errorTimelineInput);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("errors-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            error_fatal_take_screenshot: false,
+            error_replay_duration: 50,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    // Verify success toast was shown
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves per severity session replay toggles", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("error-unhandled-replay-switch"));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("error-handled-replay-switch"));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("errors-save-button"));
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("dialog-affirmative-button"));
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            error_fatal_replay_enabled: true,
+            error_unhandled_replay_enabled: false,
+            error_handled_replay_enabled: true,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves a sampling rate per error severity", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const rates: [string, string][] = [
+      ["error-fatal-sampling-rate-input", "50"],
+      ["error-unhandled-sampling-rate-input", "25"],
+      ["error-handled-sampling-rate-input", "10"],
+    ];
+
+    for (const [testId, value] of rates) {
+      const input = screen.getByTestId(testId);
+      await act(async () => {
+        fireEvent.change(input, { target: { value } });
+        fireEvent.blur(input);
+      });
+    }
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("errors-save-button"));
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("dialog-affirmative-button"));
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            error_fatal_sampling_rate: 50,
+            error_unhandled_sampling_rate: 25,
+            error_handled_sampling_rate: 10,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("limits each error sampling rate to max value of 100", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const testIds = [
+      "error-fatal-sampling-rate-input",
+      "error-unhandled-sampling-rate-input",
+      "error-handled-sampling-rate-input",
+    ];
+
+    for (const testId of testIds) {
+      const input = screen.getByTestId(testId) as HTMLInputElement;
+      expect(input).toHaveAttribute("max", "100");
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: "150" } });
+        fireEvent.blur(input);
+      });
+
+      expect(input.value).toBe("100");
+    }
+  });
+
+  it("saves ANR config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Make changes to ANR config
+    const anrSwitch = screen.getByTestId("anr-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(anrSwitch);
+    });
+
+    const anrTimelineInput = screen.getByTestId("anr-timeline-duration-input");
+    await act(async () => {
+      fireEvent.change(anrTimelineInput, { target: { value: "75" } });
+      fireEvent.blur(anrTimelineInput);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("anrs-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            anr_take_screenshot: false,
+            anr_timeline_duration: 75,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves app hang config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    const thresholdInput = screen.getByTestId("app-hang-threshold-input");
+    await act(async () => {
+      fireEvent.change(thresholdInput, { target: { value: "3000" } });
+      fireEvent.blur(thresholdInput);
+    });
+
+    const timelineInput = screen.getByTestId(
+      "app-hang-timeline-duration-input",
+    );
+    await act(async () => {
+      fireEvent.change(timelineInput, { target: { value: "60" } });
+      fireEvent.blur(timelineInput);
+    });
+
+    const samplingInput = screen.getByTestId("app-hang-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(samplingInput, { target: { value: "50" } });
+      fireEvent.blur(samplingInput);
+    });
+
+    const replaySwitch = screen.getByTestId("app-hang-replay-switch");
+    await act(async () => {
+      fireEvent.click(replaySwitch);
+    });
+
+    const saveButton = screen.getByTestId("app-hangs-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            app_hang_threshold_millis: 3000,
+            app_hang_timeline_duration: 60,
+            app_hang_sampling_rate: 50,
+            app_hang_replay_enabled: false,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves bug reports config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make changes to bug reports config
+    const bugReportTimelineInput = screen.getByTestId(
+      "bug-report-timeline-duration-input",
+    );
+    await act(async () => {
+      fireEvent.change(bugReportTimelineInput, { target: { value: "60" } });
+      fireEvent.blur(bugReportTimelineInput);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("bug-reports-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            bug_report_timeline_duration: 60,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves traces config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change trace sampling rate
+    const traceInput = screen.getByTestId("trace-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(traceInput, { target: { value: "0.5" } });
+      fireEvent.blur(traceInput);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("traces-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            trace_sampling_rate: 0.5,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves HTTP config with correct payload including all URL and header fields", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change all HTTP fields
+    const httpSamplingInput = screen.getByTestId("http-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(httpSamplingInput, { target: { value: "0.5" } });
+      fireEvent.blur(httpSamplingInput);
+    });
+
+    const httpDisableUrlsTextarea = screen.getByTestId(
+      "http-disable-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpDisableUrlsTextarea, {
+        target: { value: "https://example.com/*\nhttps://test.com/*" },
+      });
+    });
+
+    const httpTrackRequestUrlsTextarea = screen.getByTestId(
+      "http-track-request-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpTrackRequestUrlsTextarea, {
+        target: { value: "https://api.example.com/*" },
+      });
+    });
+
+    const httpTrackResponseUrlsTextarea = screen.getByTestId(
+      "http-track-response-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpTrackResponseUrlsTextarea, {
+        target: { value: "https://api.example.com/users/*" },
+      });
+    });
+
+    const httpBlockedHeadersTextarea = screen.getByTestId(
+      "http-blocked-headers-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpBlockedHeadersTextarea, {
+        target: { value: "Authorization\nX-API-Key" },
+      });
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("http-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            http_sampling_rate: 0.5,
+            http_disable_event_for_urls: [
+              "https://example.com/*",
+              "https://test.com/*",
+            ],
+            http_track_request_for_urls: ["https://api.example.com/*"],
+            http_track_response_for_urls: ["https://api.example.com/users/*"],
+            http_blocked_headers: ["Authorization", "X-API-Key"],
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves masking config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change masking dropdown
+    const maskingDropdown = screen.getByTestId(
+      "screenshot-mask-level-dropdown",
+    );
+    await act(async () => {
+      fireEvent.change(maskingDropdown, { target: { value: "All text" } });
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("masking-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            screenshot_mask_level: "all_text",
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves logs config with correct payload on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change min log level dropdown
+    const logLevelDropdown = screen.getByTestId("min-log-level-dropdown");
+    await act(async () => {
+      fireEvent.change(logLevelDropdown, { target: { value: "Warning" } });
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("logs-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            log_min_severity: 16,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("saves logs config with automatic collection disabled on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Toggle automatic log collection off
+    const autoLogSwitch = screen.getByTestId("automatic-log-collection-switch");
+    await act(async () => {
+      fireEvent.click(autoLogSwitch);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("logs-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify mutate was called with correct payload
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            log_autocollect_enabled: false,
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+
+    expect(toastPositive).toHaveBeenCalled();
+  });
+
+  it("displays error toast when save fails and keeps save button enabled", async () => {
+    const { toastNegative } = require("@/app/components/toast");
+    simulateMutateError();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make a change to enable the save button
+    const errorSwitch = screen.getByTestId("error-fatal-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("errors-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Wait for error toast
+    await waitFor(() => {
+      expect(toastNegative).toHaveBeenCalled();
+    });
+
+    // Verify save button is still enabled
+    expect(screen.getByTestId("errors-save-button")).not.toBeDisabled();
+  });
+
+  it("disables save button on successful save", async () => {
+    const { toastPositive } = require("@/app/components/toast");
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make a change to errors config
+    const errorSwitch = screen.getByTestId("error-fatal-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    // Verify save button is enabled after change
+    const saveButton = screen.getByTestId("errors-save-button");
+    expect(saveButton).not.toBeDisabled();
+
+    // Click save button
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Wait for success toast
+    await waitFor(() => {
+      expect(toastPositive).toHaveBeenCalled();
+    });
+
+    // Verify save button is disabled after successful save
+    await waitFor(() => {
+      expect(saveButton).toBeDisabled();
+    });
+
+    // Make another change to verify the button can be enabled again
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    // Verify save button is enabled again after new change
+    expect(saveButton).not.toBeDisabled();
+  });
+
+  it("renders http urls in text area trimming whitespace and filtering empty lines", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={{
+          ...mockInitialConfig,
+          http_disable_event_for_urls: [
+            "https://example.com/*",
+            "https://test.com/*",
+          ],
+        }}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Verify initial array is converted to newline-separated string
+    const httpDisableUrlsTextarea = screen.getByTestId(
+      "http-disable-urls-textarea",
+    );
+    expect(httpDisableUrlsTextarea).toHaveValue(
+      "https://example.com/*\nhttps://test.com/*",
+    );
+
+    // Test input with whitespace and empty lines
+    await act(async () => {
+      fireEvent.change(httpDisableUrlsTextarea, {
+        target: {
+          value:
+            "  https://api.example.com/*  \n\n  https://another.com/*  \n\n\n",
+        },
+      });
+    });
+
+    // Click save to trigger conversion
+    const saveButton = screen.getByTestId("http-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Click affirmative on confirmation dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    // Verify whitespace is trimmed and empty lines are filtered
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: expect.objectContaining({
+            http_disable_event_for_urls: [
+              "https://api.example.com/*",
+              "https://another.com/*",
+            ],
+          }),
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("correctly converts mask levels between backend and display formats", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={{
+          ...mockInitialConfig,
+          screenshot_mask_level: "sensitive_fields_only",
+        }}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const maskingDropdown = screen.getByTestId(
+      "screenshot-mask-level-dropdown",
+    );
+    expect(maskingDropdown).toHaveValue("Sensitive fields only");
+  });
+
+  it("saves error config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make changes to error config
+    const errorSwitch = screen.getByTestId("error-fatal-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    const errorTimelineInput = screen.getByTestId(
+      "error-replay-duration-input",
+    );
+    await act(async () => {
+      fireEvent.change(errorTimelineInput, { target: { value: "75" } });
+      fireEvent.blur(errorTimelineInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("errors-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            error_fatal_take_screenshot: false,
+            error_replay_duration: 75,
+            error_fatal_replay_enabled: true,
+            error_unhandled_replay_enabled: true,
+            error_handled_replay_enabled: false,
+            error_fatal_sampling_rate: 100,
+            error_unhandled_sampling_rate: 100,
+            error_handled_sampling_rate: 0,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves ANR config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Make changes to ANR config
+    const anrSwitch = screen.getByTestId("anr-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(anrSwitch);
+    });
+
+    const anrTimelineInput = screen.getByTestId("anr-timeline-duration-input");
+    await act(async () => {
+      fireEvent.change(anrTimelineInput, { target: { value: "50" } });
+      fireEvent.blur(anrTimelineInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("anrs-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            anr_take_screenshot: false,
+            anr_timeline_duration: 50,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves bug reports config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make changes to bug reports config
+    const bugReportTimelineInput = screen.getByTestId(
+      "bug-report-timeline-duration-input",
+    );
+    await act(async () => {
+      fireEvent.change(bugReportTimelineInput, { target: { value: "120" } });
+      fireEvent.blur(bugReportTimelineInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("bug-reports-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            bug_report_timeline_duration: 120,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves traces config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change trace sampling rate
+    const traceInput = screen.getByTestId("trace-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(traceInput, { target: { value: "0.5" } });
+      fireEvent.blur(traceInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("traces-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            trace_sampling_rate: 0.5,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves launch config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change launch sampling rate
+    const launchInput = screen.getByTestId("launch-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(launchInput, { target: { value: "1" } });
+      fireEvent.blur(launchInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("launch-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            launch_sampling_rate: 1,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves journey config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change journey sampling rate
+    const journeyInput = screen.getByTestId("journey-sampling-rate-input");
+    await act(async () => {
+      fireEvent.change(journeyInput, { target: { value: "0.25" } });
+      fireEvent.blur(journeyInput);
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("journey-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            journey_sampling_rate: 0.25,
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it.each([
+    { platform: "Android", osNames: ["android"], backgroundInterval: 30 },
+    { platform: "iOS", osNames: ["ios"], backgroundInterval: 10 },
+  ])(
+    "saves memory config on confirmation for $platform",
+    async ({ osNames, backgroundInterval }) => {
+      simulateMutateSuccess();
+
+      render(
+        <SdkConfigurator
+          appId="test-app-id"
+          appName="Test App"
+          initialConfig={mockInitialConfig}
+          currentUserCanChangeAppSettings={true}
+          osNames={osNames}
+        />,
+      );
+
+      await act(async () => {
+        fireEvent.change(screen.getByTestId("memory-usage-interval-input"), {
+          target: { value: "10" },
+        });
+        fireEvent.blur(screen.getByTestId("memory-usage-interval-input"));
+        if (osNames.includes("android")) {
+          fireEvent.change(
+            screen.getByTestId("memory-usage-background-interval-input"),
+            { target: { value: "30" } },
+          );
+          fireEvent.blur(
+            screen.getByTestId("memory-usage-background-interval-input"),
+          );
+        }
+        fireEvent.change(
+          screen.getByTestId("memory-usage-session-sampling-rate-input"),
+          { target: { value: "50" } },
+        );
+        fireEvent.blur(
+          screen.getByTestId("memory-usage-session-sampling-rate-input"),
+        );
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("memory-save-button"));
+      });
+
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("dialog-affirmative-button"));
+      });
+
+      await waitFor(() => {
+        expect(mockMutate).toHaveBeenCalledWith(
+          {
+            appId: "test-app-id",
+            config: {
+              memory_usage_interval: 10,
+              memory_usage_background_interval: backgroundInterval,
+              memory_usage_session_sampling_rate: 50,
+            },
+          },
+          expect.any(Object),
+        );
+      });
+    },
+  );
+
+  it("saves HTTP config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change HTTP fields
+    const httpSamplingRateInput = screen.getByTestId(
+      "http-sampling-rate-input",
+    );
+    await act(async () => {
+      fireEvent.change(httpSamplingRateInput, { target: { value: "0.5" } });
+      fireEvent.blur(httpSamplingRateInput);
+    });
+
+    const httpDisableUrlsTextarea = screen.getByTestId(
+      "http-disable-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpDisableUrlsTextarea, {
+        target: { value: "https://example.com/*\nhttps://test.com/*" },
+      });
+    });
+
+    const httpTrackRequestUrlsTextarea = screen.getByTestId(
+      "http-track-request-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpTrackRequestUrlsTextarea, {
+        target: { value: "https://api.example.com/*" },
+      });
+    });
+
+    const httpTrackResponseUrlsTextarea = screen.getByTestId(
+      "http-track-response-urls-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpTrackResponseUrlsTextarea, {
+        target: { value: "https://api.example.com/users/*" },
+      });
+    });
+
+    const httpBlockedHeadersTextarea = screen.getByTestId(
+      "http-blocked-headers-textarea",
+    );
+    await act(async () => {
+      fireEvent.change(httpBlockedHeadersTextarea, {
+        target: { value: "Authorization\nX-API-Key" },
+      });
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("http-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            http_sampling_rate: 0.5,
+            http_disable_event_for_urls: [
+              "https://example.com/*",
+              "https://test.com/*",
+            ],
+            http_track_request_for_urls: ["https://api.example.com/*"],
+            http_track_response_for_urls: ["https://api.example.com/users/*"],
+            http_blocked_headers: ["Authorization", "X-API-Key"],
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("saves masking config on confirmation", async () => {
+    simulateMutateSuccess();
+
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Change masking level
+    const maskingDropdown = screen.getByTestId(
+      "screenshot-mask-level-dropdown",
+    );
+    await act(async () => {
+      fireEvent.change(maskingDropdown, { target: { value: "All text" } });
+    });
+
+    // Click save and confirm
+    const saveButton = screen.getByTestId("masking-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    const affirmativeButton = screen.getByTestId("dialog-affirmative-button");
+    await act(async () => {
+      fireEvent.click(affirmativeButton);
+    });
+
+    await waitFor(() => {
+      expect(mockMutate).toHaveBeenCalledWith(
+        {
+          appId: "test-app-id",
+          config: {
+            screenshot_mask_level: "all_text",
+          },
+        },
+        expect.any(Object),
+      );
+    });
+  });
+
+  it("disables all inputs for users without change permission", () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={false}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    // Check that switches are disabled
+    expect(screen.getByTestId("error-fatal-screenshot-switch")).toBeDisabled();
+    expect(screen.getByTestId("anr-screenshot-switch")).toBeDisabled();
+
+    // Check that inputs are disabled
+    expect(screen.getByTestId("error-replay-duration-input")).toBeDisabled();
+    expect(screen.getByTestId("anr-timeline-duration-input")).toBeDisabled();
+    expect(screen.getByTestId("app-hang-replay-switch")).toBeDisabled();
+    expect(screen.getByTestId("app-hang-threshold-input")).toBeDisabled();
+    expect(
+      screen.getByTestId("app-hang-timeline-duration-input"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("app-hang-sampling-rate-input")).toBeDisabled();
+    expect(
+      screen.getByTestId("bug-report-timeline-duration-input"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("trace-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("launch-sampling-rate-input")).toBeDisabled();
+    expect(screen.getByTestId("journey-sampling-rate-input")).toBeDisabled();
+
+    // Check that textareas are disabled
+    expect(screen.getByTestId("http-disable-urls-textarea")).toBeDisabled();
+    expect(
+      screen.getByTestId("http-track-request-urls-textarea"),
+    ).toBeDisabled();
+    expect(
+      screen.getByTestId("http-track-response-urls-textarea"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("http-blocked-headers-textarea")).toBeDisabled();
+
+    // Check that all save buttons are disabled
+    expect(screen.getByTestId("errors-save-button")).toBeDisabled();
+    expect(screen.getByTestId("anrs-save-button")).toBeDisabled();
+    expect(screen.getByTestId("app-hangs-save-button")).toBeDisabled();
+    expect(screen.getByTestId("bug-reports-save-button")).toBeDisabled();
+    expect(screen.getByTestId("traces-save-button")).toBeDisabled();
+    expect(screen.getByTestId("launch-save-button")).toBeDisabled();
+    expect(screen.getByTestId("journey-save-button")).toBeDisabled();
+    expect(screen.getByTestId("http-save-button")).toBeDisabled();
+    expect(screen.getByTestId("masking-save-button")).toBeDisabled();
+  });
+
+  it("limits trace sampling rate to max value of 100", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const traceInput = screen.getByTestId(
+      "trace-sampling-rate-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 100
+    expect(traceInput).toHaveAttribute("max", "100");
+
+    // Try to set value above 100
+    await act(async () => {
+      fireEvent.change(traceInput, { target: { value: "150" } });
+      fireEvent.blur(traceInput);
+    });
+
+    // Value should be clamped to 100
+    expect(traceInput.value).toBe("100");
+  });
+
+  it("limits journey sampling rate to max value of 100", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const journeyInput = screen.getByTestId(
+      "journey-sampling-rate-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 100
+    expect(journeyInput).toHaveAttribute("max", "100");
+
+    // Try to set value above 100
+    await act(async () => {
+      fireEvent.change(journeyInput, { target: { value: "200" } });
+      fireEvent.blur(journeyInput);
+    });
+
+    // Value should be clamped to 100
+    expect(journeyInput.value).toBe("100");
+  });
+
+  it("limits launch sampling rate to max value of 100", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const launchInput = screen.getByTestId(
+      "launch-sampling-rate-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 100
+    expect(launchInput).toHaveAttribute("max", "100");
+
+    // Try to set value above 100
+    await act(async () => {
+      fireEvent.change(launchInput, { target: { value: "150" } });
+      fireEvent.blur(launchInput);
+    });
+
+    // Value should be clamped to 100
+    expect(launchInput.value).toBe("100");
+  });
+
+  it("cancels save when dialog is dismissed", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    // Make changes to error config
+    const errorSwitch = screen.getByTestId("error-fatal-screenshot-switch");
+    await act(async () => {
+      fireEvent.click(errorSwitch);
+    });
+
+    // Click save button
+    const saveButton = screen.getByTestId("errors-save-button");
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // Wait for dialog
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("danger-confirmation-dialog"),
+      ).toBeInTheDocument();
+    });
+
+    // Click cancel button
+    const cancelButton = screen.getByTestId("dialog-cancel-button");
+    await act(async () => {
+      fireEvent.click(cancelButton);
+    });
+
+    // Verify dialog is closed and save action was not called
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId("danger-confirmation-dialog"),
+      ).not.toBeInTheDocument();
+    });
+    expect(mockMutate).not.toHaveBeenCalled();
+
+    // Verify save button is still enabled
+    expect(saveButton).not.toBeDisabled();
+  });
+
+  it("limits error timeline duration to max value of 3600", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const errorTimelineInput = screen.getByTestId(
+      "error-replay-duration-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 3600
+    expect(errorTimelineInput).toHaveAttribute("max", "3600");
+
+    // Try to set value above 3600
+    await act(async () => {
+      fireEvent.change(errorTimelineInput, { target: { value: "5000" } });
+      fireEvent.blur(errorTimelineInput);
+    });
+
+    // Value should be clamped to 3600
+    expect(errorTimelineInput.value).toBe("3600");
+  });
+
+  it("limits anr timeline duration to max value of 3600", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={["android", "ios"]}
+      />,
+    );
+
+    const anrTimelineInput = screen.getByTestId(
+      "anr-timeline-duration-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 3600
+    expect(anrTimelineInput).toHaveAttribute("max", "3600");
+
+    // Try to set value above 3600
+    await act(async () => {
+      fireEvent.change(anrTimelineInput, { target: { value: "5000" } });
+      fireEvent.blur(anrTimelineInput);
+    });
+
+    // Value should be clamped to 3600
+    expect(anrTimelineInput.value).toBe("3600");
+  });
+
+  it("limits bug report timeline duration to max value of 3600", async () => {
+    render(
+      <SdkConfigurator
+        appId="test-app-id"
+        appName="Test App"
+        initialConfig={mockInitialConfig}
+        currentUserCanChangeAppSettings={true}
+        osNames={null}
+      />,
+    );
+
+    const bugReportTimelineInput = screen.getByTestId(
+      "bug-report-timeline-duration-input",
+    ) as HTMLInputElement;
+
+    // Verify max attribute is set to 3600
+    expect(bugReportTimelineInput).toHaveAttribute("max", "3600");
+
+    // Try to set value above 3600
+    await act(async () => {
+      fireEvent.change(bugReportTimelineInput, { target: { value: "5000" } });
+      fireEvent.blur(bugReportTimelineInput);
+    });
+
+    // Value should be clamped to 3600
+    expect(bugReportTimelineInput.value).toBe("3600");
+  });
+});

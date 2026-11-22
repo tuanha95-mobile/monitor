@@ -1,0 +1,619 @@
+package sdkconfig
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"slices"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/leporo/sqlf"
+	"github.com/valkey-io/valkey-go"
+)
+
+// Valkey cache key & field names.
+const (
+	configCacheKeyPrefix = "sdk_config:"
+	// cacheFieldData keeps the entry a hash & marks the payload shape.
+	// Rename it when the shape changes so legacy entries read as a miss.
+	cacheFieldData = "config"
+	// cacheFieldUpdatedAt holds the source row's updated_at in unix micros.
+	cacheFieldUpdatedAt = "updated_at"
+)
+
+// Config cache TTL & jitter.
+const (
+	// configCacheTTL is how long a cached config entry lives, jittered so
+	// entries written together don't expire together.
+	configCacheTTL = 4 * time.Hour
+	// configCacheTTLJitter is the fraction configCacheTTL varies by, either way.
+	configCacheTTLJitter = 0.10
+)
+
+// ErrNoCacheClient is returned by cache writes when no Valkey client is configured.
+var ErrNoCacheClient = errors.New("valkey client not available")
+
+// jitteredCacheTTL returns configCacheTTL varied by up to configCacheTTLJitter
+// either way, in whole seconds.
+func jitteredCacheTTL() int64 {
+	factor := 1 + configCacheTTLJitter*(2*rand.Float64()-1)
+	return int64(configCacheTTL.Seconds() * factor)
+}
+
+// Screenshot mask levels an SDK accepts.
+const (
+	ScreenshotMaskLevelAllTextAndMedia        ScreenshotMaskLevel = "all_text_and_media"
+	ScreenshotMaskLevelAllText                ScreenshotMaskLevel = "all_text"
+	ScreenshotMaskLevelAllTextExceptClickable ScreenshotMaskLevel = "all_text_except_clickable"
+	ScreenshotMaskLevelSensitiveFieldsOnly    ScreenshotMaskLevel = "sensitive_fields_only"
+)
+
+// ScreenshotMaskLevel is how much of a screenshot an SDK masks.
+type ScreenshotMaskLevel string
+
+// SdkConfig is an app's SDK configuration as served to SDKs.
+//
+// When adding, renaming or removing a field that the dashboard shows, update
+// historyFields too so the config history records changes to it.
+// A migration that renames or drops its column must also rename or remove that
+// key in measure.sdk_config_history.
+type SdkConfig struct {
+	MaxEventsInBatch               int                 `json:"max_events_in_batch"`
+	ErrorReplayDuration            int                 `json:"error_replay_duration"`
+	ANRTimelineDuration            int                 `json:"anr_timeline_duration"`
+	BugReportTimelineDuration      int                 `json:"bug_report_timeline_duration"`
+	TraceSamplingRate              float64             `json:"trace_sampling_rate"`
+	JourneySamplingRate            float64             `json:"journey_sampling_rate"`
+	ScreenshotMaskLevel            ScreenshotMaskLevel `json:"screenshot_mask_level"`
+	LogAutocollectEnabled          bool                `json:"log_autocollect_enabled"`
+	LogMinSeverity                 int                 `json:"log_min_severity"`
+	LogIgnorePatterns              []string            `json:"log_ignore_patterns"`
+	CPUUsageInterval               int                 `json:"cpu_usage_interval"`
+	MemoryUsageInterval            int                 `json:"memory_usage_interval"`
+	MemoryUsageBackgroundInterval  int                 `json:"memory_usage_background_interval"`
+	MemoryUsageSessionSamplingRate float64             `json:"memory_usage_session_sampling_rate"`
+	ErrorFatalTakeScreenshot       bool                `json:"error_fatal_take_screenshot"`
+	ErrorFatalReplayEnabled        bool                `json:"error_fatal_replay_enabled"`
+	ErrorUnhandledReplayEnabled    bool                `json:"error_unhandled_replay_enabled"`
+	ErrorHandledReplayEnabled      bool                `json:"error_handled_replay_enabled"`
+	ErrorFatalSamplingRate         float64             `json:"error_fatal_sampling_rate"`
+	ErrorUnhandledSamplingRate     float64             `json:"error_unhandled_sampling_rate"`
+	ErrorHandledSamplingRate       float64             `json:"error_handled_sampling_rate"`
+	ANRTakeScreenshot              bool                `json:"anr_take_screenshot"`
+	AppHangThresholdMillis         int                 `json:"app_hang_threshold_millis"`
+	AppHangTimelineDuration        int                 `json:"app_hang_timeline_duration"`
+	AppHangSamplingRate            float64             `json:"app_hang_sampling_rate"`
+	AppHangReplayEnabled           bool                `json:"app_hang_replay_enabled"`
+	LaunchSamplingRate             float64             `json:"launch_sampling_rate"`
+	GestureClickTakeSnapshot       bool                `json:"gesture_click_take_snapshot"`
+	HTTPSamplingRate               float64             `json:"http_sampling_rate"`
+	HTTPDisableEventForURLs        []string            `json:"http_disable_event_for_urls"`
+	HTTPTrackRequestForURLs        []string            `json:"http_track_request_for_urls"`
+	HTTPTrackResponseForURLs       []string            `json:"http_track_response_for_urls"`
+	HTTPBlockedHeaders             []string            `json:"http_blocked_headers"`
+	ProfileSamplingRate            float64             `json:"profile_sampling_rate"`
+	UpdatedAt                      *time.Time          `json:"-"`
+	UpdatedBy                      *uuid.UUID          `json:"-"`
+}
+
+// MarshalJSON emits the older crash_* keys alongside the error_* ones. They are derived
+// here rather than stored, so no caller can serve a config without them.
+//
+// SDKs released before the rename only know the old names and will never learn the new ones.
+// Dropping these keys does not fail loudly for those SDKs, it silently reverts them to their
+// compiled defaults while the dashboard keeps showing the configured value. Remove only once
+// traffic from those versions has stopped, which attribute.measure_sdk_version can confirm.
+func (s SdkConfig) MarshalJSON() ([]byte, error) {
+	type config SdkConfig
+
+	return json.Marshal(struct {
+		config
+		CrashTimelineDuration int  `json:"crash_timeline_duration"`
+		CrashTakeScreenshot   bool `json:"crash_take_screenshot"`
+	}{
+		config:                config(s),
+		CrashTimelineDuration: s.ErrorReplayDuration,
+		CrashTakeScreenshot:   s.ErrorFatalTakeScreenshot,
+	})
+}
+
+// ConfigPatch is a partial SdkConfig update, nil fields are left unchanged.
+type ConfigPatch struct {
+	MaxEventsInBatch               *int                 `json:"max_events_in_batch,omitempty"`
+	ErrorReplayDuration            *int                 `json:"error_replay_duration,omitempty"`
+	ANRTimelineDuration            *int                 `json:"anr_timeline_duration,omitempty"`
+	BugReportTimelineDuration      *int                 `json:"bug_report_timeline_duration,omitempty"`
+	TraceSamplingRate              *float64             `json:"trace_sampling_rate,omitempty"`
+	JourneySamplingRate            *float64             `json:"journey_sampling_rate,omitempty"`
+	ScreenshotMaskLevel            *ScreenshotMaskLevel `json:"screenshot_mask_level,omitempty"`
+	LogAutocollectEnabled          *bool                `json:"log_autocollect_enabled,omitempty"`
+	LogMinSeverity                 *int                 `json:"log_min_severity,omitempty"`
+	LogIgnorePatterns              *[]string            `json:"log_ignore_patterns,omitempty"`
+	CPUUsageInterval               *int                 `json:"cpu_usage_interval,omitempty"`
+	MemoryUsageInterval            *int                 `json:"memory_usage_interval,omitempty"`
+	MemoryUsageBackgroundInterval  *int                 `json:"memory_usage_background_interval,omitempty"`
+	MemoryUsageSessionSamplingRate *float64             `json:"memory_usage_session_sampling_rate,omitempty"`
+	ErrorFatalTakeScreenshot       *bool                `json:"error_fatal_take_screenshot,omitempty"`
+	ErrorFatalReplayEnabled        *bool                `json:"error_fatal_replay_enabled,omitempty"`
+	ErrorUnhandledReplayEnabled    *bool                `json:"error_unhandled_replay_enabled,omitempty"`
+	ErrorHandledReplayEnabled      *bool                `json:"error_handled_replay_enabled,omitempty"`
+	ErrorFatalSamplingRate         *float64             `json:"error_fatal_sampling_rate,omitempty"`
+	ErrorUnhandledSamplingRate     *float64             `json:"error_unhandled_sampling_rate,omitempty"`
+	ErrorHandledSamplingRate       *float64             `json:"error_handled_sampling_rate,omitempty"`
+	ANRTakeScreenshot              *bool                `json:"anr_take_screenshot,omitempty"`
+	AppHangThresholdMillis         *int                 `json:"app_hang_threshold_millis,omitempty"`
+	AppHangTimelineDuration        *int                 `json:"app_hang_timeline_duration,omitempty"`
+	AppHangSamplingRate            *float64             `json:"app_hang_sampling_rate,omitempty"`
+	AppHangReplayEnabled           *bool                `json:"app_hang_replay_enabled,omitempty"`
+	LaunchSamplingRate             *float64             `json:"launch_sampling_rate,omitempty"`
+	GestureClickSnapshot           *bool                `json:"gesture_click_take_snapshot,omitempty"`
+	HTTPSamplingRate               *float64             `json:"http_sampling_rate,omitempty"`
+	HTTPDisableEventForURLs        *[]string            `json:"http_disable_event_for_urls,omitempty"`
+	HTTPTrackRequestForURLs        *[]string            `json:"http_track_request_for_urls,omitempty"`
+	HTTPTrackResponseForURLs       *[]string            `json:"http_track_response_for_urls,omitempty"`
+	HTTPBlockedHeaders             *[]string            `json:"http_blocked_headers,omitempty"`
+	ProfileSamplingRate            *float64             `json:"profile_sampling_rate,omitempty"`
+}
+
+// SdkConfigFieldChange is one field's value before & after a config update.
+type SdkConfigFieldChange struct {
+	Old any `json:"old"`
+	New any `json:"new"`
+}
+
+// historyField is one setting recorded in the config history.
+type historyField struct {
+	column string
+	value  func(SdkConfig) any
+}
+
+// historyFields are the settings whose changes are recorded in the config
+// history. Only settings shown in the dashboard are listed.
+var historyFields = []historyField{
+	{"error_fatal_sampling_rate", func(c SdkConfig) any { return c.ErrorFatalSamplingRate }},
+	{"error_unhandled_sampling_rate", func(c SdkConfig) any { return c.ErrorUnhandledSamplingRate }},
+	{"error_handled_sampling_rate", func(c SdkConfig) any { return c.ErrorHandledSamplingRate }},
+	{"error_fatal_take_screenshot", func(c SdkConfig) any { return c.ErrorFatalTakeScreenshot }},
+	{"error_fatal_replay_enabled", func(c SdkConfig) any { return c.ErrorFatalReplayEnabled }},
+	{"error_unhandled_replay_enabled", func(c SdkConfig) any { return c.ErrorUnhandledReplayEnabled }},
+	{"error_handled_replay_enabled", func(c SdkConfig) any { return c.ErrorHandledReplayEnabled }},
+	{"error_replay_duration", func(c SdkConfig) any { return c.ErrorReplayDuration }},
+	{"anr_take_screenshot", func(c SdkConfig) any { return c.ANRTakeScreenshot }},
+	{"anr_timeline_duration", func(c SdkConfig) any { return c.ANRTimelineDuration }},
+	{"app_hang_threshold_millis", func(c SdkConfig) any { return c.AppHangThresholdMillis }},
+	{"app_hang_timeline_duration", func(c SdkConfig) any { return c.AppHangTimelineDuration }},
+	{"app_hang_sampling_rate", func(c SdkConfig) any { return c.AppHangSamplingRate }},
+	{"app_hang_replay_enabled", func(c SdkConfig) any { return c.AppHangReplayEnabled }},
+	{"bug_report_timeline_duration", func(c SdkConfig) any { return c.BugReportTimelineDuration }},
+	{"trace_sampling_rate", func(c SdkConfig) any { return c.TraceSamplingRate }},
+	{"launch_sampling_rate", func(c SdkConfig) any { return c.LaunchSamplingRate }},
+	{"profile_sampling_rate", func(c SdkConfig) any { return c.ProfileSamplingRate }},
+	{"journey_sampling_rate", func(c SdkConfig) any { return c.JourneySamplingRate }},
+	{"http_sampling_rate", func(c SdkConfig) any { return c.HTTPSamplingRate }},
+	{"http_disable_event_for_urls", func(c SdkConfig) any { return c.HTTPDisableEventForURLs }},
+	{"http_track_request_for_urls", func(c SdkConfig) any { return c.HTTPTrackRequestForURLs }},
+	{"http_track_response_for_urls", func(c SdkConfig) any { return c.HTTPTrackResponseForURLs }},
+	{"http_blocked_headers", func(c SdkConfig) any { return c.HTTPBlockedHeaders }},
+	{"screenshot_mask_level", func(c SdkConfig) any { return c.ScreenshotMaskLevel }},
+	{"memory_usage_interval", func(c SdkConfig) any { return c.MemoryUsageInterval }},
+	{"memory_usage_background_interval", func(c SdkConfig) any { return c.MemoryUsageBackgroundInterval }},
+	{"memory_usage_session_sampling_rate", func(c SdkConfig) any { return c.MemoryUsageSessionSamplingRate }},
+	{"log_autocollect_enabled", func(c SdkConfig) any { return c.LogAutocollectEnabled }},
+	{"log_min_severity", func(c SdkConfig) any { return c.LogMinSeverity }},
+	{"log_ignore_patterns", func(c SdkConfig) any { return c.LogIgnorePatterns }},
+}
+
+// Diff returns the historyFields settings whose values differ between before
+// & after, keyed by column name.
+func Diff(before, after SdkConfig) map[string]SdkConfigFieldChange {
+	changes := map[string]SdkConfigFieldChange{}
+	for _, field := range historyFields {
+		oldValue, newValue := field.value(before), field.value(after)
+		if !equalValues(oldValue, newValue) {
+			changes[field.column] = SdkConfigFieldChange{Old: oldValue, New: newValue}
+		}
+	}
+	return changes
+}
+
+var historyColumns = func() []string {
+	columns := make([]string, len(historyFields))
+	for i, field := range historyFields {
+		columns[i] = field.column
+	}
+	return columns
+}()
+
+// equalValues compares two values read by historyFields, which are either
+// string lists or comparable values.
+func equalValues(a, b any) bool {
+	if aList, ok := a.([]string); ok {
+		return slices.Equal(aList, b.([]string))
+	}
+	return a == b
+}
+
+// IsValid reports whether s is a known screenshot mask level.
+func (s ScreenshotMaskLevel) IsValid() bool {
+	switch s {
+	case ScreenshotMaskLevelAllText,
+		ScreenshotMaskLevelAllTextExceptClickable,
+		ScreenshotMaskLevelAllTextAndMedia,
+		ScreenshotMaskLevelSensitiveFieldsOnly:
+		return true
+	}
+	return false
+}
+
+// createDefaultConfig returns the SDK config new apps start with.
+func createDefaultConfig() SdkConfig {
+	return SdkConfig{
+		MaxEventsInBatch:               10000,
+		ErrorReplayDuration:            300,
+		ANRTimelineDuration:            300,
+		BugReportTimelineDuration:      300,
+		TraceSamplingRate:              100,
+		JourneySamplingRate:            100,
+		ScreenshotMaskLevel:            ScreenshotMaskLevelAllTextAndMedia,
+		LogAutocollectEnabled:          false,
+		LogMinSeverity:                 16,
+		LogIgnorePatterns:              []string{},
+		CPUUsageInterval:               5,
+		MemoryUsageInterval:            5,
+		MemoryUsageBackgroundInterval:  10,
+		MemoryUsageSessionSamplingRate: 0.01,
+		ErrorFatalTakeScreenshot:       true,
+		ErrorFatalReplayEnabled:        true,
+		ErrorUnhandledReplayEnabled:    false,
+		ErrorHandledReplayEnabled:      false,
+		ErrorFatalSamplingRate:         100,
+		ErrorUnhandledSamplingRate:     100,
+		ErrorHandledSamplingRate:       0,
+		ANRTakeScreenshot:              true,
+		AppHangThresholdMillis:         2000,
+		AppHangTimelineDuration:        300,
+		AppHangSamplingRate:            100,
+		AppHangReplayEnabled:           true,
+		LaunchSamplingRate:             100,
+		GestureClickTakeSnapshot:       true,
+		HTTPSamplingRate:               100,
+		HTTPDisableEventForURLs:        []string{},
+		HTTPTrackRequestForURLs:        []string{},
+		HTTPTrackResponseForURLs:       []string{},
+		HTTPBlockedHeaders:             []string{},
+		ProfileSamplingRate:            100,
+	}
+}
+
+// configCacheKey returns the Valkey key for an app's cached config.
+func configCacheKey(appID uuid.UUID) string {
+	return fmt.Sprintf("%s{%s}", configCacheKeyPrefix, appID.String())
+}
+
+// ComputeETag returns the hex FNV-1a hash of data, recomputed on read.
+func ComputeETag(data []byte) string {
+	h := fnv.New64a()
+	_, _ = h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// GetCache returns the cached config JSON, empty & nil for a missing key, an error for any other failure.
+func GetCache(ctx context.Context, vk valkey.Client, appID uuid.UUID) (data string, err error) {
+	key := configCacheKey(appID)
+	cmd := vk.B().Hget().Key(key).Field(cacheFieldData).Build()
+
+	data, err = vk.Do(ctx, cmd).ToString()
+	if valkey.IsValkeyNil(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read config cache: %w", err)
+	}
+
+	return data, nil
+}
+
+// setCacheScript stores the config & refreshes the TTL only when the incoming
+// updated_at is strictly newer than the cached one, so two concurrent patches
+// can't land out of order. ARGV: 1 config JSON, 2 updated_at in unix micros,
+// 3 TTL seconds. Returns 1 on write, 0 when a newer entry already won.
+//
+// The fence depends on updated_at, so changing how the patch path stamps it
+// stops this guard working.
+//
+// Micros, not nanos, embedded Lua is 5.1 so numbers are float64 & unix nanos
+// exceed the 53-bit mantissa.
+var setCacheScript = valkey.NewLuaScript(fmt.Sprintf(`
+local cur = redis.call('HGET', KEYS[1], '%[2]s')
+if cur and tonumber(cur) >= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('HSET', KEYS[1], '%[1]s', ARGV[1], '%[2]s', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+`, cacheFieldData, cacheFieldUpdatedAt))
+
+// setCacheIfAbsentScript stores the config only when absent, but always tries
+// the TTL so a legacy key with no expiry gains one. ARGV: 1 config JSON,
+// 2 TTL seconds.
+var setCacheIfAbsentScript = valkey.NewLuaScript(fmt.Sprintf(`
+redis.call('HSETNX', KEYS[1], '%s', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2], 'NX')
+return 1
+`, cacheFieldData))
+
+// SetCache writes the config JSON & refreshes its TTL, for the patch path only.
+// A write older than what is cached is dropped, which is the guard working, not
+// an error.
+func SetCache(ctx context.Context, vk valkey.Client, appID uuid.UUID, jsonConfig []byte, updatedAt time.Time) error {
+	if vk == nil {
+		return ErrNoCacheClient
+	}
+
+	keys := []string{configCacheKey(appID)}
+	args := []string{
+		string(jsonConfig),
+		strconv.FormatInt(updatedAt.UnixMicro(), 10),
+		strconv.FormatInt(jitteredCacheTTL(), 10),
+	}
+
+	if err := setCacheScript.Exec(ctx, vk, keys, args).Error(); err != nil {
+		return fmt.Errorf("failed to store config hash: %w", err)
+	}
+
+	return nil
+}
+
+// SetCacheIfAbsent writes the config JSON & sets a TTL only when absent, else
+// a slow reader can overwrite a fresh config or extend its TTL.
+func SetCacheIfAbsent(ctx context.Context, vk valkey.Client, appID uuid.UUID, jsonConfig []byte) error {
+	if vk == nil {
+		return ErrNoCacheClient
+	}
+
+	keys := []string{configCacheKey(appID)}
+	args := []string{
+		string(jsonConfig),
+		strconv.FormatInt(jitteredCacheTTL(), 10),
+	}
+
+	if err := setCacheIfAbsentScript.Exec(ctx, vk, keys, args).Error(); err != nil {
+		return fmt.Errorf("failed to store config hash: %w", err)
+	}
+
+	return nil
+}
+
+// GetConfigFromDb returns an app's SDK config from Postgres.
+func GetConfigFromDb(ctx context.Context, pg *pgxpool.Pool, appID uuid.UUID) (*SdkConfig, error) {
+	q := sqlf.PostgreSQL.
+		Select("max_events_in_batch").
+		Select("error_replay_duration").
+		Select("anr_timeline_duration").
+		Select("bug_report_timeline_duration").
+		Select("trace_sampling_rate").
+		Select("journey_sampling_rate").
+		Select("screenshot_mask_level").
+		Select("log_autocollect_enabled").
+		Select("log_min_severity").
+		Select("log_ignore_patterns").
+		Select("cpu_usage_interval").
+		Select("memory_usage_interval").
+		Select("memory_usage_background_interval").
+		Select("memory_usage_session_sampling_rate").
+		Select("error_fatal_take_screenshot").
+		Select("error_fatal_replay_enabled").
+		Select("error_unhandled_replay_enabled").
+		Select("error_handled_replay_enabled").
+		Select("error_fatal_sampling_rate").
+		Select("error_unhandled_sampling_rate").
+		Select("error_handled_sampling_rate").
+		Select("anr_take_screenshot").
+		Select("app_hang_threshold_millis").
+		Select("app_hang_timeline_duration").
+		Select("app_hang_sampling_rate").
+		Select("app_hang_replay_enabled").
+		Select("launch_sampling_rate").
+		Select("gesture_click_take_snapshot").
+		Select("http_sampling_rate").
+		Select("http_disable_event_for_urls").
+		Select("http_track_request_for_urls").
+		Select("http_track_response_for_urls").
+		Select("http_blocked_headers").
+		Select("profile_sampling_rate").
+		Select("updated_at").
+		Select("updated_by").
+		From("measure.sdk_config").
+		Where("app_id = ?", appID)
+
+	defer q.Close()
+
+	var sdkConfig SdkConfig
+
+	err := pg.QueryRow(ctx, q.String(), q.Args()...).Scan(
+		&sdkConfig.MaxEventsInBatch,
+		&sdkConfig.ErrorReplayDuration,
+		&sdkConfig.ANRTimelineDuration,
+		&sdkConfig.BugReportTimelineDuration,
+		&sdkConfig.TraceSamplingRate,
+		&sdkConfig.JourneySamplingRate,
+		&sdkConfig.ScreenshotMaskLevel,
+		&sdkConfig.LogAutocollectEnabled,
+		&sdkConfig.LogMinSeverity,
+		&sdkConfig.LogIgnorePatterns,
+		&sdkConfig.CPUUsageInterval,
+		&sdkConfig.MemoryUsageInterval,
+		&sdkConfig.MemoryUsageBackgroundInterval,
+		&sdkConfig.MemoryUsageSessionSamplingRate,
+		&sdkConfig.ErrorFatalTakeScreenshot,
+		&sdkConfig.ErrorFatalReplayEnabled,
+		&sdkConfig.ErrorUnhandledReplayEnabled,
+		&sdkConfig.ErrorHandledReplayEnabled,
+		&sdkConfig.ErrorFatalSamplingRate,
+		&sdkConfig.ErrorUnhandledSamplingRate,
+		&sdkConfig.ErrorHandledSamplingRate,
+		&sdkConfig.ANRTakeScreenshot,
+		&sdkConfig.AppHangThresholdMillis,
+		&sdkConfig.AppHangTimelineDuration,
+		&sdkConfig.AppHangSamplingRate,
+		&sdkConfig.AppHangReplayEnabled,
+		&sdkConfig.LaunchSamplingRate,
+		&sdkConfig.GestureClickTakeSnapshot,
+		&sdkConfig.HTTPSamplingRate,
+		&sdkConfig.HTTPDisableEventForURLs,
+		&sdkConfig.HTTPTrackRequestForURLs,
+		&sdkConfig.HTTPTrackResponseForURLs,
+		&sdkConfig.HTTPBlockedHeaders,
+		&sdkConfig.ProfileSamplingRate,
+		&sdkConfig.UpdatedAt,
+		&sdkConfig.UpdatedBy,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config: %w", err)
+	}
+
+	return &sdkConfig, nil
+}
+
+// ConfigChange is one recorded change to an app's SDK config.
+type ConfigChange struct {
+	ID             uuid.UUID                  `json:"id"`
+	ChangedAt      time.Time                  `json:"changed_at"`
+	ChangedByEmail *string                    `json:"changed_by_email"`
+	Changes        map[string]json.RawMessage `json:"changes"`
+}
+
+// GetConfigChangesFromDb returns a page of an app's config changes, newest first.
+func GetConfigChangesFromDb(ctx context.Context, pg *pgxpool.Pool, appID uuid.UUID, limit, offset int) (changes []ConfigChange, next, previous bool, err error) {
+	q := sqlf.PostgreSQL.
+		Select("sdk_config_history.id").
+		Select("sdk_config_history.changed_at").
+		Select("users.email").
+		Select("sdk_config_history.changes").
+		From("measure.sdk_config_history").
+		LeftJoin("measure.users", "users.id = sdk_config_history.changed_by").
+		Where("sdk_config_history.app_id = ?", appID).
+		// A change whose keys include no historyFields column has nothing to
+		// show, so the query leaves it out before limit and offset apply.
+		Where("exists (select 1 from jsonb_object_keys(sdk_config_history.changes) as key where key = any(?))", historyColumns).
+		OrderBy("sdk_config_history.changed_at desc").
+		// one extra row tells whether another page exists
+		Limit(uint64(limit) + 1).
+		Offset(uint64(offset))
+
+	defer q.Close()
+
+	rows, err := pg.Query(ctx, q.String(), q.Args()...)
+	if err != nil {
+		return nil, false, false, fmt.Errorf("failed to query config changes: %w", err)
+	}
+	defer rows.Close()
+
+	changes = []ConfigChange{}
+	for rows.Next() {
+		var change ConfigChange
+		if err := rows.Scan(&change.ID, &change.ChangedAt, &change.ChangedByEmail, &change.Changes); err != nil {
+			return nil, false, false, fmt.Errorf("failed to scan config change: %w", err)
+		}
+		changes = append(changes, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, false, fmt.Errorf("failed to read config changes: %w", err)
+	}
+
+	if len(changes) > limit {
+		changes = changes[:limit]
+		next = true
+	}
+
+	// A key that is not a historyFields column was left behind by a migration
+	// that renamed or dropped a sdk_config column without updating
+	// sdk_config_history. It is dropped and logged so migration can be fixed.
+	for _, change := range changes {
+		for key := range change.Changes {
+			if !slices.Contains(historyColumns, key) {
+				fmt.Println("dropping unknown key from sdk config change, change_id:", change.ID, "key:", key)
+				delete(change.Changes, key)
+			}
+		}
+	}
+
+	return changes, next, offset > 0, nil
+}
+
+// InvalidateCache deletes an app's cached config.
+func InvalidateCache(ctx context.Context, vk valkey.Client, appID uuid.UUID) error {
+	if vk == nil {
+		return ErrNoCacheClient
+	}
+
+	cacheKey := configCacheKey(appID)
+	cmd := vk.B().Del().Key(cacheKey).Build()
+	result := vk.Do(ctx, cmd)
+
+	return result.Error()
+}
+
+// CreateConfig creates a default SDK config for the given app.
+func CreateConfig(ctx context.Context, tx pgx.Tx, teamID, appID uuid.UUID, createdBy *uuid.UUID) error {
+	config := createDefaultConfig()
+
+	stmt := sqlf.PostgreSQL.
+		InsertInto("measure.sdk_config").
+		Set("team_id", teamID).
+		Set("app_id", appID).
+		Set("max_events_in_batch", config.MaxEventsInBatch).
+		Set("error_replay_duration", config.ErrorReplayDuration).
+		Set("anr_timeline_duration", config.ANRTimelineDuration).
+		Set("bug_report_timeline_duration", config.BugReportTimelineDuration).
+		Set("trace_sampling_rate", config.TraceSamplingRate).
+		Set("journey_sampling_rate", config.JourneySamplingRate).
+		Set("screenshot_mask_level", config.ScreenshotMaskLevel).
+		Set("log_autocollect_enabled", config.LogAutocollectEnabled).
+		Set("log_min_severity", config.LogMinSeverity).
+		Set("log_ignore_patterns", config.LogIgnorePatterns).
+		Set("cpu_usage_interval", config.CPUUsageInterval).
+		Set("memory_usage_interval", config.MemoryUsageInterval).
+		Set("memory_usage_background_interval", config.MemoryUsageBackgroundInterval).
+		Set("memory_usage_session_sampling_rate", config.MemoryUsageSessionSamplingRate).
+		Set("error_fatal_take_screenshot", config.ErrorFatalTakeScreenshot).
+		Set("error_fatal_replay_enabled", config.ErrorFatalReplayEnabled).
+		Set("error_unhandled_replay_enabled", config.ErrorUnhandledReplayEnabled).
+		Set("error_handled_replay_enabled", config.ErrorHandledReplayEnabled).
+		Set("error_fatal_sampling_rate", config.ErrorFatalSamplingRate).
+		Set("error_unhandled_sampling_rate", config.ErrorUnhandledSamplingRate).
+		Set("error_handled_sampling_rate", config.ErrorHandledSamplingRate).
+		Set("anr_take_screenshot", config.ANRTakeScreenshot).
+		Set("app_hang_threshold_millis", config.AppHangThresholdMillis).
+		Set("app_hang_timeline_duration", config.AppHangTimelineDuration).
+		Set("app_hang_sampling_rate", config.AppHangSamplingRate).
+		Set("app_hang_replay_enabled", config.AppHangReplayEnabled).
+		Set("launch_sampling_rate", config.LaunchSamplingRate).
+		Set("gesture_click_take_snapshot", config.GestureClickTakeSnapshot).
+		Set("http_sampling_rate", config.HTTPSamplingRate).
+		Set("http_disable_event_for_urls", config.HTTPDisableEventForURLs).
+		Set("http_track_request_for_urls", config.HTTPTrackRequestForURLs).
+		Set("http_track_response_for_urls", config.HTTPTrackResponseForURLs).
+		Set("http_blocked_headers", config.HTTPBlockedHeaders).
+		Set("profile_sampling_rate", config.ProfileSamplingRate).
+		Set("updated_at", time.Now()).
+		Set("updated_by", createdBy)
+
+	defer stmt.Close()
+
+	_, err := tx.Exec(ctx, stmt.String(), stmt.Args()...)
+	if err != nil {
+		return fmt.Errorf("failed to create config: %w", err)
+	}
+
+	return nil
+}

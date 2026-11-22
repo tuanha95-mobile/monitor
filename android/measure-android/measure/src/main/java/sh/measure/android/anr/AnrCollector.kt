@@ -1,0 +1,61 @@
+package sh.measure.android.anr
+
+import android.os.Build
+import android.os.Looper
+import sh.measure.android.AnrListener
+import sh.measure.android.NativeBridge
+import sh.measure.android.events.EventType
+import sh.measure.android.events.SignalProcessor
+import sh.measure.android.exceptions.ExceptionData
+import sh.measure.android.exceptions.ExceptionFactory
+import sh.measure.android.mainHandler
+import sh.measure.android.utils.ProcessInfoProvider
+
+/**
+ * Detects and reports ANRs by listening to SIGQUIT signal. Only
+ * registered for API level 29 and below. See [AppExitCollector]
+ * for API level 30+.
+ */
+internal class AnrCollector(
+    private val processInfo: ProcessInfoProvider,
+    private val signalProcessor: SignalProcessor,
+    private val nativeBridge: NativeBridge,
+    private val mainLooper: Looper = mainHandler.looper,
+) : AnrListener {
+
+    private var isRegistered = false
+
+    fun register() {
+        if (isRegistered) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) return
+        nativeBridge.enableAnrReporting(anrListener = this)
+        isRegistered = true
+    }
+
+    fun unregister() {
+        if (!isRegistered) return
+        nativeBridge.disableAnrReporting()
+        isRegistered = false
+    }
+
+    override fun onAnrDetected(timestamp: Long) {
+        val anrError = AnrError(
+            mainLooper.thread,
+            timestamp,
+            "Application Not Responding for at least 5s",
+        )
+        signalProcessor.trackCrash(
+            data = toMeasureException(anrError),
+            timestamp = anrError.timestamp,
+            type = EventType.ANR,
+            threadName = anrError.thread.name,
+            takeScreenshot = true,
+        )
+    }
+
+    private fun toMeasureException(anr: AnrError): ExceptionData = ExceptionFactory.createMeasureException(
+        throwable = anr,
+        thread = anr.thread,
+        foreground = processInfo.isForegroundProcess(),
+    )
+}

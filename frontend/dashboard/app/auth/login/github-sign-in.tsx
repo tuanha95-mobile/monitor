@@ -1,0 +1,65 @@
+"use client";
+
+import { signInWithGitHub } from "@/app/auth/oauth";
+import { Button } from "@/app/components/button";
+import { navigateTo } from "@/app/utils/navigation";
+import Image from "next/image";
+
+export default function GitHubSignIn({
+  mcpAuthorizeUrl,
+}: {
+  mcpAuthorizeUrl?: string;
+}) {
+  const doGitHubLogin = async () => {
+    const { origin } = new URL(window.location.href);
+    const { url, error } = await signInWithGitHub({
+      clientId: process.env.NEXT_PUBLIC_OAUTH_GITHUB_KEY,
+      options: {
+        redirectTo: `${origin}/auth/callback/github`,
+        next: "",
+      },
+    });
+
+    if (error) {
+      console.error(`failed to login using GitHub`, error);
+      return;
+    }
+
+    if (url) {
+      navigateTo(url);
+    }
+  };
+
+  const handleClick = () => {
+    if (mcpAuthorizeUrl) {
+      navigateTo(mcpAuthorizeUrl);
+      return;
+    }
+    doGitHubLogin();
+  };
+
+  return (
+    <Button
+      variant="outline"
+      size={"lg"}
+      className="group justify-center w-full font-display border-2 border-border"
+      onClick={handleClick}
+    >
+      <Image
+        src="/images/github_logo_black.svg"
+        width={24}
+        height={24}
+        className="w-4 h-4 dark:hidden"
+        alt={"GitHub logo"}
+      />
+      <Image
+        src="/images/github_logo_white.svg"
+        width={24}
+        height={24}
+        className="w-4 h-4 hidden dark:block"
+        alt={"GitHub logo"}
+      />
+      <span> Sign in with GitHub</span>
+    </Button>
+  );
+}

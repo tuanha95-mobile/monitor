@@ -1,0 +1,249 @@
+platform :ios, '16.0'
+
+# The Flutter module and the Measure SDK are integrated via Swift Package
+# Manager, not CocoaPods: the Xcode project references the generated
+# FlutterNativeIntegration package (../flutter/build/ios/SwiftPackages) and
+# the local Measure package at the repo root. The local package overrides the
+# remote measure-sh SPM references declared by measure_flutter and
+# MeasureReactNative.
+
+# React Native integration
+require_relative '../react_native/node_modules/react-native/scripts/react_native_pods'
+
+target 'FrankensteinApp' do
+  use_frameworks! :linkage => :static
+
+  # React Native pods
+  use_react_native!(
+    :path => '../react_native/node_modules/react-native',
+    :app_path => '../react_native'
+  )
+
+  # Measure React Native SDK (manual pod — use_native_modules! doesn't work
+  # in add-to-app setups where the RN root is outside the ios directory)
+  pod 'MeasureReactNative', :path => '../react_native/node_modules/@measuresh/react-native'
+
+  # Copy Firebase config per build configuration
+  script_phase :name => 'Copy GoogleService-Info.plist',
+    :script => <<~SCRIPT,
+      set -e
+      if [[ "$CONFIGURATION" == "Debug" ]]; then
+        SRC="$SRCROOT/FrankensteinApp/Firebase/Debug/GoogleService-Info.plist"
+      else
+        SRC="$SRCROOT/FrankensteinApp/Firebase/Release/GoogleService-Info.plist"
+      fi
+      DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist"
+      if [[ -f "$SRC" ]]; then
+        cp "$SRC" "$DEST"
+      else
+        echo "warning: GoogleService-Info.plist not found at $SRC"
+      fi
+    SCRIPT
+    :execution_position => :before_compile
+
+  # Upload dSYMs to Firebase Crashlytics
+  script_phase :name => 'Upload dSYMs to Firebase Crashlytics',
+    :script => <<~SCRIPT,
+      set -e
+      if [[ "$CONFIGURATION" == "Debug" ]]; then
+        PLIST="$SRCROOT/FrankensteinApp/Firebase/Debug/GoogleService-Info.plist"
+      else
+        PLIST="$SRCROOT/FrankensteinApp/Firebase/Release/GoogleService-Info.plist"
+      fi
+
+      if [[ ! -f "$PLIST" ]]; then
+        echo "warning: GoogleService-Info.plist not found at $PLIST, skipping dSYM upload"
+        exit 0
+      fi
+
+      PROJECT_ID=$(/usr/libexec/PlistBuddy -c "Print :PROJECT_ID" "$PLIST" 2>/dev/null || true)
+      if [[ "$PROJECT_ID" == "frank-sample-placeholder" ]]; then
+        echo "warning: placeholder Firebase config, skipping dSYM upload"
+        exit 0
+      fi
+
+      # Firebase ships via SPM (through the Flutter plugins), so upload-symbols
+      # lives in the SPM checkout, not in Pods.
+      UPLOAD_SYMBOLS="${BUILD_DIR%/Build/*}/SourcePackages/checkouts/firebase-ios-sdk/Crashlytics/upload-symbols"
+      if [[ ! -x "$UPLOAD_SYMBOLS" ]]; then
+        echo "warning: upload-symbols not found at $UPLOAD_SYMBOLS, skipping dSYM upload"
+        exit 0
+      fi
+
+      "$UPLOAD_SYMBOLS" \
+        -gsp "$PLIST" \
+        -p ios \
+        "${DWARF_DSYM_FOLDER_PATH}"
+    SCRIPT
+    :execution_position => :after_compile
+
+  # Upload dSYMs and the React Native JS sourcemap to Measure after each build
+  script_phase :name => 'Upload dSYMs and RN sourcemap to Measure',
+    :script => <<~SCRIPT,
+      set -e
+      if [[ -z "$MEASURE_API_KEY" || -z "$MEASURE_API_URL" ]]; then
+        echo "warning: MEASURE_API_KEY or MEASURE_API_URL not set, skipping Measure upload"
+        exit 0
+      fi
+
+      # Debug builds use DEBUG_INFORMATION_FORMAT=dwarf and produce no dSYMs, so
+      # the folder may be missing. Create it so the upload script can still run
+      # and ship the JS sourcemap (it uploads JS-only when no dSYMs are present).
+      DSYM_FOLDER="${DWARF_DSYM_FOLDER_PATH}"
+      mkdir -p "$DSYM_FOLDER"
+
+      DEST_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+      JS_BUNDLE="$DEST_DIR/main.jsbundle"
+      JS_SOURCEMAP="$DEST_DIR/main.jsbundle.map"
+
+      VERSION_NAME="${MARKETING_VERSION}"
+      VERSION_CODE="${CURRENT_PROJECT_VERSION}"
+      APP_ID="${PRODUCT_BUNDLE_IDENTIFIER}"
+      BUILD_SIZE=$(stat -f%z "${BUILT_PRODUCTS_DIR}/${EXECUTABLE_PATH}" 2>/dev/null || echo "0")
+
+      UPLOAD_SCRIPT="$SRCROOT/Scripts/upload_to_measure.sh"
+      if [[ ! -f "$UPLOAD_SCRIPT" ]]; then
+        echo "error: upload_to_measure.sh not found at $UPLOAD_SCRIPT"
+        exit 1
+      fi
+
+      JS_ARGS=()
+      if [[ -f "$JS_BUNDLE" ]]; then
+        JS_ARGS+=(--bundle "$JS_BUNDLE")
+      fi
+      if [[ -f "$JS_SOURCEMAP" ]]; then
+        JS_ARGS+=(--mapping "$JS_SOURCEMAP")
+      fi
+
+      bash "$UPLOAD_SCRIPT" \
+        "$DSYM_FOLDER" \
+        "$MEASURE_API_URL" \
+        "$MEASURE_API_KEY" \
+        "$VERSION_NAME" \
+        "$VERSION_CODE" \
+        "$APP_ID" \
+        "$BUILD_SIZE" \
+        "${JS_ARGS[@]}"
+    SCRIPT
+    :execution_position => :after_compile
+
+  # Bundle React Native JS into the app
+  script_phase :name => 'Bundle React Native JS',
+    :script => <<~SCRIPT,
+      set -e
+      export PATH="/opt/homebrew/bin:$PATH"
+      REACT_NATIVE_DIR="$SRCROOT/../react_native"
+      DEST_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+      mkdir -p "$DEST_DIR"
+      cd "$REACT_NATIVE_DIR"
+
+      # Always bundle in production mode. The packaged jsbundle is only used
+      # when Metro is not running (e2e, standalone), where a non-dev bundle
+      # parses far faster; a developer running Metro still gets the live dev
+      # bundle, so hot reload is unaffected.
+      if [[ "$CONFIGURATION" == "Debug" ]]; then
+        # Plain JS bundle (matches Android's bundleReactNativeDebug task).
+        # Hermes loads plain JS directly, so no hermesc step is needed.
+        npx react-native bundle \
+          --platform ios \
+          --dev false \
+          --entry-file index.js \
+          --bundle-output "$DEST_DIR/main.jsbundle" \
+          --sourcemap-output "$DEST_DIR/main.jsbundle.map" \
+          --assets-dest "$DEST_DIR"
+      else
+        # Compile to Hermes bytecode and compose the packager and Hermes
+        # sourcemaps (matches Android's RNGP release bundling).
+        HERMES_CLI="$PODS_ROOT/hermes-engine/destroot/bin/hermesc"
+        COMPOSE_SOURCEMAP="$REACT_NATIVE_DIR/node_modules/react-native/scripts/compose-source-maps.js"
+        PLAIN_BUNDLE="$DEST_DIR/main.jsbundle.plain"
+        PACKAGER_SOURCEMAP="$DEST_DIR/main.jsbundle.packager.map"
+        HBC_SOURCEMAP="$DEST_DIR/main.jsbundle.hbc.map"
+
+        npx react-native bundle \
+          --platform ios \
+          --dev false \
+          --minify false \
+          --entry-file index.js \
+          --bundle-output "$PLAIN_BUNDLE" \
+          --sourcemap-output "$PACKAGER_SOURCEMAP" \
+          --assets-dest "$DEST_DIR"
+
+        "$HERMES_CLI" -emit-binary -max-diagnostic-width=80 -O -output-source-map \
+          -out "$DEST_DIR/main.jsbundle" "$PLAIN_BUNDLE"
+        mv "$DEST_DIR/main.jsbundle.map" "$HBC_SOURCEMAP"
+
+        node "$COMPOSE_SOURCEMAP" "$PACKAGER_SOURCEMAP" "$HBC_SOURCEMAP" -o "$DEST_DIR/main.jsbundle.map"
+        rm -f "$PLAIN_BUNDLE" "$PACKAGER_SOURCEMAP" "$HBC_SOURCEMAP"
+      fi
+    SCRIPT
+    :execution_position => :before_compile
+end
+
+post_install do |installer|
+  react_native_post_install(installer, '../react_native/node_modules/react-native')
+
+  # MeasureReactNative's SPM dependency on Measure exists so its Swift compiles
+  # against the module, but a linked package product gets merged into the static
+  # pod archive by libtool, duplicating every Measure and KSCrash symbol the app
+  # already links from the package graph. Convert the product link into a plain
+  # target dependency: build order still guarantees Measure.swiftmodule exists
+  # before the pod compiles (found via the SWIFT_INCLUDE_PATHS that
+  # react_native_post_install adds), and the app link provides the single copy.
+  measure_rn = installer.pods_project.targets.find { |t| t.name == 'MeasureReactNative' }
+  if measure_rn
+    measure_rn.package_product_dependencies.dup.each do |product|
+      next unless product.product_name == 'Measure'
+      measure_rn.package_product_dependencies.delete(product)
+      order_dep = installer.pods_project.new(Xcodeproj::Project::Object::PBXTargetDependency)
+      order_dep.product_ref = product
+      measure_rn.dependencies << order_dep
+    end
+
+    # Loading Measure.swiftmodule needs the module maps of Measure's C
+    # dependencies, which Xcode only passes along with a linked product.
+    module_maps = %w[KSCrashRecording KSCrashRecordingCore KSCrashCore third-party-IsAppEncrypted]
+      .map { |m| "$(OBJROOT)/GeneratedModuleMaps$(EFFECTIVE_PLATFORM_NAME)/#{m}.modulemap" }
+    module_maps << File.expand_path('../../../ios/Sources/MeasureWebP/include/module.modulemap', __dir__)
+
+    # Compiling those modules resolves includes across KSCrash targets (the
+    # KSCrashRecording headers pull in KSCrashNamespace.h from KSCrashCore),
+    # so the checkout's include dirs must be on the header search path too.
+    # OBJROOT sits deeper in an archive than in a build, so try both depths.
+    derived_data_roots = ['$(OBJROOT)/../..', '$(OBJROOT)/../../../../..']
+    include_dirs = derived_data_roots.flat_map do |root|
+      %w[KSCrashCore KSCrashRecordingCore KSCrashRecording].map do |t|
+        "#{root}/SourcePackages/checkouts/KSCrash/Sources/#{t}/include"
+      end
+    end
+    measure_rn.build_configurations.each do |config|
+      flags = Array(config.build_settings['OTHER_SWIFT_FLAGS'] || '$(inherited)')
+      module_maps.each { |map| flags.push('-Xcc', "-fmodule-map-file=#{map}") }
+      include_dirs.each { |dir| flags.push('-Xcc', "-I#{dir}") }
+      config.build_settings['OTHER_SWIFT_FLAGS'] = flags
+    end
+  end
+
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '16.0'
+    end
+  end
+
+  # Inject Measure xcconfig into Pods xcconfig files
+  debug_xcconfig = File.join(__dir__, 'MeasureDebug.xcconfig')
+  release_xcconfig = File.join(__dir__, 'MeasureRelease.xcconfig')
+  pods_dir = File.join(__dir__, 'Pods', 'Target Support Files', 'Pods-FrankensteinApp')
+  {
+    'Pods-FrankensteinApp.debug.xcconfig' => debug_xcconfig,
+    'Pods-FrankensteinApp.release.xcconfig' => release_xcconfig
+  }.each do |filename, config_path|
+    xcconfig_path = File.join(pods_dir, filename)
+    next unless File.exist?(xcconfig_path)
+    include_line = "#include \"#{config_path}\""
+    content = File.read(xcconfig_path)
+    unless content.include?(include_line)
+      File.write(xcconfig_path, "#{include_line}\n#{content}")
+    end
+  end
+end

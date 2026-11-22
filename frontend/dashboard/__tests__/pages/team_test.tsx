@@ -1,0 +1,1787 @@
+import { promiseParams } from "@/__tests__/helpers/promise_params";
+import TeamOverview from "@/app/[teamId]/team/page";
+import { beforeEach, describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+
+// Radix tooltip content measures its arrow via ResizeObserver, absent in jsdom.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class ResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as any;
+}
+
+const mockToastPositive = jest.fn();
+const mockToastNegative = jest.fn();
+const mockPush = jest.fn();
+const mockSearchParamsGet = jest.fn((_: string): string | null => null);
+const mockSearchParamsToString = jest.fn(() => "");
+
+jest.mock("@/app/components/toast", () => ({
+  toastPositive: (...args: any[]) => mockToastPositive(...args),
+  toastNegative: (...args: any[]) => mockToastNegative(...args),
+}));
+
+// Page reload after a team rename goes through the navigation module
+// because jsdom's window.location can't be stubbed; mock it so the reload
+// is a no-op in tests.
+jest.mock("@/app/utils/navigation", () => ({
+  navigateTo: jest.fn(),
+  reloadPage: jest.fn(),
+}));
+
+let mockIsCloud = false;
+jest.mock("@/app/utils/env_utils", () => ({
+  isCloud: () => mockIsCloud,
+}));
+
+jest.mock("next/navigation", () => ({
+  useRouter: () => ({ push: mockPush }),
+  useSearchParams: () => ({
+    get: mockSearchParamsGet,
+    toString: mockSearchParamsToString,
+  }),
+}));
+
+jest.mock("next/link", () => ({
+  __esModule: true,
+  default: ({ children, href, ...props }: any) => (
+    <a href={href} {...props}>
+      {children}
+    </a>
+  ),
+}));
+
+jest.mock("next/image", () => ({
+  __esModule: true,
+  default: ({ unoptimized, ...props }: any) => <img {...props} />,
+}));
+
+const defaultAuthz = {
+  can_invite_roles: ["viewer", "developer"],
+  can_change_billing: true,
+  can_create_app: true,
+  can_rename_app: true,
+  can_change_retention: true,
+  can_rotate_api_key: true,
+  can_write_sdk_config: true,
+  can_rename_team: true,
+  can_manage_slack: true,
+  members: [
+    {
+      id: "user-1",
+      name: "Owner",
+      email: "owner@test.com",
+      role: "owner",
+      last_sign_in_at: "2025-01-01T00:00:00Z",
+      created_at: "2025-01-01T00:00:00Z",
+      authz: {
+        current_user_assignable_roles_for_member: [],
+        current_user_can_remove_member: false,
+      },
+    },
+    {
+      id: "user-2",
+      name: "Dev",
+      email: "dev@test.com",
+      role: "developer",
+      last_sign_in_at: "2025-01-01T00:00:00Z",
+      created_at: "2025-01-01T00:00:00Z",
+      authz: {
+        current_user_assignable_roles_for_member: [
+          "admin",
+          "developer",
+          "viewer",
+        ],
+        current_user_can_remove_member: true,
+      },
+    },
+  ],
+};
+
+const defaultPendingInvites = [
+  {
+    id: "invite-1",
+    email: "invitee@test.com",
+    invited_by_email: "owner@test.com",
+    role: "viewer",
+    valid_until: "2025-01-10T00:00:00Z",
+  },
+];
+
+const mockTeam = { id: "team-1", name: "Team One" };
+
+jest.mock("@/app/api/api_calls", () => ({
+  __esModule: true,
+  defaultAuthzAndMembers: {
+    can_invite_roles: ["viewer"],
+    can_change_billing: false,
+    can_create_app: false,
+    can_rename_app: false,
+    can_change_retention: false,
+    can_rotate_api_key: false,
+    can_write_sdk_config: false,
+    can_rename_team: false,
+    can_manage_slack: false,
+    members: [],
+  },
+}));
+
+// --- Bridge stores: tests control these, query hook mocks read from them ---
+const { create: createBridge } = jest.requireActual("zustand") as any;
+const teamsStore = createBridge(() => ({
+  teamsState: "loading",
+  teams: null as any,
+  selectedTeam: null as any,
+  fetchTeams: jest.fn(),
+  setSelectedTeam: jest.fn(),
+  reset: jest.fn(),
+}));
+const teamPageStore = createBridge(() => ({
+  currentUserId: undefined as string | undefined,
+  authzAndMembersState: "loading",
+  authzAndMembers: {
+    can_invite_roles: [] as string[],
+    can_rename_team: false,
+    can_manage_slack: false,
+    members: [] as any[],
+  },
+  pendingInvitesState: "loading",
+  pendingInvites: null as any,
+  teamSlackConnectUrl: null as string | null,
+  teamSlackConnectUrlState: "init",
+  refetchSlackConnectUrl: jest.fn(),
+  teamSlack: null as any,
+  teamSlackState: "init",
+  refetchSlackStatus: jest.fn(),
+  updateSlackStatusState: "init",
+  removeTeamSlackState: "init",
+  testSlackAlertState: "init",
+  teamNameChangeState: "init",
+  inviteMemberState: "init",
+  removeMemberState: "init",
+  resendPendingInviteState: "init",
+  removePendingInviteState: "init",
+  roleChangeState: "init",
+  fetchCurrentUserId: jest.fn(),
+  fetchAuthzAndMembers: jest.fn(),
+  fetchPendingInvites: jest.fn(),
+  fetchTeamSlackConnectUrl: jest.fn(),
+  fetchTeamSlackStatus: jest.fn(),
+  changeTeamName: jest.fn(),
+  inviteMember: jest.fn(),
+  removeMember: jest.fn(),
+  resendPendingInvite: jest.fn(),
+  removePendingInvite: jest.fn(),
+  changeRole: jest.fn(),
+  updateSlackStatus: jest.fn(),
+  removeTeamSlack: jest.fn(),
+  testSlackAlert: jest.fn(),
+  reset: jest.fn(),
+}));
+
+function mapStatus(s: string) {
+  if (s === "loading") {
+    return "pending";
+  }
+  if (s === "init") {
+    return "pending";
+  }
+  return s;
+}
+
+jest.mock("@/app/query/hooks", () => ({
+  __esModule: true,
+  useSessionQuery: () => {
+    const s = teamPageStore.getState();
+    return {
+      data: s.currentUserId ? { user: { id: s.currentUserId } } : undefined,
+      status: s.currentUserId ? "success" : "pending",
+    };
+  },
+  useTeamsQuery: () => {
+    const s = teamsStore.getState();
+    return { data: s.teams, status: mapStatus(s.teamsState) };
+  },
+  useAuthzAndMembersQuery: () => {
+    const s = teamPageStore.getState();
+    return {
+      data: s.authzAndMembers,
+      status: mapStatus(s.authzAndMembersState),
+    };
+  },
+  usePendingInvitesQuery: () => {
+    const s = teamPageStore.getState();
+    return {
+      data: s.pendingInvites,
+      status: mapStatus(s.pendingInvitesState),
+    };
+  },
+  useTeamSlackConnectUrlQuery: () => {
+    const s = teamPageStore.getState();
+    return {
+      data: s.teamSlackConnectUrl,
+      status: mapStatus(s.teamSlackConnectUrlState),
+      refetch: s.refetchSlackConnectUrl,
+    };
+  },
+  useTeamSlackStatusQuery: () => {
+    const s = teamPageStore.getState();
+    return {
+      data: s.teamSlack,
+      status: mapStatus(s.teamSlackState),
+      refetch: s.refetchSlackStatus,
+    };
+  },
+  useChangeTeamNameMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.changeTeamName(params.teamId, params.newName);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.teamNameChangeState === "loading",
+    };
+  },
+  useInviteMemberMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.inviteMember(
+          params.teamId,
+          params.email,
+          params.role,
+        );
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.(new Error("Failed to invite member"));
+        }
+      },
+      isPending: s.inviteMemberState === "loading",
+    };
+  },
+  useRemoveMemberMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.removeMember(params.teamId, params.memberId);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.removeMemberState === "loading",
+    };
+  },
+  useResendPendingInviteMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.resendPendingInvite(
+          params.teamId,
+          params.inviteId,
+        );
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.resendPendingInviteState === "loading",
+    };
+  },
+  useRemovePendingInviteMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.removePendingInvite(
+          params.teamId,
+          params.inviteId,
+        );
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.removePendingInviteState === "loading",
+    };
+  },
+  useChangeRoleMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.changeRole(
+          params.teamId,
+          params.newRole,
+          params.memberId,
+        );
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.roleChangeState === "loading",
+    };
+  },
+  useUpdateSlackStatusMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.updateSlackStatus(params.teamId, params.status);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.updateSlackStatusState === "loading",
+    };
+  },
+  useRemoveTeamSlackMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.removeTeamSlack(params.teamId);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.();
+        }
+      },
+      isPending: s.removeTeamSlackState === "loading",
+    };
+  },
+  useTestSlackAlertMutation: () => {
+    const s = teamPageStore.getState();
+    return {
+      mutate: async (params: any, opts: any) => {
+        const result = await s.testSlackAlert(params.teamId);
+        if (result) {
+          opts?.onSuccess?.();
+        } else {
+          opts?.onError?.(new Error("Failed to send test Slack alert"));
+        }
+      },
+      isPending: s.testSlackAlertState === "loading",
+    };
+  },
+}));
+
+const useTeamsStore = teamsStore;
+const useTeamPageStore = teamPageStore;
+
+jest.mock("@/app/components/button", () => ({
+  Button: ({ children, loading, disabled, ...props }: any) => (
+    <button disabled={disabled || loading} {...props}>
+      {children}
+    </button>
+  ),
+}));
+
+jest.mock("@/app/components/input", () => ({
+  Input: (props: any) => <input {...props} />,
+}));
+
+jest.mock("@/app/components/dropdown_select", () => ({
+  __esModule: true,
+  default: (props: any) => {
+    const next =
+      props.items?.find((i: any) => i !== props.initialSelected) ??
+      props.items?.[0];
+    return (
+      <button
+        data-testid={`dropdown-${props.title}`}
+        disabled={props.disabled}
+        onClick={() => props.onChangeSelected?.(next)}
+      >
+        {props.title}
+      </button>
+    );
+  },
+  DropdownSelectType: { SingleString: "single" },
+}));
+
+jest.mock("@/app/components/create_team", () => ({
+  __esModule: true,
+  default: ({ onSuccess }: any) => (
+    <button onClick={() => onSuccess("team-2")}>Create Team</button>
+  ),
+}));
+
+jest.mock("@/app/components/skeleton", () => ({
+  Skeleton: ({ className, ...props }: any) => (
+    <div data-testid="skeleton-mock" className={className} {...props} />
+  ),
+  SkeletonTable: () => <div data-testid="skeleton-table-mock" />,
+}));
+
+jest.mock("@/app/components/switch", () => ({
+  Switch: ({ checked, disabled, onCheckedChange }: any) => (
+    <button
+      data-testid="slack-switch"
+      disabled={disabled}
+      onClick={() => onCheckedChange(!checked)}
+    >
+      switch
+    </button>
+  ),
+}));
+
+jest.mock("@/app/components/table", () => ({
+  Table: ({ children }: any) => <table>{children}</table>,
+  TableHeader: ({ children }: any) => <thead>{children}</thead>,
+  TableRow: ({ children }: any) => <tr>{children}</tr>,
+  TableHead: ({ children }: any) => <th>{children}</th>,
+  TableBody: ({ children }: any) => <tbody>{children}</tbody>,
+  TableCell: ({ children }: any) => <td>{children}</td>,
+}));
+
+jest.mock("@/app/components/danger_confirmation_dialog", () => ({
+  __esModule: true,
+  default: (props: any) => {
+    if (!props.open) return null;
+    return (
+      <div>
+        <button onClick={props.onAffirmativeAction}>
+          {props.affirmativeText}
+        </button>
+        <button onClick={props.onCancelAction}>{props.cancelText}</button>
+      </div>
+    );
+  },
+}));
+
+jest.mock("@/app/components/confirmation_dialog", () => ({
+  __esModule: true,
+  default: (props: any) => {
+    if (!props.open) return null;
+    return (
+      <div>
+        <button onClick={props.onAffirmativeAction}>
+          {props.affirmativeText}
+        </button>
+        <button onClick={props.onCancelAction}>{props.cancelText}</button>
+      </div>
+    );
+  },
+}));
+
+const setDefaultTeamsState = () => {
+  useTeamsStore.setState({
+    teamsState: "success",
+    teams: [mockTeam],
+    selectedTeam: mockTeam,
+  });
+};
+
+const setDefaultTeamPageState = () => {
+  useTeamPageStore.setState({
+    currentUserId: "user-1",
+    authzAndMembersState: "success",
+    authzAndMembers: defaultAuthz,
+    pendingInvitesState: "success",
+    pendingInvites: defaultPendingInvites,
+    teamSlackConnectUrlState: "success",
+    teamSlackConnectUrl: "https://slack/connect",
+    teamSlackState: "success",
+    teamSlack: { slack_team_name: "Measure", is_active: true },
+  });
+};
+
+const renderPage = async ({
+  waitForSlack = true,
+}: {
+  waitForSlack?: boolean;
+} = {}) => {
+  setDefaultTeamsState();
+  setDefaultTeamPageState();
+  render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+  await screen.findByText("Invite Team Members");
+  if (waitForSlack) {
+    await screen.findByTestId("slack-switch");
+  }
+};
+
+describe("Team Page", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsCloud = false;
+    useTeamsStore.setState({
+      teamsState: "loading",
+      teams: null,
+      selectedTeam: null,
+      fetchTeams: jest.fn(),
+      setSelectedTeam: jest.fn(),
+      reset: jest.fn(),
+    });
+    useTeamPageStore.setState({
+      currentUserId: undefined,
+      authzAndMembersState: "loading",
+      authzAndMembers: {
+        can_invite_roles: [],
+        can_rename_team: false,
+        can_manage_slack: false,
+        members: [],
+      },
+      pendingInvitesState: "loading",
+      pendingInvites: null,
+      teamSlackConnectUrl: null,
+      teamSlackConnectUrlState: "init",
+      refetchSlackConnectUrl: jest.fn(),
+      teamSlack: null,
+      teamSlackState: "init",
+      refetchSlackStatus: jest.fn(),
+      updateSlackStatusState: "init",
+      removeTeamSlackState: "init",
+      testSlackAlertState: "init",
+      teamNameChangeState: "init",
+      inviteMemberState: "init",
+      removeMemberState: "init",
+      resendPendingInviteState: "init",
+      removePendingInviteState: "init",
+      roleChangeState: "init",
+      fetchCurrentUserId: jest.fn(),
+      fetchAuthzAndMembers: jest.fn(),
+      fetchPendingInvites: jest.fn(),
+      fetchTeamSlackConnectUrl: jest.fn(),
+      fetchTeamSlackStatus: jest.fn(),
+      changeTeamName: jest.fn(),
+      inviteMember: jest.fn(),
+      removeMember: jest.fn(),
+      resendPendingInvite: jest.fn(),
+      removePendingInvite: jest.fn(),
+      changeRole: jest.fn(),
+      updateSlackStatus: jest.fn(),
+      removeTeamSlack: jest.fn(),
+      testSlackAlert: jest.fn(),
+      reset: jest.fn(),
+    });
+    mockSearchParamsGet.mockReset();
+    mockSearchParamsGet.mockImplementation(() => null);
+    mockSearchParamsToString.mockReset();
+    mockSearchParamsToString.mockImplementation(() => "");
+    window.sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    // Tests that stage query params via the history API leave them on the
+    // shared jsdom URL; put the URL back so later tests start clean.
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("renders core sections on successful load", async () => {
+    await renderPage();
+
+    expect(screen.getByText("Members")).toBeInTheDocument();
+    expect(screen.getByText("Pending Invites")).toBeInTheDocument();
+    expect(screen.getByText("Slack Integration")).toBeInTheDocument();
+    expect(screen.getByText("Change Team Name")).toBeInTheDocument();
+  });
+
+  it("renders members table headers", async () => {
+    await renderPage();
+
+    expect(screen.getByText("Member")).toBeInTheDocument();
+    expect(screen.getByText("Role")).toBeInTheDocument();
+  });
+
+  it("renders member emails in the members table", async () => {
+    await renderPage();
+
+    // owner@test.com also appears as the inviter in the pending invites table.
+    expect(screen.getAllByText("owner@test.com").length).toBeGreaterThan(0);
+    expect(screen.getByText("dev@test.com")).toBeInTheDocument();
+  });
+
+  it("renders the current user's role as camel-cased text", async () => {
+    await renderPage();
+
+    // The current user's row shows the role as plain text ("owner" becomes
+    // "Owner") instead of a role dropdown.
+    expect(screen.getByText("Owner")).toBeInTheDocument();
+  });
+
+  it("keeps Change Role disabled until a different role is selected", async () => {
+    await renderPage();
+
+    const changeRoleButton = screen.getByRole("button", {
+      name: "Change Role",
+    });
+    expect(changeRoleButton).toBeDisabled();
+
+    // The second Roles dropdown belongs to the other member's row; the mock
+    // selects a role different from the member's current one on click.
+    fireEvent.click(screen.getAllByTestId("dropdown-Roles")[1]);
+
+    expect(changeRoleButton).not.toBeDisabled();
+  });
+
+  it("disables Remove when the member cannot be removed", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: {
+        ...defaultAuthz,
+        members: [
+          defaultAuthz.members[0],
+          {
+            ...defaultAuthz.members[1],
+            authz: {
+              current_user_assignable_roles_for_member: null as any,
+              current_user_can_remove_member: false,
+            },
+          },
+        ],
+      },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.getByRole("button", { name: "Remove" })).toBeDisabled();
+  });
+
+  it("keeps Invite disabled while the email input is empty", async () => {
+    await renderPage();
+
+    const inviteButton = screen.getByRole("button", { name: "Invite" });
+    expect(inviteButton).toBeDisabled();
+
+    fireEvent.input(screen.getByPlaceholderText("Enter email"), {
+      target: { value: "new@member.com" },
+    });
+
+    expect(inviteButton).not.toBeDisabled();
+  });
+
+  it("renders pending invite email and role", async () => {
+    await renderPage();
+
+    expect(screen.getByText("invitee@test.com")).toBeInTheDocument();
+    // The inviter's email also appears in the members table.
+    expect(screen.getAllByText("owner@test.com").length).toBeGreaterThan(0);
+    // The invite role "viewer" renders camel-cased.
+    expect(screen.getByText("Viewer")).toBeInTheDocument();
+  });
+
+  it("hides the Pending Invites section when there are no pending invites", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({ pendingInvites: [] });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.queryByText("Pending Invites")).not.toBeInTheDocument();
+    expect(screen.queryByText("Invitee")).not.toBeInTheDocument();
+  });
+
+  it("renders slack integration doc link", async () => {
+    await renderPage();
+
+    // The doc link now lives in an info tooltip beside the Slack heading.
+    const trigger = screen
+      .getByText("Slack Integration")
+      .parentElement!.querySelector(
+        '[data-slot="tooltip-trigger"]',
+      ) as HTMLElement;
+    fireEvent.focus(trigger);
+    const content = await waitFor(() => {
+      const el = document.querySelector('[data-slot="tooltip-content"]');
+      if (!el) {
+        throw new Error("tooltip content not visible");
+      }
+      return el as HTMLElement;
+    });
+
+    const learnMoreLink = content.querySelector("a");
+    expect(learnMoreLink).toHaveAttribute("href", "/docs/integrations#slack");
+  });
+
+  it("shows team fetch error when teams API fails", async () => {
+    useTeamsStore.setState({
+      teamsState: "error",
+      teams: null,
+      selectedTeam: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+
+    expect(
+      await screen.findByText(
+        "Error fetching team, please refresh page to try again",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows members fetch error when authz API fails", async () => {
+    setDefaultTeamsState();
+    useTeamPageStore.setState({
+      currentUserId: "user-1",
+      authzAndMembersState: "error",
+      authzAndMembers: defaultAuthz,
+      pendingInvitesState: "success",
+      pendingInvites: defaultPendingInvites,
+      teamSlackConnectUrlState: "success",
+      teamSlackConnectUrl: "https://slack/connect",
+      teamSlackState: "success",
+      teamSlack: { slack_team_name: "Measure", is_active: true },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText(
+        "Error fetching team members, please refresh page to try again",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows members loading spinner while authz API is pending", async () => {
+    setDefaultTeamsState();
+    useTeamPageStore.setState({
+      currentUserId: "user-1",
+      authzAndMembersState: "loading",
+      pendingInvitesState: "loading",
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+
+    const spinners = await screen.findAllByTestId("skeleton-mock");
+    expect(spinners.length).toBeGreaterThan(0);
+  });
+
+  it("shows pending invites fetch error when pending invites API fails", async () => {
+    setDefaultTeamsState();
+    useTeamPageStore.setState({
+      currentUserId: "user-1",
+      authzAndMembersState: "success",
+      authzAndMembers: defaultAuthz,
+      pendingInvitesState: "error",
+      pendingInvites: null,
+      teamSlackConnectUrlState: "success",
+      teamSlackConnectUrl: "https://slack/connect",
+      teamSlackState: "success",
+      teamSlack: { slack_team_name: "Measure", is_active: true },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText(
+        "Error fetching pending invites, please refresh page to try again",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows pending invites loading spinner while pending invites API is pending", async () => {
+    setDefaultTeamsState();
+    useTeamPageStore.setState({
+      currentUserId: "user-1",
+      authzAndMembersState: "success",
+      authzAndMembers: defaultAuthz,
+      pendingInvitesState: "loading",
+      pendingInvites: null,
+      teamSlackConnectUrlState: "success",
+      teamSlackConnectUrl: "https://slack/connect",
+      teamSlackState: "success",
+      teamSlack: { slack_team_name: "Measure", is_active: true },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+
+    const skeletons = await screen.findAllByTestId("skeleton-table-mock");
+    expect(skeletons.length).toBeGreaterThan(0);
+  });
+
+  it("disables team rename save when can_rename_team is false", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_rename_team: false },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    const saveButton = screen.getByRole("button", { name: "Save" });
+    expect(saveButton).toBeDisabled();
+  });
+
+  it("re-disables rename save when team name is changed back to original", async () => {
+    await renderPage();
+
+    const input = screen.getByDisplayValue("Team One");
+    const saveButton = screen.getByRole("button", { name: "Save" });
+
+    fireEvent.change(input, { target: { value: "Team Updated" } });
+    expect(saveButton).not.toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "Team One" } });
+    expect(saveButton).toBeDisabled();
+  });
+
+  it("renames team after confirmation when can_rename_team is true", async () => {
+    const mockChangeTeamName = jest.fn().mockResolvedValue(true);
+    useTeamPageStore.setState({ changeTeamName: mockChangeTeamName });
+
+    await renderPage();
+
+    fireEvent.change(screen.getByDisplayValue("Team One"), {
+      target: { value: "Team Updated" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockChangeTeamName).toHaveBeenCalledWith("team-1", "Team Updated");
+    });
+  });
+
+  it("shows error toast when team rename fails", async () => {
+    const mockChangeTeamName = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ changeTeamName: mockChangeTeamName });
+
+    await renderPage();
+
+    fireEvent.change(screen.getByDisplayValue("Team One"), {
+      target: { value: "Team Updated" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error changing team name",
+      );
+    });
+  });
+
+  it("uses renamed member authz fields for role change and remove actions", async () => {
+    await renderPage();
+
+    fireEvent.click(screen.getAllByTestId("dropdown-Roles")[1]);
+
+    const changeRoleButtons = screen.getAllByRole("button", {
+      name: "Change Role",
+    });
+    expect(changeRoleButtons[0]).not.toBeDisabled();
+
+    const removeButtons = screen.getAllByRole("button", { name: "Remove" });
+    expect(removeButtons[0]).not.toBeDisabled();
+  });
+
+  it("disables invite actions when can_invite_roles is empty", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_invite_roles: [] },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.getAllByTestId("dropdown-Roles")[0]).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Invite" })).toBeDisabled();
+  });
+
+  it("disables pending invite actions when role is not invitable", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_invite_roles: ["developer"] },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.getByRole("button", { name: "Resend" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revoke" })).toBeDisabled();
+  });
+
+  it("invites member successfully", async () => {
+    const mockInviteMember = jest.fn().mockResolvedValue(true);
+    useTeamPageStore.setState({ inviteMember: mockInviteMember });
+
+    await renderPage();
+
+    fireEvent.input(screen.getByPlaceholderText("Enter email"), {
+      target: { value: "new@member.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Invite" }));
+
+    await waitFor(() => {
+      expect(mockInviteMember).toHaveBeenCalledWith(
+        "team-1",
+        "new@member.com",
+        expect.any(String),
+      );
+      expect(mockToastPositive).toHaveBeenCalled();
+    });
+  });
+
+  it("shows error toast when invite member fails", async () => {
+    const mockInviteMember = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ inviteMember: mockInviteMember });
+
+    await renderPage();
+
+    fireEvent.input(screen.getByPlaceholderText("Enter email"), {
+      target: { value: "new@member.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Invite" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith("Failed to invite member");
+    });
+  });
+
+  it("changes member role through confirmation dialog", async () => {
+    const mockChangeRole = jest.fn().mockResolvedValue(true);
+    useTeamPageStore.setState({ changeRole: mockChangeRole });
+
+    await renderPage();
+
+    fireEvent.click(screen.getAllByTestId("dropdown-Roles")[1]);
+    fireEvent.click(screen.getByRole("button", { name: "Change Role" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockChangeRole).toHaveBeenCalledWith(
+        "team-1",
+        expect.any(String),
+        "user-2",
+      );
+      expect(mockToastPositive).toHaveBeenCalled();
+    });
+  });
+
+  it("shows non-editable current role selector when no assignable roles are returned", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: {
+        ...defaultAuthz,
+        members: [
+          defaultAuthz.members[0],
+          {
+            ...defaultAuthz.members[1],
+            authz: {
+              ...defaultAuthz.members[1].authz,
+              current_user_assignable_roles_for_member: [],
+            },
+          },
+        ],
+      },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.getByTestId("dropdown-Current Role")).toBeInTheDocument();
+  });
+
+  it("does not render role/remove actions for the current user row", async () => {
+    await renderPage();
+
+    expect(screen.getAllByRole("button", { name: "Change Role" })).toHaveLength(
+      1,
+    );
+    expect(screen.getAllByRole("button", { name: "Remove" })).toHaveLength(1);
+  });
+
+  it("shows error toast when role change fails", async () => {
+    const mockChangeRole = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ changeRole: mockChangeRole });
+
+    await renderPage();
+
+    fireEvent.click(screen.getAllByTestId("dropdown-Roles")[1]);
+    fireEvent.click(screen.getByRole("button", { name: "Change Role" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith("Error changing role");
+    });
+  });
+
+  it("removes member through confirmation dialog", async () => {
+    const mockRemoveMember = jest.fn().mockResolvedValue(true);
+    useTeamPageStore.setState({ removeMember: mockRemoveMember });
+
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockRemoveMember).toHaveBeenCalledWith("team-1", "user-2");
+      expect(mockToastPositive).toHaveBeenCalled();
+    });
+  });
+
+  it("shows error toast when remove member fails", async () => {
+    const mockRemoveMember = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ removeMember: mockRemoveMember });
+
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith("Error removing member");
+    });
+  });
+
+  it("resends and revokes pending invites via confirmation dialogs", async () => {
+    const mockResendPendingInvite = jest.fn().mockResolvedValue(true);
+    const mockRemovePendingInvite = jest.fn().mockResolvedValue(true);
+    useTeamPageStore.setState({
+      resendPendingInvite: mockResendPendingInvite,
+      removePendingInvite: mockRemovePendingInvite,
+    });
+
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resend" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockResendPendingInvite).toHaveBeenCalledWith(
+        "team-1",
+        "invite-1",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockRemovePendingInvite).toHaveBeenCalledWith(
+        "team-1",
+        "invite-1",
+      );
+    });
+  });
+
+  it("shows error toast when resend pending invite fails", async () => {
+    const mockResendPendingInvite = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ resendPendingInvite: mockResendPendingInvite });
+
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resend" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith("Error resending invite");
+    });
+  });
+
+  it("shows error toast when revoke pending invite fails", async () => {
+    const mockRemovePendingInvite = jest.fn().mockResolvedValue(false);
+    useTeamPageStore.setState({ removePendingInvite: mockRemovePendingInvite });
+
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error removing pending invite",
+      );
+    });
+  });
+
+  it("disables slack actions when can_manage_slack is false", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_manage_slack: false },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(screen.getByTestId("slack-switch")).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Send Test Alert" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    ).toBeDisabled();
+  });
+
+  it("handles slack enable action", async () => {
+    const mockUpdateSlackStatus = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: { slack_team_name: "Measure", is_active: false },
+      updateSlackStatus: mockUpdateSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    fireEvent.click(screen.getByTestId("slack-switch"));
+
+    await waitFor(() => {
+      expect(mockUpdateSlackStatus).toHaveBeenCalledWith("team-1", true);
+    });
+  });
+
+  it("handles test slack alert action", async () => {
+    const mockTestSlackAlert = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      testSlackAlert: mockTestSlackAlert,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Send Test Alert" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Send Test Alert" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockTestSlackAlert).toHaveBeenCalledWith("team-1");
+    });
+  });
+
+  it("keeps remove slack enabled when the integration is disabled", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: { slack_team_name: "Measure", is_active: false },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(
+      screen.getByRole("button", { name: "Send Test Alert" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    ).toBeEnabled();
+  });
+
+  it("handles remove slack action through the confirmation dialog", async () => {
+    const mockRemoveTeamSlack = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      removeTeamSlack: mockRemoveTeamSlack,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Remove Slack connection" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockRemoveTeamSlack).toHaveBeenCalledWith("team-1");
+    });
+  });
+
+  it("cancelling the remove slack dialog makes no call", async () => {
+    const mockRemoveTeamSlack = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      removeTeamSlack: mockRemoveTeamSlack,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Remove Slack connection" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(mockRemoveTeamSlack).not.toHaveBeenCalled();
+  });
+
+  it("shows add-to-slack button when slack is not connected and user can manage slack", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    const addToSlackImage = await screen.findByAltText("Add to Slack");
+    const link = addToSlackImage.closest("a");
+    expect(link).toHaveAttribute("href", "https://slack/connect");
+  });
+
+  it("shows ask-a-team-owner message when slack is not connected and user cannot manage slack", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_manage_slack: false },
+      teamSlack: null,
+      // The connect url query is disabled for users who cannot manage Slack,
+      // so it reports pending forever. The section must not wait on it.
+      teamSlackConnectUrlState: "init",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText(
+        "Slack is not connected. Please ask a team owner to connect it.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByAltText("Add to Slack")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows slack integration error when slack APIs fail", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlackState: "error",
+      teamSlack: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows slack integration error when the connect URL fetch fails for a manager before connecting", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: null,
+      teamSlackConnectUrlState: "error",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps showing connected slack state when the connect URL fetch fails", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlackConnectUrlState: "error",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(
+      screen.queryByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows connected slack state instead of an error when the user cannot manage slack", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_manage_slack: false },
+      teamSlackConnectUrlState: "init",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(screen.getByTestId("slack-switch")).toBeDisabled();
+    expect(
+      screen.queryByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("retries the slack status fetch from the error state", async () => {
+    const mockRefetchSlackStatus = jest.fn();
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlackState: "error",
+      teamSlack: null,
+      refetchSlackStatus: mockRefetchSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
+
+    expect(mockRefetchSlackStatus).toHaveBeenCalled();
+  });
+
+  it("retries only the connect URL fetch when it is the failing query", async () => {
+    const mockRefetchSlackConnectUrl = jest.fn();
+    const mockRefetchSlackStatus = jest.fn();
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: null,
+      teamSlackConnectUrlState: "error",
+      teamSlackConnectUrl: null,
+      refetchSlackConnectUrl: mockRefetchSlackConnectUrl,
+      refetchSlackStatus: mockRefetchSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
+
+    expect(mockRefetchSlackConnectUrl).toHaveBeenCalled();
+    expect(mockRefetchSlackStatus).not.toHaveBeenCalled();
+  });
+
+  it("shows loading state while a manager's connect URL fetch is pending", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: null,
+      teamSlackConnectUrlState: "loading",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(screen.getAllByTestId("skeleton-mock").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Add to Slack")).not.toBeInTheDocument();
+  });
+
+  it("hides the reauth callout when a manager's connect URL fetch fails", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: {
+        slack_team_name: "Measure",
+        is_active: true,
+        needs_reauth: true,
+      },
+      teamSlackConnectUrlState: "error",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(
+      screen.queryByText(/This Slack connection is missing newer permissions/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Reconnect Slack →" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the reauth callout while a manager's connect URL is still loading", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: {
+        slack_team_name: "Measure",
+        is_active: true,
+        needs_reauth: true,
+      },
+      teamSlackConnectUrlState: "loading",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(
+      screen.queryByText(/This Slack connection is missing newer permissions/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows authorization error when the authz fetch fails and slack is not connected", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembersState: "error",
+      authzAndMembers: null,
+      teamSlack: null,
+      teamSlackConnectUrlState: "init",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText(
+        "Could not verify authorization. Please refresh to try again.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Slack is not connected. Please ask a team owner to connect it.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Add to Slack")).not.toBeInTheDocument();
+  });
+
+  it("keeps showing connected slack state with disabled controls when the authz fetch fails", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembersState: "error",
+      authzAndMembers: null,
+      teamSlackConnectUrlState: "init",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(screen.getByTestId("slack-switch")).toBeDisabled();
+    expect(
+      screen.queryByText(
+        "Could not verify authorization. Please refresh to try again.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows reconnect link in the reauth callout for slack managers", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: {
+        slack_team_name: "Measure",
+        is_active: true,
+        needs_reauth: true,
+      },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    const link = screen.getByRole("link", { name: "Reconnect Slack →" });
+    expect(link).toHaveAttribute("href", "https://slack/connect");
+  });
+
+  it("asks for a team owner in the reauth callout when user cannot manage slack", async () => {
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      authzAndMembers: { ...defaultAuthz, can_manage_slack: false },
+      teamSlack: {
+        slack_team_name: "Measure",
+        is_active: true,
+        needs_reauth: true,
+      },
+      teamSlackConnectUrlState: "init",
+      teamSlackConnectUrl: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+
+    expect(
+      screen.getByText("Ask a team owner to reconnect."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Reconnect Slack →" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("self-hosted mode points to the slack hosting guide when slack APIs fail", async () => {
+    mockIsCloud = false;
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlackState: "error",
+      teamSlack: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    const guide = await screen.findByRole("link", { name: "guide" });
+    expect(guide).toHaveAttribute("href", "/docs/hosting/slack");
+  });
+
+  it("cloud mode hides the slack hosting guide on slack API failure", async () => {
+    mockIsCloud = true;
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlackState: "error",
+      teamSlack: null,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    expect(
+      await screen.findByText((content) =>
+        content.includes("Error fetching Slack Integration status"),
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "guide" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Follow our/)).not.toBeInTheDocument();
+  });
+
+  it("shows error toast when disabling slack integration fails", async () => {
+    const mockUpdateSlackStatus = jest.fn().mockResolvedValue(false);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: { slack_team_name: "Measure", is_active: true },
+      updateSlackStatus: mockUpdateSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Send Test Alert" });
+    fireEvent.click(screen.getByTestId("slack-switch"));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error disabling Slack integration",
+      );
+    });
+  });
+
+  it("shows error toast when enabling slack integration fails", async () => {
+    const mockUpdateSlackStatus = jest.fn().mockResolvedValue(false);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      teamSlack: { slack_team_name: "Measure", is_active: false },
+      updateSlackStatus: mockUpdateSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByTestId("slack-switch");
+    fireEvent.click(screen.getByTestId("slack-switch"));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error enabling Slack integration",
+      );
+    });
+  });
+
+  it("shows success toast when disabling slack integration succeeds", async () => {
+    const mockUpdateSlackStatus = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      updateSlackStatus: mockUpdateSlackStatus,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Send Test Alert" });
+
+    fireEvent.click(screen.getByTestId("slack-switch"));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastPositive).toHaveBeenCalledWith(
+        "Slack integration disabled successfully",
+      );
+    });
+  });
+
+  it("shows error toast when sending test slack alert fails", async () => {
+    const mockTestSlackAlert = jest.fn().mockResolvedValue(false);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      testSlackAlert: mockTestSlackAlert,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Send Test Alert" });
+    fireEvent.click(screen.getByRole("button", { name: "Send Test Alert" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Failed to send test Slack alert",
+      );
+    });
+  });
+
+  it("shows success toast when removing slack connection succeeds", async () => {
+    const mockRemoveTeamSlack = jest.fn().mockResolvedValue(true);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      removeTeamSlack: mockRemoveTeamSlack,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Remove Slack connection" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastPositive).toHaveBeenCalledWith(
+        "Slack connection removed",
+      );
+    });
+  });
+
+  it("shows error toast when removing slack connection fails", async () => {
+    const mockRemoveTeamSlack = jest.fn().mockResolvedValue(false);
+
+    setDefaultTeamsState();
+    setDefaultTeamPageState();
+    useTeamPageStore.setState({
+      removeTeamSlack: mockRemoveTeamSlack,
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByRole("button", { name: "Remove Slack connection" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Slack connection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Yes, I'm sure" }));
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith(
+        "Error removing Slack connection",
+      );
+    });
+  });
+
+  it("shows toast from error query param and clears it from URL", async () => {
+    // The page reads window.location.search on a short timer after render.
+    // Stage the query through the history API (jsdom's location itself
+    // can't be stubbed), then observe the strip via the replaceState spy.
+    window.history.replaceState(null, "", "?error=Boom");
+    const replaceStateSpy = jest.spyOn(window.history, "replaceState");
+
+    await renderPage();
+
+    await waitFor(() => {
+      expect(mockToastNegative).toHaveBeenCalledWith("Boom");
+    });
+    expect(replaceStateSpy).toHaveBeenCalledWith(
+      {},
+      "",
+      window.location.pathname,
+    );
+    replaceStateSpy.mockRestore();
+  });
+
+  it("shows toast from success query param and clears it from URL", async () => {
+    window.history.replaceState(null, "", "?success=Nice");
+    const replaceStateSpy = jest.spyOn(window.history, "replaceState");
+
+    await renderPage();
+
+    await waitFor(() => {
+      expect(mockToastPositive).toHaveBeenCalledWith("Nice");
+    });
+    expect(replaceStateSpy).toHaveBeenCalledWith(
+      {},
+      "",
+      window.location.pathname,
+    );
+    replaceStateSpy.mockRestore();
+  });
+
+  it("shows team renamed toast when session storage flag is present", async () => {
+    window.sessionStorage.setItem("teamNameChanged", "true");
+
+    await renderPage();
+
+    expect(mockToastPositive).toHaveBeenCalledWith("Team name changed");
+    expect(window.sessionStorage.getItem("teamNameChanged")).toBeNull();
+  });
+
+  it("renders page without slack connect URL when currentUserId is undefined", async () => {
+    setDefaultTeamsState();
+    useTeamPageStore.setState({
+      currentUserId: undefined,
+      authzAndMembersState: "success",
+      authzAndMembers: defaultAuthz,
+      pendingInvitesState: "success",
+      pendingInvites: defaultPendingInvites,
+      teamSlackConnectUrlState: "success",
+      teamSlackConnectUrl: "https://slack/connect",
+      teamSlackState: "success",
+      teamSlack: { slack_team_name: "Measure", is_active: true },
+    });
+
+    render(<TeamOverview params={promiseParams({ teamId: "team-1" })} />);
+    await screen.findByText("Invite Team Members");
+
+    // Page renders without errors even without session user ID
+    expect(screen.getByText("Members")).toBeInTheDocument();
+  });
+
+  it("navigates to new team after create team success callback", async () => {
+    await renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Team" }));
+
+    expect(mockPush).toHaveBeenCalledWith("/team-2/team");
+  });
+});

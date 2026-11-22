@@ -1,0 +1,544 @@
+import { promiseParams } from "@/__tests__/helpers/promise_params";
+import Login from "@/app/auth/login/page";
+import { beforeEach, describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import { ApiError } from "@/app/api/api_error";
+import { act, render, screen } from "@testing-library/react";
+
+const mockRouterReplace = jest.fn();
+const mockValidateInvites = jest.fn((_arg?: any) => Promise.resolve());
+const mockPosthogIdentify = jest.fn();
+const mockFetchCurrentSession = jest.fn((...args: any[]) =>
+  Promise.resolve(null as any),
+);
+const mockResetAllStores = jest.fn();
+
+jest.mock("@/app/query/hooks", () => ({
+  __esModule: true,
+  fetchCurrentSession: (...args: any[]) => mockFetchCurrentSession(...args),
+}));
+
+jest.mock("@/app/stores/provider", () => ({
+  __esModule: true,
+  useMeasureStoreRegistry: () => ({}),
+}));
+
+jest.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ clear: jest.fn() }),
+}));
+
+jest.mock("@/app/stores/reset_all", () => ({
+  resetAllStores: (...args: any[]) => mockResetAllStores(...args),
+}));
+
+jest.mock("@/app/api/api_calls", () => ({
+  validateInvitesFromServer: (arg: any) => mockValidateInvites(arg),
+}));
+
+jest.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: mockRouterReplace }),
+  useSearchParams: () => ({ get: jest.fn(() => null) }),
+}));
+
+jest.mock("next/link", () => ({
+  __esModule: true,
+  default: ({ children, ...props }: any) => <a {...props}>{children}</a>,
+}));
+
+jest.mock("next/image", () => ({
+  __esModule: true,
+  default: ({ alt, ...props }: any) => <img alt={alt} {...props} />,
+}));
+
+jest.mock("next-themes", () => ({
+  useTheme: () => ({ theme: "light", resolvedTheme: "light" }),
+}));
+
+jest.mock("posthog-js", () => ({
+  posthog: { identify: (...args: [...any[]]) => mockPosthogIdentify(...args) },
+}));
+
+let mockIsCloud = false;
+jest.mock("@/app/utils/env_utils", () => ({
+  __esModule: true,
+  isCloud: () => mockIsCloud,
+}));
+
+// Full-page navigation goes through the navigation module because jsdom's
+// window.location can't be stubbed; mock it to observe the OAuth redirect.
+const mockAssign = jest.fn();
+jest.mock("@/app/utils/navigation", () => ({
+  navigateTo: (...args: any[]) => mockAssign(...args),
+  reloadPage: jest.fn(),
+}));
+
+describe("Login Page", () => {
+  beforeEach(() => {
+    mockIsCloud = false;
+    mockAssign.mockClear();
+    mockRouterReplace.mockClear();
+    mockValidateInvites.mockClear();
+    mockValidateInvites.mockResolvedValue(undefined);
+    mockPosthogIdentify.mockClear();
+    mockFetchCurrentSession.mockReset();
+    mockFetchCurrentSession.mockResolvedValue(null);
+    mockResetAllStores.mockClear();
+    process.env.NEXT_PUBLIC_API_BASE_URL = "https://api.example.com";
+    process.env.NEXT_PUBLIC_AGENT_BASE_URL = "https://agent.example.com";
+  });
+
+  it("fetches the current session when mcp param is absent", async () => {
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(mockFetchCurrentSession).toHaveBeenCalled();
+  });
+
+  it("skips session fetch in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "test_client",
+          redirect_uri: "http://localhost/cb",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(mockFetchCurrentSession).not.toHaveBeenCalled();
+  });
+
+  it("names the host of an https client_id in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+          redirect_uri: "http://localhost/cb",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("claude.ai")).toBeInTheDocument();
+    expect(screen.getByText(/use Measure on your behalf/)).toBeInTheDocument();
+  });
+
+  it("names the redirect host", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+          redirect_uri: "http://localhost:3118/callback",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("localhost")).toBeInTheDocument();
+  });
+
+  it("names a private-scheme redirect by its scheme", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+          redirect_uri: "com.example.app:/oauth2redirect",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("com.example.app")).toBeInTheDocument();
+  });
+
+  it("omits the redirect clause when the redirect_uri will not parse", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+          redirect_uri: "not a url",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/use Measure on your behalf/)).toBeInTheDocument();
+    expect(screen.queryByText(/You will be sent back to/)).toBeNull();
+  });
+
+  it("names a remote redirect host", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+          redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.getAllByText("claude.ai").length).toBe(2);
+  });
+
+  it("shows a generic client name for a client_id that is not an https URL", () => {
+    for (const clientId of ["msr_client_abc", "http://claude.ai/x"]) {
+      const { unmount } = render(
+        <Login
+          searchParams={promiseParams({
+            mcp: "1",
+            response_type: "code",
+            client_id: clientId,
+            redirect_uri: "http://localhost/cb",
+            state: "s",
+            code_challenge: "ch",
+          })}
+        />,
+      );
+      expect(screen.getByText("an MCP client")).toBeInTheDocument();
+      expect(screen.queryByText("claude.ai")).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("renders sign-in buttons in MCP mode without loading state", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "test_client",
+          redirect_uri: "http://localhost/cb",
+          state: "s",
+          code_challenge: "ch",
+        })}
+      />,
+    );
+
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    expect(screen.getByText("Sign in with GitHub")).toBeInTheDocument();
+    expect(screen.getByText("Sign in with Google")).toBeInTheDocument();
+  });
+
+  it("throws in MCP mode when NEXT_PUBLIC_AGENT_BASE_URL is missing", () => {
+    process.env.NEXT_PUBLIC_AGENT_BASE_URL = "";
+
+    // Silence React's console.error report of the uncaught render error
+    const consoleError = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    try {
+      expect(() =>
+        render(
+          <Login
+            searchParams={promiseParams({
+              mcp: "1",
+              response_type: "code",
+              client_id: "test_client",
+              redirect_uri: "http://localhost/cb",
+              state: "s",
+              code_challenge: "ch",
+            })}
+          />,
+        ),
+      ).toThrow("NEXT_PUBLIC_AGENT_BASE_URL is not set");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("normal sign-in is unaffected by a missing NEXT_PUBLIC_AGENT_BASE_URL", async () => {
+    process.env.NEXT_PUBLIC_AGENT_BASE_URL = "";
+
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(screen.getByText("Sign in with GitHub")).toBeInTheDocument();
+    expect(screen.getByText("Sign in with Google")).toBeInTheDocument();
+  });
+
+  it("constructs correct GitHub authorize URL in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "my_client",
+          redirect_uri: "http://localhost:9999/cb",
+          state: "mystate",
+          code_challenge: "mychallenge",
+        })}
+      />,
+    );
+
+    screen.getByText("Sign in with GitHub").click();
+
+    expect(mockAssign).toHaveBeenCalledTimes(1);
+    const url = new URL(mockAssign.mock.calls[0][0] as string);
+    expect(url.origin).toBe("https://agent.example.com");
+    expect(url.pathname).toBe("/oauth/authorize");
+    expect(url.searchParams.get("provider")).toBe("github");
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("client_id")).toBe("my_client");
+    expect(url.searchParams.get("redirect_uri")).toBe(
+      "http://localhost:9999/cb",
+    );
+    expect(url.searchParams.get("state")).toBe("mystate");
+    expect(url.searchParams.get("code_challenge")).toBe("mychallenge");
+    expect(url.searchParams.get("mcp")).toBeNull();
+  });
+
+  it("constructs correct Google authorize URL in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "my_client",
+          redirect_uri: "http://localhost:9999/cb",
+          state: "mystate",
+          code_challenge: "mychallenge",
+        })}
+      />,
+    );
+
+    screen.getByText("Sign in with Google").click();
+
+    expect(mockAssign).toHaveBeenCalledTimes(1);
+    const url = new URL(mockAssign.mock.calls[0][0] as string);
+    expect(url.origin).toBe("https://agent.example.com");
+    expect(url.pathname).toBe("/oauth/authorize");
+    expect(url.searchParams.get("provider")).toBe("google");
+    expect(url.searchParams.get("client_id")).toBe("my_client");
+    expect(url.searchParams.get("mcp")).toBeNull();
+  });
+
+  it("error param hides sign-in buttons", async () => {
+    await act(async () => {
+      render(
+        <Login searchParams={promiseParams({ error: "Could not sign in" })} />,
+      );
+    });
+
+    expect(screen.queryByText("Sign in with GitHub")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sign in with Google")).not.toBeInTheDocument();
+  });
+
+  it("message param hides sign-in buttons", async () => {
+    await act(async () => {
+      render(
+        <Login
+          searchParams={promiseParams({
+            message: "user@example.com not allowed",
+          })}
+        />,
+      );
+    });
+
+    expect(screen.queryByText("Sign in with GitHub")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sign in with Google")).not.toBeInTheDocument();
+  });
+
+  it("does not show invite error in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "c",
+          redirect_uri: "http://x/cb",
+          state: "s",
+          code_challenge: "ch",
+          inviteId: "some-invite",
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByText("Invalid or expired invite link."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("validates invite when inviteId is present in non-MCP mode", async () => {
+    await act(async () => {
+      render(
+        <Login searchParams={promiseParams({ inviteId: "invite-123" })} />,
+      );
+    });
+
+    expect(mockValidateInvites).toHaveBeenCalledWith("invite-123");
+  });
+
+  it("shows invalid invite message when the server rejects the invite", async () => {
+    mockValidateInvites.mockRejectedValue(new ApiError(404, "no such invite"));
+
+    await act(async () => {
+      render(
+        <Login searchParams={promiseParams({ inviteId: "bad-invite" })} />,
+      );
+    });
+
+    expect(
+      screen.getByText("Invalid or expired invite link."),
+    ).toBeInTheDocument();
+  });
+
+  it("does not show invalid invite message when invite is valid", async () => {
+    mockValidateInvites.mockResolvedValue(undefined);
+
+    await act(async () => {
+      render(
+        <Login searchParams={promiseParams({ inviteId: "good-invite" })} />,
+      );
+    });
+
+    expect(
+      screen.queryByText("Invalid or expired invite link."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("leaves the invite unjudged when the network fails", async () => {
+    mockValidateInvites.mockRejectedValue(new Error("network down"));
+
+    await act(async () => {
+      render(
+        <Login searchParams={promiseParams({ inviteId: "some-invite" })} />,
+      );
+    });
+
+    expect(
+      screen.queryByText("Invalid or expired invite link."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("redirects to overview when session exists", async () => {
+    mockFetchCurrentSession.mockResolvedValueOnce({
+      user: {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test",
+        own_team_id: "team-1",
+      },
+    } as any);
+
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(mockRouterReplace).toHaveBeenCalledWith("/team-1/overview");
+  });
+
+  it('shows "Logging in..." when session exists and redirecting', async () => {
+    mockFetchCurrentSession.mockResolvedValueOnce({
+      user: {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test",
+        own_team_id: "team-1",
+      },
+    } as any);
+
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(screen.getByText("Logging in...")).toBeInTheDocument();
+  });
+
+  it("calls posthog.identify when session exists", async () => {
+    mockFetchCurrentSession.mockResolvedValueOnce({
+      user: {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test User",
+        own_team_id: "team-1",
+      },
+    } as any);
+
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(mockPosthogIdentify).toHaveBeenCalledWith(
+      "user-1",
+      {
+        email: "test@example.com",
+        name: "Test User",
+      },
+      {
+        first_touch_utm_source: undefined,
+        first_touch_utm_medium: undefined,
+        first_touch_utm_campaign: undefined,
+        last_touch_utm_source: undefined,
+        last_touch_utm_medium: undefined,
+        referrer_domain: undefined,
+        signup_acquisition_source: "direct",
+        signup_is_inbound: true,
+        email_domain: "example.com",
+      },
+    );
+  });
+
+  it("does not validate invite in MCP mode", () => {
+    render(
+      <Login
+        searchParams={promiseParams({
+          mcp: "1",
+          response_type: "code",
+          client_id: "c",
+          redirect_uri: "http://x/cb",
+          state: "s",
+          code_challenge: "ch",
+          inviteId: "some-invite",
+        })}
+      />,
+    );
+
+    expect(mockValidateInvites).not.toHaveBeenCalled();
+  });
+
+  it("links terms of service and privacy policy in cloud mode", async () => {
+    mockIsCloud = true;
+
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(screen.getByText(/By continuing, you agree to our/)).toBeVisible();
+    expect(
+      screen.getByRole("link", { name: "Terms of Service" }),
+    ).toHaveAttribute("href", "/terms-of-service");
+    expect(
+      screen.getByRole("link", { name: "Privacy Policy" }),
+    ).toHaveAttribute("href", "/privacy-policy");
+  });
+
+  it("omits the terms notice when self-hosted", async () => {
+    await act(async () => {
+      render(<Login searchParams={promiseParams({})} />);
+    });
+
+    expect(
+      screen.queryByText(/By continuing, you agree to our/),
+    ).not.toBeInTheDocument();
+  });
+});

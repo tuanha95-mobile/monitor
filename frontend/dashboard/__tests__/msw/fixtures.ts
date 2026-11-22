@@ -1,0 +1,2374 @@
+/**
+ * Response fixture factories matching the Go backend struct shapes.
+ *
+ * Each factory returns a structurally valid API response with realistic
+ * data. Override individual fields via the `overrides` parameter.
+ *
+ * Source of truth: the Go struct definitions in backend/api/measure/.
+ * If a backend struct changes, update the corresponding factory here.
+ */
+
+// --- Apps (GET /teams/:teamId/apps) ---
+// Go struct: measure.App in backend/api/measure/app.go
+
+export function makeAppFixture(overrides: Record<string, any> = {}) {
+  return {
+    id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    team_id: "a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6",
+    name: "measure demo",
+    unique_identifier: "sh.measure.demo",
+    os_names: ["android"],
+    api_key: {
+      key: "msw-test-api-key-0000",
+      revoked: false,
+      created_at: "2026-01-01T00:00:00Z",
+      last_seen: "2026-04-10T12:00:00Z",
+    },
+    retention: 90,
+    first_version: "1.0.0",
+    onboarded: true,
+    onboarded_at: "2026-01-01T00:00:00Z",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-04-10T00:00:00Z",
+    ...overrides,
+  };
+}
+
+// --- Session Plot (GET /apps/:appId/sessions/plots/instances) ---
+// Go struct: session.SessionInstance in backend/api/session/plot.go
+// Response is array of { id, data: [{ datetime, instances }] }
+
+export function makeSessionPlotFixture() {
+  return [
+    {
+      id: "3.1.0",
+      data: [
+        { datetime: "2026-04-01T00:00:00Z", instances: 1200 },
+        { datetime: "2026-04-02T00:00:00Z", instances: 1350 },
+        { datetime: "2026-04-03T00:00:00Z", instances: 1100 },
+        { datetime: "2026-04-04T00:00:00Z", instances: 1400 },
+        { datetime: "2026-04-05T00:00:00Z", instances: 1250 },
+      ],
+    },
+  ];
+}
+
+// --- Crash Plot (GET /apps/:appId/crashGroups/plots/instances) ---
+// Go struct: event.IssueInstance in backend/api/event/plot.go
+// Response is array of { id, data: [{ datetime, instances, issue_free_sessions }] }
+
+export function makeCrashPlotFixture() {
+  return [
+    {
+      id: "3.1.0",
+      data: [
+        {
+          datetime: "2026-04-01T00:00:00Z",
+          instances: 15,
+          issue_free_sessions: 98.7,
+        },
+        {
+          datetime: "2026-04-02T00:00:00Z",
+          instances: 12,
+          issue_free_sessions: 99.1,
+        },
+        {
+          datetime: "2026-04-03T00:00:00Z",
+          instances: 18,
+          issue_free_sessions: 98.3,
+        },
+        {
+          datetime: "2026-04-04T00:00:00Z",
+          instances: 10,
+          issue_free_sessions: 99.3,
+        },
+        {
+          datetime: "2026-04-05T00:00:00Z",
+          instances: 14,
+          issue_free_sessions: 98.9,
+        },
+      ],
+    },
+  ];
+}
+
+// --- ANR Plot (GET /apps/:appId/anrGroups/plots/instances) ---
+// Same shape as crash plot but for ANRs
+
+export function makeAnrPlotFixture() {
+  return [
+    {
+      id: "3.1.0",
+      data: [
+        {
+          datetime: "2026-04-01T00:00:00Z",
+          instances: 3,
+          issue_free_sessions: 99.7,
+        },
+        {
+          datetime: "2026-04-02T00:00:00Z",
+          instances: 2,
+          issue_free_sessions: 99.8,
+        },
+        {
+          datetime: "2026-04-03T00:00:00Z",
+          instances: 5,
+          issue_free_sessions: 99.6,
+        },
+        {
+          datetime: "2026-04-04T00:00:00Z",
+          instances: 1,
+          issue_free_sessions: 99.9,
+        },
+        {
+          datetime: "2026-04-05T00:00:00Z",
+          instances: 4,
+          issue_free_sessions: 99.7,
+        },
+      ],
+    },
+  ];
+}
+
+// --- Health Plot (GET /apps/:appId/health/plots/instances) ---
+// Single endpoint backing the overview app health plot. Response is
+// three series keyed by id: "sessions" | "crashes" | "anrs", each with
+// sparse { datetime, instances } points.
+
+export function makeHealthPlotFixture() {
+  return [
+    {
+      id: "sessions",
+      data: [
+        { datetime: "2026-04-01T00:00:00Z", instances: 1200 },
+        { datetime: "2026-04-02T00:00:00Z", instances: 1350 },
+        { datetime: "2026-04-03T00:00:00Z", instances: 1100 },
+        { datetime: "2026-04-04T00:00:00Z", instances: 1400 },
+        { datetime: "2026-04-05T00:00:00Z", instances: 1250 },
+      ],
+    },
+    {
+      id: "crashes",
+      data: [
+        { datetime: "2026-04-01T00:00:00Z", instances: 15 },
+        { datetime: "2026-04-02T00:00:00Z", instances: 12 },
+        { datetime: "2026-04-03T00:00:00Z", instances: 18 },
+        { datetime: "2026-04-04T00:00:00Z", instances: 10 },
+        { datetime: "2026-04-05T00:00:00Z", instances: 14 },
+      ],
+    },
+    {
+      id: "anrs",
+      data: [
+        { datetime: "2026-04-01T00:00:00Z", instances: 3 },
+        { datetime: "2026-04-02T00:00:00Z", instances: 2 },
+        { datetime: "2026-04-03T00:00:00Z", instances: 5 },
+        { datetime: "2026-04-04T00:00:00Z", instances: 1 },
+        { datetime: "2026-04-05T00:00:00Z", instances: 4 },
+      ],
+    },
+  ];
+}
+
+// --- Metrics (GET /apps/:appId/metrics) ---
+// Go structs: metrics.LaunchMetric, metrics.SessionAdoption, etc.
+// in backend/api/metrics/metrics.go
+
+export function makeMetricsFixture(overrides: Record<string, any> = {}) {
+  return {
+    cold_launch: {
+      p95: 923,
+      unselected_p95: 987,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    warm_launch: {
+      p95: 412,
+      unselected_p95: 398,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    hot_launch: {
+      p95: 187,
+      unselected_p95: 224,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    adoption: {
+      all_versions: 10000000,
+      selected_version: 4100000,
+      adoption: 41,
+      no_data: false,
+    },
+    sizes: {
+      average_app_size: 52428800,
+      selected_app_size: 48234496,
+      delta: -0.08,
+      no_data: false,
+      multiple_versions: false,
+    },
+    crash_free_sessions: {
+      crash_free_sessions: 99.1,
+      unselected_crash_free_sessions: 98.2,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    anr_free_sessions: {
+      anr_free_sessions: 99.7,
+      unselected_anr_free_sessions: 99.2,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    perceived_crash_free_sessions: {
+      perceived_crash_free_sessions: 99.6,
+      unselected_perceived_crash_free_sessions: 98.9,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    perceived_anr_free_sessions: {
+      perceived_anr_free_sessions: 99.8,
+      unselected_perceived_anr_free_sessions: 99.5,
+      no_data: false,
+      unselected_no_data: false,
+    },
+    ...overrides,
+  };
+}
+
+// --- Threshold Prefs (GET /apps/:appId/thresholdPrefs) ---
+// Go struct: measure.AppThresholdPrefs in backend/api/measure/app_threshold_prefs.go
+
+export function makeThresholdPrefsFixture(overrides: Record<string, any> = {}) {
+  return {
+    app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    error_good_threshold: 99.0,
+    error_caution_threshold: 98.0,
+    error_spike_min_count_threshold: 50,
+    error_spike_min_rate_threshold: 2.0,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-04-10T00:00:00Z",
+    ...overrides,
+  };
+}
+
+// --- Session Replay Overview (GET /apps/:appId/sessions) ---
+// Go struct: assembled in handler, backend/api/measure/app.go
+
+export function makeSessionReplayOverviewFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        session_id: "sess-001",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        first_event_time: "2026-04-10T10:00:00Z",
+        last_event_time: "2026-04-10T10:05:30Z",
+        duration: "330000",
+        attribute: {
+          app_version: "3.1.0",
+          app_build: "310",
+          user_id: "user-123",
+          device_name: "Pixel 8",
+          device_model: "Pixel 8",
+          device_manufacturer: "Google",
+          os_name: "android",
+          os_version: "14",
+        },
+      },
+      {
+        session_id: "sess-002",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        first_event_time: "2026-04-10T09:00:00Z",
+        last_event_time: "2026-04-10T09:02:15Z",
+        duration: "135000",
+        attribute: {
+          app_version: "3.0.2",
+          app_build: "302",
+          user_id: "user-456",
+          device_name: "Galaxy S24",
+          device_model: "SM-S921B",
+          device_manufacturer: "Samsung",
+          os_name: "android",
+          os_version: "14",
+        },
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeSessionReplayOverviewPage2Fixture() {
+  return {
+    meta: { next: false, previous: true },
+    results: [
+      {
+        session_id: "sess-006",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        first_event_time: "2026-04-09T15:00:00Z",
+        last_event_time: "2026-04-09T15:01:00Z",
+        duration: "60000",
+        attribute: {
+          app_version: "3.0.1",
+          app_build: "301",
+          user_id: "user-789",
+          device_name: "Pixel 7",
+          device_model: "Pixel 7",
+          device_manufacturer: "Google",
+          os_name: "android",
+          os_version: "13",
+        },
+      },
+    ],
+  };
+}
+
+// --- Session Replay Details (GET /apps/:appId/sessions/:sessionId) ---
+
+// --- Journey (GET /apps/:appId/journey) ---
+// Go struct: assembled in handler, backend/api/measure/app.go
+
+export function makeJourneyFixture(overrides: Record<string, any> = {}) {
+  return {
+    nodes: [
+      {
+        id: "sh.measure.demo.MainActivity",
+        issues: { crashes: [], anrs: [] },
+      },
+      {
+        id: "sh.measure.demo.ProductListActivity",
+        issues: { crashes: [], anrs: [] },
+      },
+      {
+        id: "sh.measure.demo.SearchActivity",
+        issues: { crashes: [], anrs: [] },
+      },
+      {
+        id: "sh.measure.demo.CartActivity",
+        issues: { crashes: [], anrs: [] },
+      },
+    ],
+    links: [
+      {
+        source: "sh.measure.demo.MainActivity",
+        target: "sh.measure.demo.ProductListActivity",
+        value: 5000,
+      },
+      {
+        source: "sh.measure.demo.MainActivity",
+        target: "sh.measure.demo.SearchActivity",
+        value: 2800,
+      },
+      {
+        source: "sh.measure.demo.ProductListActivity",
+        target: "sh.measure.demo.CartActivity",
+        value: 1200,
+      },
+    ],
+    totalIssues: 0,
+    ...overrides,
+  };
+}
+
+// --- Exceptions Overview (GET /apps/:appId/crashGroups or /anrGroups) ---
+// Go struct: assembled in handler, backend/api/measure/app.go
+
+export function makeExceptionsOverviewFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: true, previous: false, plot_time_group: "days" },
+    results: [
+      {
+        id: "crash-group-001",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        type: "java.lang.NullPointerException",
+        message: "Attempt to invoke virtual method on null object reference",
+        method_name: "onClick",
+        file_name: "CheckoutActivity.kt",
+        line_number: 42,
+        count: 1523,
+        users: 611,
+        sessions: 1204,
+        last_seen: "2026-04-10T12:00:00Z",
+        trend: [
+          { datetime: "2026-04-06", instances: 280 },
+          { datetime: "2026-04-07", instances: 301 },
+          { datetime: "2026-04-08", instances: 297 },
+          { datetime: "2026-04-09", instances: 322 },
+          { datetime: "2026-04-10", instances: 323 },
+        ],
+        updated_at: "2026-04-10T12:00:00Z",
+      },
+      {
+        id: "crash-group-002",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        type: "java.lang.IllegalStateException",
+        message: "Fragment not attached to context",
+        method_name: "onResume",
+        file_name: "ProductFragment.kt",
+        line_number: 88,
+        count: 847,
+        users: 402,
+        sessions: 655,
+        last_seen: "2026-04-09T18:00:00Z",
+        trend: [
+          { datetime: "2026-04-06", instances: 160 },
+          { datetime: "2026-04-07", instances: 172 },
+          { datetime: "2026-04-08", instances: 181 },
+          { datetime: "2026-04-09", instances: 199 },
+          { datetime: "2026-04-10", instances: 135 },
+        ],
+        updated_at: "2026-04-09T18:00:00Z",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeExceptionsOverviewPage2Fixture() {
+  return {
+    meta: { next: false, previous: true, plot_time_group: "days" },
+    results: [
+      {
+        id: "crash-group-003",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        type: "java.lang.ArithmeticException",
+        message: "divide by zero",
+        method_name: "computeTotal",
+        file_name: "CartActivity.kt",
+        line_number: 12,
+        count: 91,
+        users: 0,
+        sessions: 64,
+        last_seen: "2026-04-08T10:00:00Z",
+        trend: [
+          { datetime: "2026-04-06", instances: 30 },
+          { datetime: "2026-04-07", instances: 33 },
+          { datetime: "2026-04-08", instances: 28 },
+          { datetime: "2026-04-09", instances: 0 },
+          { datetime: "2026-04-10", instances: 0 },
+        ],
+        updated_at: "2026-04-08T10:00:00Z",
+      },
+    ],
+  };
+}
+
+// --- Exception Instance Detail (GET /apps/:appId/crashGroups/:id/crashes) ---
+
+// Pass `variant: 'anr'` to get an ANR instance (with `anr` field instead of `exception`)
+// Pass `variant: 'app_hang'` to get a killed iOS app hang instance
+export function makeExceptionInstanceFixture(
+  overrides: Record<string, any> & {
+    variant?: "crash" | "anr" | "app_hang";
+  } = {},
+) {
+  const { variant = "crash", ...rest } = overrides;
+  const appHangFields =
+    variant === "app_hang"
+      ? {
+          type: "app_hang",
+          app_hang: {
+            title: "ViewController.swift: blockMainThread()",
+            stacktrace:
+              "0 DemoApp 0x104a3f5c0 ViewController.blockMainThread() + 192 (ViewController.swift:319)",
+            thread_name: "main",
+            duration: 8083,
+            state: "killed",
+          },
+          threads: [],
+        }
+      : {};
+  const exceptionField =
+    variant === "app_hang"
+      ? {}
+      : variant === "anr"
+        ? {
+            anr: {
+              title: "ANR at CheckoutActivity.onClick",
+              stacktrace:
+                "ANR in sh.measure.demo.CheckoutActivity.onClick(CheckoutActivity.kt:42)\n\tat android.os.Handler.dispatchMessage(Handler.java:106)",
+            },
+          }
+        : {
+            exception: {
+              title: "NullPointerException at CheckoutActivity.onClick",
+              stacktrace:
+                "java.lang.NullPointerException: Attempt to invoke virtual method\n\tat sh.measure.demo.CheckoutActivity.onClick(CheckoutActivity.kt:42)\n\tat android.view.View.performClick(View.java:7448)",
+              message:
+                "Attempt to invoke virtual method on null object reference",
+            },
+          };
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        id: "instance-001",
+        session_id: "sess-crash-001",
+        timestamp: "2026-04-10T10:30:00Z",
+        type: "java.lang.NullPointerException",
+        thread_name: "main",
+        ...exceptionField,
+        attribute: {
+          installation_id: "inst-001",
+          app_version: "3.1.0",
+          app_build: "310",
+          app_unique_id: "sh.measure.demo",
+          measure_sdk_version: "0.9.0",
+          platform: "android",
+          thread_name: "main",
+          user_id: "user-crash-123",
+          device_name: "Pixel 8",
+          device_model: "Pixel 8",
+          device_manufacturer: "Google",
+          device_type: "phone",
+          device_is_foldable: false,
+          device_is_physical: true,
+          device_density_dpi: 420,
+          device_width_px: 1440,
+          device_height_px: 3120,
+          device_density: 2.75,
+          device_locale: "en-US",
+          os_name: "android",
+          os_version: "14",
+          network_type: "wifi",
+          network_provider: "Comcast",
+          network_generation: "",
+        },
+        attachments: [],
+        threads: [
+          {
+            name: "main",
+            frames: [
+              "sh.measure.demo.CheckoutActivity.onClick(CheckoutActivity.kt:42)",
+              "android.view.View.performClick(View.java:7448)",
+            ],
+          },
+          {
+            name: "AsyncTask #1",
+            frames: ["java.lang.Thread.run(Thread.java:920)"],
+          },
+        ],
+        ...appHangFields,
+        ...rest,
+      },
+    ],
+  };
+}
+
+// --- Exception Distribution Plot ---
+
+function attributeDistributionFixture(values: [string, number][]) {
+  return {
+    values: values.map(([value, count]) => ({ value, count })),
+    other_count: 0,
+    distinct_count: values.length,
+  };
+}
+
+export function makeExceptionDistributionFixture() {
+  return {
+    app_version: attributeDistributionFixture([
+      ["1.2.0 (120)", 900],
+      ["1.1.0 (110)", 300],
+    ]),
+    os_version: attributeDistributionFixture([
+      ["android 14", 800],
+      ["android 13", 400],
+    ]),
+    country: attributeDistributionFixture([
+      ["US", 700],
+      ["IN", 300],
+      ["DE", 200],
+    ]),
+    network_type: attributeDistributionFixture([
+      ["wifi", 900],
+      ["cellular", 300],
+    ]),
+    locale: attributeDistributionFixture([
+      ["en-US", 800],
+      ["en-IN", 400],
+    ]),
+    device: attributeDistributionFixture([
+      ["Google - Pixel 8", 600],
+      ["Samsung - Galaxy S23", 400],
+      ["OnePlus - 11", 200],
+    ]),
+  };
+}
+
+export function makeAttributeDistributionFixture() {
+  return makeExceptionDistributionFixture().device;
+}
+
+// --- Common Path ---
+
+export function makeCommonPathFixture(overrides: Record<string, any> = {}) {
+  return {
+    sessions_analyzed: 250,
+    steps: [
+      { description: "App launched", thread_name: "main", confidence_pct: 95 },
+      {
+        description: "MainActivity.onCreate",
+        thread_name: "main",
+        confidence_pct: 92,
+      },
+      {
+        description: "CheckoutActivity.onClick",
+        thread_name: "main",
+        confidence_pct: 85,
+      },
+      {
+        description: "NetworkCall.execute",
+        thread_name: "OkHttp",
+        confidence_pct: 60,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Bug Reports Overview (GET /apps/:appId/bugReports) ---
+
+export function makeBugReportsOverviewFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        session_id: "sess-br-001",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        event_id: "evt-br-001",
+        status: 0, // Open
+        description: "App crashes when tapping checkout button",
+        timestamp: "2026-04-10T14:30:00Z",
+        attribute: {
+          installation_id: "inst-001",
+          app_version: "3.1.0",
+          app_build: "310",
+          app_unique_id: "sh.measure.demo",
+          measure_sdk_version: "0.9.0",
+          platform: "android",
+          thread_name: "main",
+          user_id: "user-br-123",
+          device_name: "Pixel 8",
+          device_model: "Pixel 8",
+          device_manufacturer: "Google",
+          device_type: "phone",
+          device_is_foldable: false,
+          device_is_physical: true,
+          device_density_dpi: 420,
+          device_width_px: 1440,
+          device_height_px: 3120,
+          device_density: 2.75,
+          device_locale: "en-US",
+          os_name: "android",
+          os_version: "14",
+          network_type: "wifi",
+          network_provider: "Comcast",
+          network_generation: "",
+        },
+        user_defined_attribute: null,
+        attachments: null,
+      },
+      {
+        session_id: "sess-br-002",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        event_id: "evt-br-002",
+        status: 1, // Closed
+        description: "",
+        timestamp: "2026-04-09T09:15:00Z",
+        attribute: {
+          installation_id: "inst-002",
+          app_version: "3.0.2",
+          app_build: "302",
+          app_unique_id: "sh.measure.demo",
+          measure_sdk_version: "0.9.0",
+          platform: "android",
+          thread_name: "main",
+          user_id: "",
+          device_name: "Galaxy S24",
+          device_model: "SM-S921B",
+          device_manufacturer: "Samsung",
+          device_type: "phone",
+          device_is_foldable: false,
+          device_is_physical: true,
+          device_density_dpi: 480,
+          device_width_px: 1440,
+          device_height_px: 3120,
+          device_density: 3.0,
+          device_locale: "de-DE",
+          os_name: "android",
+          os_version: "14",
+          network_type: "cellular",
+          network_provider: "T-Mobile",
+          network_generation: "5g",
+        },
+        user_defined_attribute: null,
+        attachments: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Bug Report Detail (GET /apps/:appId/bugReports/:bugReportId) ---
+
+export function makeBugReportDetailFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    session_id: "sess-br-001",
+    app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    event_id: "evt-br-001",
+    status: 0,
+    description: "App crashes when tapping checkout button",
+    timestamp: "2026-04-10T14:30:00Z",
+    updated_at: "2026-04-10T14:30:00Z",
+    attribute: {
+      installation_id: "inst-001",
+      app_version: "3.1.0",
+      app_build: "310",
+      app_unique_id: "sh.measure.demo",
+      measure_sdk_version: "0.9.0",
+      platform: "android",
+      thread_name: "main",
+      user_id: "user-br-123",
+      device_name: "Pixel 8",
+      device_model: "Pixel 8",
+      device_manufacturer: "Google",
+      device_type: "phone",
+      device_is_foldable: false,
+      device_is_physical: true,
+      device_density_dpi: 420,
+      device_width_px: 1440,
+      device_height_px: 3120,
+      device_density: 2.75,
+      device_locale: "en-US",
+      os_name: "android",
+      os_version: "14",
+      network_type: "wifi",
+      network_provider: "Comcast",
+      network_generation: "",
+    },
+    user_defined_attribute: { premium: true, plan: "pro" },
+    attachments: [
+      {
+        id: "att-br-1",
+        name: "screenshot.png",
+        type: "screenshot",
+        key: "att-key-br-1",
+        location: "https://example.com/bug-screenshot.png",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Bug Reports Overview Plot ---
+
+export function makeBugReportsPlotFixture() {
+  return [
+    {
+      id: "3.1.0",
+      data: [
+        { datetime: "2026-04-01T00:00:00Z", instances: 8 },
+        { datetime: "2026-04-02T00:00:00Z", instances: 12 },
+        { datetime: "2026-04-03T00:00:00Z", instances: 5 },
+      ],
+    },
+  ];
+}
+
+export function makeSessionReplayFixture(overrides: Record<string, any> = {}) {
+  return {
+    app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    session_id: "sess-001",
+    attribute: {
+      installation_id: "inst-001",
+      app_version: "3.1.0",
+      app_build: "310",
+      app_unique_id: "sh.measure.demo",
+      measure_sdk_version: "0.9.0",
+      platform: "android",
+      thread_name: "main",
+      user_id: "user-123",
+      device_name: "Pixel 8",
+      device_model: "Pixel 8",
+      device_manufacturer: "Google",
+      device_type: "phone",
+      device_is_foldable: false,
+      device_is_physical: true,
+      device_density_dpi: 420,
+      device_width_px: 1440,
+      device_height_px: 3120,
+      device_density: 2.75,
+      device_locale: "en-US",
+      os_name: "android",
+      os_version: "14",
+      network_type: "cellular",
+      network_provider: "Verizon",
+      network_generation: "5g",
+    },
+    cpu_usage: [
+      { timestamp: "2026-04-10T10:00:00Z", value: 12.5 },
+      { timestamp: "2026-04-10T10:00:01Z", value: 18.3 },
+      { timestamp: "2026-04-10T10:00:02Z", value: 15.1 },
+    ],
+    memory_usage: [
+      {
+        java_max_heap: 262144,
+        java_total_heap: 65536,
+        java_free_heap: 58391,
+        total_pss: 57572,
+        rss: 135240,
+        anon_rss: 65536,
+        swap: 8192,
+        dynamic_memory: 73728,
+        native_total_heap: 17752,
+        native_free_heap: 1229,
+        interval: 0,
+        timestamp: "2026-04-10T10:00:00Z",
+      },
+    ],
+    memory_usage_absolute: [
+      {
+        max_memory: 1024000,
+        used_memory: 512000,
+        interval: 0,
+        timestamp: "2026-04-10T10:00:00Z",
+      },
+    ],
+    duration: 330000,
+    threads: {
+      main: [
+        {
+          event_type: "lifecycle_activity",
+          thread_name: "main",
+          type: "created",
+          class_name: "sh.measure.demo.MainActivity",
+          intent: "",
+          saved_instance_state: false,
+          timestamp: "2026-04-10T10:00:00Z",
+        },
+      ],
+    },
+    traces: [
+      {
+        trace_id: "trace-001",
+        trace_name: "activity.onCreate",
+        thread_name: "main",
+        start_time: "2026-04-10T10:00:00Z",
+        end_time: "2026-04-10T10:00:00.280Z",
+        duration: 280,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Alerts Overview (GET /apps/:appId/alerts) ---
+// Go struct: assembled in handler, backend/api/measure/alert.go
+
+// --- Spans Overview (GET /apps/:appId/spans) ---
+// Go struct: assembled in handler, backend/api/measure/span.go
+
+export function makeSpansOverviewFixture(overrides: Record<string, any> = {}) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        span_name: "checkout_full_display",
+        span_id: "span-001",
+        trace_id: "trace-001",
+        status: 1, // Ok
+        start_time: "2026-04-10T14:30:00Z",
+        end_time: "2026-04-10T14:30:01.187Z",
+        duration: 1187,
+        app_version: "3.1.0",
+        app_build: "310",
+        os_name: "android",
+        os_version: "14",
+        device_manufacturer: "Google",
+        device_model: "Pixel 8",
+      },
+      {
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        span_name: "api_fetch_payments",
+        span_id: "span-002",
+        trace_id: "trace-002",
+        status: 2, // Error
+        start_time: "2026-04-09T09:15:00Z",
+        end_time: "2026-04-09T09:15:00.500Z",
+        duration: 500,
+        app_version: "3.0.2",
+        app_build: "302",
+        os_name: "ios",
+        os_version: "17",
+        device_manufacturer: "Apple",
+        device_model: "iPhone 15",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Trace Detail (GET /apps/:appId/traces/:traceId) ---
+
+export function makeTraceDetailFixture(overrides: Record<string, any> = {}) {
+  return {
+    app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    trace_id: "trace-001",
+    session_id: "sess-trace-001",
+    user_id: "user-trace-123",
+    start_time: "2026-04-10T14:30:00Z",
+    end_time: "2026-04-10T14:30:01.187Z",
+    duration: 1187,
+    app_version: "3.1.0 (310)",
+    os_version: "android 14",
+    device_model: "Pixel 8",
+    device_manufacturer: "Google",
+    network_type: "wifi",
+    spans: [
+      {
+        span_name: "checkout_full_display",
+        span_id: "span-root",
+        parent_id: "",
+        status: 0,
+        start_time: "2026-04-10T14:30:00Z",
+        end_time: "2026-04-10T14:30:01.187Z",
+        duration: 1187,
+        thread_name: "main",
+        user_defined_attributes: null,
+        checkpoints: null,
+      },
+      {
+        span_name: "api_fetch_payments",
+        span_id: "span-child-1",
+        parent_id: "span-root",
+        status: 1,
+        start_time: "2026-04-10T14:30:00.100Z",
+        end_time: "2026-04-10T14:30:00.850Z",
+        duration: 750,
+        thread_name: "okhttp",
+        user_defined_attributes: { endpoint: "/api/payments" },
+        checkpoints: [
+          { name: "request_sent", timestamp: "2026-04-10T14:30:00.120Z" },
+          { name: "response_received", timestamp: "2026-04-10T14:30:00.840Z" },
+        ],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Span Metrics Plot (GET /apps/:appId/spans/plots/metrics) ---
+
+export function makeSpanMetricsPlotFixture() {
+  return [
+    {
+      id: "checkout_full_display",
+      data: [
+        {
+          datetime: "2026-04-01T00:00:00Z",
+          p50: 800,
+          p90: 1100,
+          p95: 1200,
+          p99: 1500,
+        },
+        {
+          datetime: "2026-04-02T00:00:00Z",
+          p50: 750,
+          p90: 1050,
+          p95: 1150,
+          p99: 1400,
+        },
+        {
+          datetime: "2026-04-03T00:00:00Z",
+          p50: 820,
+          p90: 1120,
+          p95: 1250,
+          p99: 1600,
+        },
+      ],
+    },
+  ];
+}
+
+export function makeAlertsOverviewFixture(overrides: Record<string, any> = {}) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        id: "alert-001",
+        team_id: "a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        entity_id: "crash-group-001",
+        type: "crash_spike",
+        message:
+          "Crash rate spiked to 5.2% for NullPointerException in CheckoutActivity",
+        url: "/test-team/errors/b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f/crash-group-001",
+        created_at: "2026-04-10T14:30:00Z",
+        updated_at: "2026-04-10T14:30:00Z",
+      },
+      {
+        id: "alert-002",
+        team_id: "a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6",
+        app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+        entity_id: "anr-group-001",
+        type: "anr_spike",
+        message: "ANR rate increased above threshold in CartActivity",
+        url: "/test-team/errors/b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f/anr-group-001",
+        created_at: "2026-04-09T09:15:00Z",
+        updated_at: "2026-04-09T09:15:00Z",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Network Endpoints (GET /apps/:appId/networkRequests/endpoints) ---
+
+export function makeNetworkEndpointsFixture() {
+  return {
+    results: [
+      { domain: "api.example.com", path_pattern: "/v1/users/*/profile" },
+      { domain: "api.example.com", path_pattern: "/v1/orders" },
+      { domain: "cdn.example.com", path_pattern: "/images/*" },
+    ],
+  };
+}
+
+// --- Network Overview Status Codes Plot ---
+
+export function makeNetworkStatusCodesFixture() {
+  return [
+    {
+      datetime: "2026-04-01T00:00:00Z",
+      total_count: 5000,
+      count_2xx: 4700,
+      count_3xx: 50,
+      count_4xx: 150,
+      count_5xx: 100,
+    },
+    {
+      datetime: "2026-04-02T00:00:00Z",
+      total_count: 5200,
+      count_2xx: 4900,
+      count_3xx: 60,
+      count_4xx: 140,
+      count_5xx: 100,
+    },
+    {
+      datetime: "2026-04-03T00:00:00Z",
+      total_count: 4800,
+      count_2xx: 4500,
+      count_3xx: 40,
+      count_4xx: 160,
+      count_5xx: 100,
+    },
+  ];
+}
+
+export function makeNetworkEndpointStatusCodesFixture() {
+  return {
+    status_codes: [200, 201, 404],
+    data_points: [
+      {
+        datetime: "2026-04-01T00:00:00Z",
+        total_count: 5000,
+        count_200: 4600,
+        count_201: 100,
+        count_404: 300,
+      },
+      {
+        datetime: "2026-04-02T00:00:00Z",
+        total_count: 5200,
+        count_200: 4800,
+        count_201: 150,
+        count_404: 250,
+      },
+    ],
+  };
+}
+
+// --- Network Trends (GET /apps/:appId/networkRequests/trends) ---
+
+export function makeNetworkTrendsFixture() {
+  return {
+    trends_latency: [
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/checkout",
+        p95_latency: 2340,
+        error_rate: 5.7,
+        frequency: 8400,
+      },
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/users/*",
+        p95_latency: 1250,
+        error_rate: 2.1,
+        frequency: 84200,
+      },
+    ],
+    trends_error_rate: [
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/checkout",
+        p95_latency: 2340,
+        error_rate: 5.7,
+        frequency: 8400,
+      },
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/users/*/profile",
+        p95_latency: 560,
+        error_rate: 4.3,
+        frequency: 18900,
+      },
+    ],
+    trends_frequency: [
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/events",
+        p95_latency: 180,
+        error_rate: 0.1,
+        frequency: 245000,
+      },
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/users/*",
+        p95_latency: 1250,
+        error_rate: 2.1,
+        frequency: 84200,
+      },
+    ],
+  };
+}
+
+// --- Network Overview Timeline (GET /apps/:appId/networkRequests/plots/overviewTimeline) ---
+
+export function makeNetworkTimelineFixture() {
+  return {
+    interval: 5,
+    points: [
+      {
+        elapsed: 0,
+        domain: "api.example.com",
+        path_pattern: "/v1/auth/token",
+        count: 2.5,
+      },
+      {
+        elapsed: 5,
+        domain: "api.example.com",
+        path_pattern: "/v1/auth/token",
+        count: 1.8,
+      },
+      {
+        elapsed: 10,
+        domain: "api.example.com",
+        path_pattern: "/v1/users/*",
+        count: 1.2,
+      },
+    ],
+  };
+}
+
+// --- Network Endpoint Latency Plot ---
+
+export function makeNetworkEndpointLatencyFixture() {
+  return [
+    {
+      datetime: "2026-04-01T00:00:00Z",
+      p50: 120,
+      p90: 250,
+      p95: 340,
+      p99: 580,
+      count: 1200,
+    },
+    {
+      datetime: "2026-04-02T00:00:00Z",
+      p50: 115,
+      p90: 240,
+      p95: 320,
+      p99: 550,
+      count: 1350,
+    },
+    {
+      datetime: "2026-04-03T00:00:00Z",
+      p50: 130,
+      p90: 260,
+      p95: 360,
+      p99: 600,
+      count: 1100,
+    },
+  ];
+}
+
+// --- Network Endpoint Status Codes Plot ---
+
+// --- Network Endpoint Timeline ---
+
+// --- Authz (GET /teams/:teamId/authz) ---
+
+export function makeAuthzFixture(overrides: Record<string, any> = {}) {
+  return {
+    can_create_app: true,
+    can_update_bug_reports: true,
+    can_change_funnels: true,
+    can_rename_app: true,
+    can_change_retention: true,
+    can_rotate_api_key: true,
+    can_write_sdk_config: true,
+    can_change_app_threshold_prefs: true,
+    ...overrides,
+  };
+}
+
+// --- Billing Info (GET /teams/:teamId/billing/info) ---
+
+export function makeBillingInfoFixture(overrides: Record<string, any> = {}) {
+  return {
+    team_id: "team-001",
+    plan: "pro",
+    autumn_customer_id: "cust_test",
+    bytes_granted: 0,
+    bytes_used: 0,
+    status: "active",
+    current_period_start: 0,
+    current_period_end: 0,
+    canceled_at: 0,
+    ...overrides,
+  };
+}
+
+// --- App Retention (GET /apps/:appId/retention) ---
+
+export function makeAppRetentionFixture(overrides: Record<string, any> = {}) {
+  return { retention: 90, ...overrides };
+}
+
+// --- SDK Config (GET /apps/:appId/config) ---
+
+export function makeSdkConfigFixture(overrides: Record<string, any> = {}) {
+  return {
+    trace_sampling_rate: 50,
+    error_replay_duration: 30,
+    error_fatal_take_screenshot: true,
+    error_fatal_replay_enabled: true,
+    error_unhandled_replay_enabled: true,
+    error_handled_replay_enabled: false,
+    error_fatal_sampling_rate: 100,
+    error_unhandled_sampling_rate: 100,
+    error_handled_sampling_rate: 0,
+    anr_timeline_duration: 30,
+    anr_take_screenshot: true,
+    app_hang_threshold_millis: 2000,
+    app_hang_timeline_duration: 30,
+    app_hang_sampling_rate: 100,
+    app_hang_replay_enabled: true,
+    bug_report_timeline_duration: 30,
+    launch_sampling_rate: 100,
+    journey_sampling_rate: 100,
+    http_sampling_rate: 100,
+    http_disable_event_for_urls: [],
+    http_track_request_for_urls: [],
+    http_track_response_for_urls: [],
+    http_blocked_headers: [],
+    screenshot_mask_level: "all_text_and_media",
+    memory_usage_interval: 5,
+    memory_usage_background_interval: 10,
+    memory_usage_session_sampling_rate: 0.01,
+    log_autocollect_enabled: true,
+    log_min_severity: 12,
+    log_ignore_patterns: [],
+    ...overrides,
+  };
+}
+
+// --- Teams (GET /teams) ---
+
+export function makeTeamsFixture() {
+  return [
+    { id: "team-001", name: "Test Team" },
+    { id: "team-002", name: "Other Team" },
+  ];
+}
+
+// --- Authz + Members (GET /teams/:teamId/authz) ---
+
+export function makeAuthzAndMembersFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    can_invite_roles: ["owner", "admin", "viewer"],
+    can_change_billing: true,
+    can_create_app: true,
+    can_update_bug_reports: true,
+    can_change_funnels: true,
+    can_rename_app: true,
+    can_change_retention: true,
+    can_rotate_api_key: true,
+    can_write_sdk_config: true,
+    can_rename_team: true,
+    can_manage_slack: true,
+    can_change_app_threshold_prefs: true,
+    members: [
+      {
+        id: "user-current",
+        name: "Current User",
+        email: "current@example.com",
+        role: "owner",
+        last_sign_in_at: "2026-04-10T12:00:00Z",
+        created_at: "2026-01-01T00:00:00Z",
+        authz: {
+          current_user_assignable_roles_for_member: null,
+          current_user_can_remove_member: false,
+        },
+      },
+      {
+        id: "user-member",
+        name: "Team Member",
+        email: "member@example.com",
+        role: "admin",
+        last_sign_in_at: "2026-04-09T10:00:00Z",
+        created_at: "2026-02-01T00:00:00Z",
+        authz: {
+          current_user_assignable_roles_for_member: ["admin", "viewer"],
+          current_user_can_remove_member: true,
+        },
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Pending Invites (GET /teams/:teamId/invites) ---
+
+export function makePendingInvitesFixture() {
+  return [
+    {
+      id: "invite-001",
+      invited_by_user_id: "user-current",
+      invited_by_email: "current@example.com",
+      invited_to_team_id: "team-001",
+      role: "viewer",
+      email: "pending@example.com",
+      created_at: "2026-04-08T00:00:00Z",
+      updated_at: "2026-04-08T00:00:00Z",
+      valid_until: "2026-04-15T00:00:00Z",
+    },
+  ];
+}
+
+// --- Slack Connect URL (GET /api/teams/:teamId/slack/connect-url) ---
+
+export function makeSlackConnectUrlFixture() {
+  return { url: "https://slack.com/oauth/v2/authorize?client_id=test" };
+}
+
+// --- Slack Status (GET /teams/:teamId/slack) ---
+
+export function makeSlackStatusFixture(overrides: Record<string, any> = {}) {
+  return {
+    slack_team_name: "Test Workspace",
+    is_active: true,
+    needs_reauth: false,
+    ...overrides,
+  };
+}
+
+// --- Notification Preferences (GET /prefs/notifPrefs) ---
+
+// --- Usage (GET /teams/:teamId/usage) ---
+
+export function makeUsageFixture() {
+  return [
+    {
+      app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+      app_name: "measure demo",
+      monthly_app_usage: [
+        {
+          month_year: "Mar 2026",
+          sessions: 5000,
+          events: 12000,
+          spans: 8000,
+          bytes_in: 1_000_000_000,
+        },
+        {
+          month_year: "Apr 2026",
+          sessions: 6200,
+          events: 15000,
+          spans: 9500,
+          bytes_in: 1_500_000_000,
+        },
+      ],
+    },
+    {
+      app_id: "c6f4e9b2-7d3e-5a0b-9f8c-2b3c4d5e6f7a",
+      app_name: "other app",
+      monthly_app_usage: [
+        {
+          month_year: "Mar 2026",
+          sessions: 2000,
+          events: 4000,
+          spans: 3000,
+          bytes_in: 500_000_000,
+        },
+        {
+          month_year: "Apr 2026",
+          sessions: 2500,
+          events: 5000,
+          spans: 3500,
+          bytes_in: 750_000_000,
+        },
+      ],
+    },
+  ];
+}
+
+export function makeNotifPrefsFixture(overrides: Record<string, any> = {}) {
+  return {
+    error_spike: true,
+    app_hang_spike: true,
+    bug_report: false,
+    daily_summary: true,
+    ...overrides,
+  };
+}
+
+// --- Filter keys (GET /apps/:appId/filters/keys) ---
+
+export function makeFilterKeysFixture(overrides: Record<string, any> = {}) {
+  return {
+    keys: [
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The version the build was uploaded against",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "mapping_type",
+        label: "File type",
+        description: "The kind of mapping file the build carries",
+        key_group: "Build",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+    ],
+    key_groups: ["Version", "Build"],
+    ...overrides,
+  };
+}
+
+// --- Filter keys for the bug_reports entity ---
+
+export function makeBugReportsFilterKeysFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    keys: [
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The app version the bug report was filed on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "bug_report_status",
+        label: "Bug report status",
+        description: "Whether the bug report is open or closed",
+        key_group: "Bug Report",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "user_id",
+        label: "User ID",
+        description: "The user the bug report was filed by",
+        key_group: "User",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "bug_report_description",
+        label: "Description",
+        description: "The bug report's description text",
+        key_group: "Bug Report",
+        value_type: "string",
+        value_suggestion_mode: "none",
+        operators: ["contains", "not_contains"],
+      },
+      {
+        name: "session_id",
+        label: "Session ID",
+        description: "The session the bug report was filed in",
+        key_group: "Session",
+        value_type: "uuid",
+        value_suggestion_mode: "none",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "os_name",
+        label: "OS name",
+        description: "The operating system's name",
+        key_group: "OS",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+    ],
+    key_groups: [
+      "Bug Report",
+      "Version",
+      "OS",
+      "Device",
+      "Network",
+      "Location",
+      "User",
+      "Session",
+      "Custom",
+    ],
+    ...overrides,
+  };
+}
+
+// --- Filter keys for the sessions entity ---
+
+export function makeSessionsFilterKeysFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    keys: [
+      {
+        name: "session_events",
+        label: "Events",
+        description: "What the session contains",
+        key_group: "Session",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: [
+          "fatal_error",
+          "unhandled_error",
+          "handled_error",
+          "anr",
+          "bug_report",
+          "user_interaction",
+        ],
+      },
+      {
+        name: "session_foreground_background",
+        label: "Foreground/Background",
+        description: "Whether the session ran in the foreground or background",
+        key_group: "Session",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: ["foreground", "background"],
+      },
+      {
+        name: "device_total_memory",
+        label: "Device total memory",
+        description: "The total memory of the device.",
+        key_group: "Device",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: [
+          "0-4gb",
+          "5-6gb",
+          "7-8gb",
+          "9-12gb",
+          "13-16gb",
+          "17-32gb",
+          "33gb+",
+          "unknown",
+        ],
+      },
+      {
+        name: "session_custom_event",
+        label: "Custom event name",
+        description: "The name of a custom event recorded in the session",
+        key_group: "Session",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains", "starts_with"],
+      },
+      {
+        name: "session_log",
+        label: "Log",
+        description: "The text of a log line recorded in the session",
+        key_group: "Session",
+        value_type: "string",
+        value_suggestion_mode: "none",
+        operators: ["contains", "not_contains", "starts_with", "ends_with"],
+      },
+      {
+        name: "session_error_text",
+        label: "Error text",
+        description: "The text of an error recorded in the session",
+        key_group: "Session",
+        value_type: "string",
+        value_suggestion_mode: "none",
+        operators: ["contains", "not_contains", "starts_with", "ends_with"],
+      },
+      {
+        name: "session_screen",
+        label: "Screen",
+        description: "The name of a screen the session visited",
+        key_group: "Session",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains", "starts_with"],
+      },
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The app version the session ran on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "patch_version",
+        label: "Patch version",
+        description: "The version of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "patch_id",
+        label: "Patch id",
+        description: "The id of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "uuid",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "is_set", "is_not_set"],
+      },
+      {
+        name: "user_id",
+        label: "User ID",
+        description: "The user the session belonged to",
+        key_group: "User",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "os_name",
+        label: "OS name",
+        description: "The operating system's name",
+        key_group: "OS",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+    ],
+    key_groups: ["Session", "Version", "OS", "Device", "User"],
+    ...overrides,
+  };
+}
+
+// --- Filter keys for the journeys entity ---
+// The journey table carries only the app version, so these are its only keys.
+
+export function makeJourneysFilterKeysFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    keys: [
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The app version the session ran on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "version_code",
+        label: "App build",
+        description: "The app build the session ran on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "patch_version",
+        label: "Patch version",
+        description: "The version of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "patch_id",
+        label: "Patch id",
+        description: "The id of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "uuid",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "is_set", "is_not_set"],
+      },
+    ],
+    key_groups: ["Version"],
+    ...overrides,
+  };
+}
+
+// --- Filter keys for the network entity ---
+
+export function makeNetworkFilterKeysFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    keys: [
+      {
+        name: "http_method",
+        label: "HTTP method",
+        description: "The HTTP method of the request.",
+        key_group: "Request",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: ["get", "post", "put", "patch", "delete"],
+      },
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The app version the request was made on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "os_name",
+        label: "OS name",
+        description: "The operating system's name",
+        key_group: "OS",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "network_type",
+        label: "Network type",
+        description: "The kind of network the request went over",
+        key_group: "Network",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+    ],
+    key_groups: ["Request", "Version", "OS", "Device", "Network", "Location"],
+    ...overrides,
+  };
+}
+
+// --- Filter keys for the errors entity ---
+
+export function makeErrorGroupEventsFilterKeysFixture() {
+  const errors = makeErrorsFilterKeysFixture();
+  return {
+    ...errors,
+    keys: [
+      ...errors.keys.filter((key: any) => key.name !== "error_type"),
+      {
+        name: "app_hang_state",
+        label: "State",
+        description:
+          "Whether the app was killed during the hang or recovered from it.",
+        key_group: "App Hang",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: ["Killed", "Recovered"],
+      },
+    ],
+    key_groups: [
+      ...errors.key_groups.filter((group: string) => group !== "Error"),
+      "App Hang",
+    ],
+  };
+}
+
+export function makeErrorsFilterKeysFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    keys: [
+      {
+        name: "error_type",
+        label: "Error Type",
+        description: "The kind and severity of the error",
+        key_group: "Error",
+        value_type: "enum",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+        enum_values: [
+          "Crash",
+          "ANR",
+          "Handled Error",
+          "Unhandled Error",
+          "App Hang",
+        ],
+      },
+      {
+        name: "version_name",
+        label: "App version",
+        description: "The app version the error occurred on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "version_code",
+        label: "App build",
+        description: "The app build the error occurred on",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "patch_version",
+        label: "Patch version",
+        description: "The version of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "patch_id",
+        label: "Patch id",
+        description: "The id of an Over-The-Air patch.",
+        key_group: "Version",
+        value_type: "uuid",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "is_set", "is_not_set"],
+      },
+      {
+        name: "user_id",
+        label: "User ID",
+        description: "The user the error occurred for",
+        key_group: "User",
+        value_type: "string",
+        value_suggestion_mode: "sample",
+        operators: ["in", "not_in", "contains"],
+      },
+      {
+        name: "os_name",
+        label: "OS name",
+        description: "The operating system's name",
+        key_group: "OS",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "os_version",
+        label: "OS version",
+        description: "The operating system's version",
+        key_group: "OS",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "device_name",
+        label: "Device name",
+        description: "The device's model name",
+        key_group: "Device",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "device_manufacturer",
+        label: "Device manufacturer",
+        description: "The device's manufacturer",
+        key_group: "Device",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "locale",
+        label: "Locale",
+        description: "The device's locale",
+        key_group: "Device",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "network_type",
+        label: "Network type",
+        description: "The kind of network the device was on",
+        key_group: "Network",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "network_generation",
+        label: "Network generation",
+        description: "The cellular network generation the device was on",
+        key_group: "Network",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "network_provider",
+        label: "Network provider",
+        description: "The device's network carrier",
+        key_group: "Network",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+      {
+        name: "country",
+        label: "Country",
+        description: "The country the error occurred in",
+        key_group: "Location",
+        value_type: "string",
+        value_suggestion_mode: "full_list",
+        operators: ["in", "not_in"],
+      },
+    ],
+    key_groups: [
+      "Error",
+      "Version",
+      "User",
+      "OS",
+      "Device",
+      "Network",
+      "Location",
+    ],
+    ...overrides,
+  };
+}
+
+// --- Filter values (GET /apps/:appId/filters/values) ---
+
+export function makeFilterValuesFixture(overrides: Record<string, any> = {}) {
+  return {
+    values: [{ text: "proguard" }, { text: "dsym" }],
+    truncated: false,
+    ...overrides,
+  };
+}
+
+// --- Builds (GET /apps/:appId/builds) ---
+
+export function makeBuildsFixture(overrides: Record<string, any> = {}) {
+  return {
+    results: [
+      {
+        version_name: "1.0.2",
+        version_code: "2",
+        last_updated: "2026-04-10T00:00:00Z",
+        files: [
+          {
+            id: "3f0e7c3e-9c31-4d9d-9a4e-2f6a3d0f5b21",
+            mapping_type: "proguard",
+            download_url: "/apps/app-1/builds/mapping-1/download",
+            filesize: 1024,
+            last_updated: "2026-04-10T00:00:00Z",
+          },
+        ],
+      },
+    ],
+    meta: { next: false, previous: false },
+    ...overrides,
+  };
+}
+
+// --- Funnels (GET /apps/:appId/funnels and /apps/:appId/funnels/:funnelId) ---
+// Shape: Funnel in app/api/api_calls.ts
+
+export function makeFunnelFixture(overrides: Record<string, any> = {}) {
+  return {
+    id: "funnel-001",
+    app_id: "b5f3e8a1-6c2d-4f9a-8e7b-1a2b3c4d5e6f",
+    name: "Checkout",
+    steps: [
+      { event_name: "product_viewed" },
+      { event_name: "added_to_cart" },
+      { event_name: "checkout_started" },
+      { event_name: "payment_submitted" },
+      { event_name: "order_placed" },
+    ],
+    conversion_window_seconds: 86400,
+    pinned: true,
+    pin_order: 0,
+    created_by: "user-001",
+    created_by_email: "test@example.com",
+    created_at: "2026-03-01T00:00:00Z",
+    updated_at: "2026-04-04T09:30:00Z",
+    ...overrides,
+  };
+}
+
+export function makeSearchToCartFunnelFixture(
+  overrides: Record<string, any> = {},
+) {
+  return makeFunnelFixture({
+    id: "funnel-002",
+    name: "Search to cart",
+    steps: [
+      { event_name: "search_performed" },
+      { event_name: "search_result_clicked" },
+      { event_name: "added_to_cart" },
+    ],
+    conversion_window_seconds: 1800,
+    pinned: false,
+    pin_order: null,
+    created_by: null,
+    created_by_email: null,
+    created_at: "2026-03-04T00:00:00Z",
+    updated_at: "2026-03-04T00:00:00Z",
+    ...overrides,
+  });
+}
+
+export function makeSearchToOrderFunnelFixture(
+  overrides: Record<string, any> = {},
+) {
+  return makeFunnelFixture({
+    id: "funnel-003",
+    name: "Search to order",
+    steps: [
+      { event_name: "search_performed" },
+      { event_name: "search_result_clicked" },
+      { event_name: "added_to_cart" },
+      { event_name: "order_placed" },
+    ],
+    conversion_window_seconds: 7200,
+    pinned: true,
+    pin_order: 1,
+    created_at: "2026-03-10T00:00:00Z",
+    updated_at: "2026-04-01T00:00:00Z",
+    ...overrides,
+  });
+}
+
+export function makeFunnelsFixture(overrides: Record<string, any> = {}) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      makeFunnelFixture(),
+      makeSearchToCartFunnelFixture(),
+      makeSearchToOrderFunnelFixture(),
+    ],
+    ...overrides,
+  };
+}
+
+export function makeFunnelsPage2Fixture() {
+  return {
+    meta: { next: false, previous: true },
+    results: [
+      makeFunnelFixture({
+        id: "funnel-004",
+        name: "Log in",
+        steps: [
+          { event_name: "login_viewed" },
+          { event_name: "login_submitted" },
+          { event_name: "login_succeeded" },
+        ],
+        conversion_window_seconds: 3600,
+        pinned: false,
+        pin_order: null,
+        updated_at: "2026-02-20T00:00:00Z",
+      }),
+    ],
+  };
+}
+
+// --- Pinned funnels (GET /apps/:appId/funnels/pinned) ---
+
+export function makePinnedFunnelsFixture(overrides: Record<string, any> = {}) {
+  return {
+    results: [makeFunnelFixture(), makeSearchToOrderFunnelFixture()],
+    ...overrides,
+  };
+}
+
+// --- Funnel event names (GET /apps/:appId/funnels/events) ---
+
+export function makeFunnelEventNamesFixture() {
+  return {
+    results: [
+      "added_to_cart",
+      "checkout_started",
+      "order_placed",
+      "payment_submitted",
+      "product_viewed",
+      "search_performed",
+      "search_result_clicked",
+    ],
+  };
+}
+
+// --- Funnel conversion (GET /apps/:appId/funnels/:funnelId/conversion) ---
+// One entry per step of the Checkout funnel, in step order.
+
+export function makeFunnelConversionFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    steps: [
+      {
+        event_name: "product_viewed",
+        users: 10000,
+        median_seconds_from_previous: null,
+      },
+      {
+        event_name: "added_to_cart",
+        users: 1900,
+        median_seconds_from_previous: 95,
+      },
+      {
+        event_name: "checkout_started",
+        users: 760,
+        median_seconds_from_previous: 240,
+      },
+      {
+        event_name: "payment_submitted",
+        users: 562,
+        median_seconds_from_previous: 110,
+      },
+      {
+        event_name: "order_placed",
+        users: 523,
+        median_seconds_from_previous: 6,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Funnel trend (GET /apps/:appId/funnels/:funnelId/trend) ---
+// One entry per step for each period. The latest period is still converting.
+
+function funnelTrendPoint(
+  datetime: string,
+  users: number[],
+  medianSecondsToConvert: number | null,
+  complete = true,
+) {
+  return {
+    datetime,
+    steps: users.map((count, i) => ({
+      users: count,
+      median_seconds_from_previous: i === 0 ? null : 60 * i,
+    })),
+    median_seconds_to_convert: medianSecondsToConvert,
+    complete,
+  };
+}
+
+export function makeFunnelTrendFixture(overrides: Record<string, any> = {}) {
+  return {
+    event_names: [
+      "product_viewed",
+      "added_to_cart",
+      "checkout_started",
+      "payment_submitted",
+      "order_placed",
+    ],
+    points: [
+      funnelTrendPoint("2026-03-16", [1000, 200, 80, 60, 50], 1180),
+      funnelTrendPoint("2026-03-23", [1200, 230, 95, 70, 66], 1210),
+      funnelTrendPoint("2026-03-30", [1100, 210, 90, 66, 62], 1260),
+      funnelTrendPoint("2026-04-06", [900, 150, 40, 20, 10], 900, false),
+    ],
+    builds: [
+      {
+        version_name: "3.1.0",
+        version_code: "310",
+        patch_id: null,
+        patch_version: null,
+        uploaded_at: "2026-03-25T10:00:00Z",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeSearchToOrderTrendFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    event_names: [
+      "search_performed",
+      "search_result_clicked",
+      "added_to_cart",
+      "order_placed",
+    ],
+    points: [
+      funnelTrendPoint("2026-03-23", [800, 500, 100, 30], 2400),
+      funnelTrendPoint("2026-03-30", [820, 520, 200, 26], 2700),
+      funnelTrendPoint("2026-04-06", [760, 470, 60, 5], 1500, false),
+    ],
+    releases: [],
+    ...overrides,
+  };
+}
+
+export function makeSearchToCartTrendFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    event_names: ["search_performed", "search_result_clicked", "added_to_cart"],
+    points: [
+      funnelTrendPoint("2026-03-23", [600, 380, 80], 140),
+      funnelTrendPoint("2026-03-30", [640, 400, 90], 150),
+      funnelTrendPoint("2026-04-06", [500, 300, 50], 120, false),
+    ],
+    releases: [],
+    ...overrides,
+  };
+}
+
+// --- Funnel step errors (GET /apps/:appId/funnels/:funnelId/errors) ---
+
+export function makeFunnelStepErrorsFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: true, previous: false },
+    results: [
+      {
+        id: "crash-group-001",
+        type: "java.lang.NullPointerException",
+        error_type: "exception",
+        severity: "fatal",
+        message: "Attempt to invoke virtual method on null object reference",
+        method_name: "onAddToCart",
+        file_name: "ProductActivity.kt",
+        count: 612,
+        users: 443,
+        dropped: 405,
+        converted: 38,
+      },
+      {
+        id: "anr-group-001",
+        type: "",
+        error_type: "anr",
+        severity: "fatal",
+        message: "Input dispatching timed out",
+        method_name: "loadImages",
+        file_name: "ProductGallery.kt",
+        count: 97,
+        users: 81,
+        dropped: 81,
+        converted: 0,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Funnel step traces (GET /apps/:appId/funnels/:funnelId/traces) ---
+
+export function makeFunnelStepTracesFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: false, previous: false },
+    results: [
+      {
+        span_name: "product_detail_load",
+        count: 1600,
+        dropped: 1215,
+        converted: 190,
+        dropped_duration_ms: 4200,
+        converted_duration_ms: 2100,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Funnel step network (GET /apps/:appId/funnels/:funnelId/network) ---
+
+export function makeFunnelStepNetworkFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: false, previous: false },
+    results: [
+      {
+        domain: "api.example.com",
+        path_pattern: "/v1/products/*/reviews",
+        count: 3100,
+        dropped: 2430,
+        converted: 380,
+        dropped_latency_ms: 950,
+        converted_latency_ms: 420,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+// --- Funnel step sessions (GET /apps/:appId/funnels/:funnelId/sessions) ---
+
+export function makeFunnelCadenceFixture(overrides: Record<string, any> = {}) {
+  return {
+    from: "2026-03-09T00:00:00.000Z",
+    to: "2026-04-06T00:00:00.000Z",
+    hours: [
+      { weekday: 1, hour: 9, users: 400, converted: 12 },
+      { weekday: 6, hour: 20, users: 250, converted: 11 },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeFunnelStepSessionsFixture(
+  overrides: Record<string, any> = {},
+) {
+  return {
+    meta: { next: false, previous: false },
+    results: [
+      {
+        session_id: "session-funnel-001",
+        installation_id: "installation-funnel-001",
+        user_id: "user-funnel-001",
+        first_event_time: "2026-03-24T10:00:00Z",
+        duration: 185000,
+      },
+    ],
+    ...overrides,
+  };
+}

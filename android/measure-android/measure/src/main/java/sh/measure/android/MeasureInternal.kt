@@ -1,0 +1,483 @@
+package sh.measure.android
+
+import android.app.Activity
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import sh.measure.android.attributes.AttributeValue
+import sh.measure.android.bugreport.MsrShakeListener
+import sh.measure.android.events.EventType
+import sh.measure.android.lifecycle.AppLifecycleListener
+import sh.measure.android.logger.LogLevel
+import sh.measure.android.logger.MonitorPrinter
+import sh.measure.android.logger.SdkDebugLogWriter
+import sh.measure.android.logs.LogSeverity
+import sh.measure.android.tracing.Span
+import sh.measure.android.tracing.SpanBuilder
+import sh.measure.android.utils.AttachmentHelper
+import sh.measure.android.utils.ValidationLimits
+import sh.measure.android.utils.WebPEncoder
+import sh.measure.android.utils.iso8601Timestamp
+
+/**
+ * Initializes the Measure SDK and hides the internal dependencies from public API.
+ */
+internal class MeasureInternal(private val measure: MeasureInitializer) :
+    AppLifecycleListener,
+    SessionStartListener {
+    val timeProvider = measure.timeProvider
+    val processInfoProvider = measure.processInfoProvider
+    val logger = measure.logger
+    val bugReportCollector = measure.bugReportCollector
+    val httpEventCollector = measure.httpEventCollector
+    val httpUrlConnectionEventCollector = measure.httpUrlConnectionEventCollector
+    val logEventCollector = measure.logEventCollector
+    val signalProcessor = measure.signalProcessor
+
+    @Volatile
+    private var isStarted: Boolean = false
+    private val lock = Any()
+
+    private val uuidRegex = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+    /**
+     * Reads the most recently stored monitors (events and spans) from the local database,
+     * prints them to logcat and returns them as a human readable string.
+     *
+     * This performs synchronous database reads, so prefer calling it off the main thread.
+     *
+     * @param limit Maximum number of events and spans to read (each capped independently).
+     */
+    fun dumpStoredMonitors(limit: Int): String {
+        val builder = StringBuilder()
+        builder.append("===== Measure stored monitors (newest first, limit=$limit) =====\n")
+        try {
+            val eventIds = measure.database.getRecentEventIds(limit)
+            val events = measure.database.getEventPackets(eventIds)
+            builder.append("Events (").append(events.size).append("):\n")
+            events.forEach { event ->
+                val data = event.serializedData ?: event.serializedDataFilePath?.let { path ->
+                    runCatching { measure.fileStorage.getFile(path)?.readText() }.getOrNull()
+                }
+                builder.append("  - [").append(event.type.value).append("] ")
+                    .append(event.timestamp)
+                    .append(" session=").append(event.sessionId).append('\n')
+                if (!data.isNullOrBlank()) {
+                    builder.append("      data: ").append(data).append('\n')
+                }
+            }
+
+            val spanIds = measure.database.getRecentSpanIds(limit)
+            val spans = measure.database.getSpanPackets(spanIds)
+            builder.append("Spans (").append(spans.size).append("):\n")
+            spans.forEach { span ->
+                builder.append("  - ").append(span.name)
+                    .append(" ").append(span.duration).append("ms")
+                    .append(" status=").append(span.status)
+                    .append(" session=").append(span.sessionId).append('\n')
+            }
+        } catch (e: Exception) {
+            logger.log(LogLevel.Error, "Failed to dump stored monitors", e)
+            builder.append("Failed to read monitors: ").append(e.message).append('\n')
+        }
+        val result = builder.toString()
+        MonitorPrinter.line(result)
+        return result
+    }
+
+    fun init() {
+        try {
+            if (measure.configProvider.enableDiagnosticMode) {
+                val logsDir = measure.fileStorage.getSdkDebugLogsDirectory()
+                if (logsDir != null) {
+                    val now = measure.timeProvider.now()
+                    val writer = SdkDebugLogWriter(
+                        logsDir = logsDir,
+                        sdkVersion = BuildConfig.MEASURE_SDK_VERSION,
+                        fileName = now.toString(),
+                        timestamp = now.iso8601Timestamp(),
+                        ioExecutor = measure.executorServiceRegistry.ioExecutor(),
+                    )
+                    writer.start()
+                    measure.logger.setLogCallback { level, message, throwable ->
+                        writer.writeLog(level, message, throwable)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Silently ignore to avoid affecting SDK initialization
+        }
+
+        // Local mode: the SDK stores monitors on-device and never uploads, so there is no
+        // network client or API credential setup.
+
+        measure.sessionManager.setSessionStartListener(this)
+        // start a session
+        measure.sessionManager.init()
+
+        // setup lifecycle state
+        measure.resumedActivityProvider.register()
+        measure.appLifecycleManager.addListener(this)
+        measure.appLifecycleManager.register()
+
+        // delaying this can lead to initial
+        // launch events to not get collected
+        measure.appLaunchCollector.register()
+
+        // enable crash tracking early
+        if (measure.configProvider.autoStart) {
+            start()
+        }
+
+        measure.configLoader.loadDynamicConfig { config ->
+            // Callback on msr-io thread
+            if (config != null) {
+                measure.configProvider.setDynamicConfig(config)
+            }
+            measure.sessionManager.onConfigLoaded()
+            measure.spanProcessor.onConfigLoaded()
+            measure.appLaunchCollector.onConfigLoaded()
+            mainHandler.post {
+                measure.cpuUsageCollector.onConfigLoaded()
+                measure.memoryUsageCollector.onConfigLoaded()
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // Must be called on msr-io thread
+                measure.appExitCollector.collect()
+            }
+
+            // must be called last
+            measure.exporter.export()
+        }
+        measure.logger.log(LogLevel.Debug, "Initialization complete")
+    }
+
+    fun start() {
+        synchronized(lock) {
+            if (isStarted) {
+                return
+            }
+            enableCrashTracking()
+            registerCollectors()
+            isStarted = true
+        }
+    }
+
+    fun stop() {
+        synchronized(lock) {
+            if (!isStarted) {
+                return
+            }
+            disableCrashTracking()
+            unregisterCollectors()
+            isStarted = false
+        }
+    }
+
+    override fun onAppForeground() {
+        // session manager must be the first to be notified about app foreground to ensure that
+        // new session ID (if created) is reflected in all events collected after the launch.
+        measure.sessionManager.onAppForeground()
+        if (isStarted) {
+            resumeCollectorsOnForeground()
+            measure.memoryUsageCollector.onAppForeground()
+            measure.exporter.flush()
+        }
+    }
+
+    override fun onAppBackground() {
+        measure.sessionManager.onAppBackground()
+        if (isStarted) {
+            measure.periodicSignalStoreScheduler.onAppBackground()
+            measure.memoryUsageCollector.onAppBackground()
+            pauseCollectorsOnBackground()
+            measure.exporter.export()
+            measure.dataCleanupService.cleanup()
+        }
+    }
+
+    override fun onSessionStart(sessionId: String, startTime: Long) {
+        measure.signalProcessor.track(
+            SessionStartData,
+            timestamp = startTime,
+            type = EventType.SESSION_START,
+            sessionId = sessionId,
+            // always sample session start event
+            isSampled = true,
+        )
+        measure.exporter.flush()
+    }
+
+    fun setUserId(userId: String) {
+        measure.userAttributeProcessor.setUserId(userId)
+    }
+
+    fun clearUserId() {
+        measure.userAttributeProcessor.clearUserId()
+    }
+
+    fun internalSetPatch(patchId: String, patchVersion: String?) {
+        if (!uuidRegex.matches(patchId)) {
+            logger.log(LogLevel.Error, "Patch ID must be a valid UUID, patch will be ignored")
+            return
+        }
+        measure.patchAttributeProcessor.setPatch(
+            patchId,
+            patchVersion?.take(ValidationLimits.PATCH_VERSION),
+        )
+    }
+
+    fun trackScreenView(screenName: String, attributes: Map<String, AttributeValue>) {
+        measure.userTriggeredEventCollector.trackScreenView(screenName, attributes)
+    }
+
+    fun trackHandledException(throwable: Throwable, attributes: Map<String, AttributeValue>) {
+        measure.userTriggeredEventCollector.trackHandledException(throwable, attributes)
+    }
+
+    fun createSpan(name: String): SpanBuilder? = measure.spanCollector.createSpan(name)
+
+    fun startSpan(name: String, timestamp: Long? = null): Span = measure.spanCollector.startSpan(name, timestamp)
+
+    fun getTraceParentHeaderValue(span: Span): String = measure.spanCollector.getTraceParentHeaderValue(span)
+
+    fun getTraceParentHeaderKey(): String = measure.spanCollector.getTraceParentHeaderKey()
+
+    fun getSessionId(): String? = try {
+        measure.sessionManager.getSessionId()
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+
+    fun trackEvent(name: String, attributes: Map<String, AttributeValue>, timestamp: Long?) {
+        measure.customEventCollector.trackEvent(name, attributes, timestamp)
+    }
+
+    fun log(
+        body: String,
+        severity: LogSeverity,
+        attributes: Map<String, AttributeValue>,
+    ) {
+        measure.logEventCollector.trackLog(body, severity, attributes)
+    }
+
+    fun startBugReportFlow(
+        takeScreenshot: Boolean,
+        attributes: MutableMap<String, AttributeValue>,
+    ) {
+        measure.bugReportCollector.startBugReportFlow(takeScreenshot, attributes)
+    }
+
+    fun trackBugReport(
+        description: String,
+        screenshots: List<MsrAttachment>,
+        attributes: MutableMap<String, AttributeValue>,
+    ) {
+        measure.userTriggeredEventCollector.trackBugReport(description, screenshots, attributes)
+    }
+
+    fun captureScreenshot(
+        activity: Activity,
+        onComplete: (attachment: MsrAttachment) -> Unit,
+        onError: (() -> Unit)?,
+    ) {
+        AttachmentHelper(
+            measure.logger,
+            measure.executorServiceRegistry.ioExecutor(),
+            measure.configProvider,
+        ).captureScreenshot(activity, onComplete, onError)
+    }
+
+    fun imageUriToAttachment(
+        context: Context,
+        uri: Uri,
+        onComplete: (attachment: MsrAttachment) -> Unit,
+        onError: () -> Unit,
+    ) {
+        AttachmentHelper(
+            measure.logger,
+            measure.executorServiceRegistry.ioExecutor(),
+            measure.configProvider,
+        ).imageUriToAttachment(
+            context,
+            uri,
+            onComplete,
+            onError,
+        )
+    }
+
+    fun setShakeListener(shakeListener: MsrShakeListener?) {
+        measure.shakeBugReportCollector.setShakeListener(shakeListener)
+    }
+
+    fun internalTrackEvent(
+        data: MutableMap<String, Any?>,
+        type: String,
+        timestamp: Long,
+        attributes: MutableMap<String, Any?>,
+        userDefinedAttrs: MutableMap<String, AttributeValue>,
+        attachments: MutableList<MsrAttachment>,
+        userTriggerEvent: Boolean,
+        sessionId: String?,
+        threadName: String?,
+    ) {
+        measure.internalSignalCollector.trackEvent(
+            data = data,
+            type = type,
+            timestamp = timestamp,
+            attributes = attributes,
+            userDefinedAttrs = userDefinedAttrs,
+            attachments = attachments,
+            userTriggered = userTriggerEvent,
+            sessionId = sessionId,
+            threadName = threadName,
+        )
+    }
+
+    fun internalTrackSpan(
+        name: String,
+        traceId: String,
+        spanId: String,
+        parentId: String?,
+        startTime: Long,
+        endTime: Long,
+        duration: Long,
+        status: Int,
+        attributes: MutableMap<String, Any?>,
+        userDefinedAttrs: MutableMap<String, Any?>,
+        checkpoints: Map<String, Long>,
+        hasEnded: Boolean,
+        isSampled: Boolean,
+    ) {
+        measure.internalSignalCollector.trackSpan(
+            name = name,
+            traceId = traceId,
+            spanId = spanId,
+            parentId = parentId,
+            startTime = startTime,
+            endTime = endTime,
+            duration = duration,
+            status = status,
+            attributes = attributes,
+            userDefinedAttrs = userDefinedAttrs,
+            checkpoints = checkpoints,
+            hasEnded = hasEnded,
+            isSampled = isSampled,
+        )
+    }
+
+    fun getAttachmentDirectory(): String? = measure.fileStorage.getAttachmentDirectory()
+
+    fun encodeWebP(
+        pixels: ByteArray,
+        width: Int,
+        height: Int,
+        callback: (ByteArray?) -> Unit,
+    ) {
+        val quality = measure.configProvider.screenshotCompressionQuality
+        measure.executorServiceRegistry.defaultExecutor().submit {
+            val encoded = WebPEncoder.encode(pixels, width, height, quality, measure.logger)
+            mainHandler.post { callback(encoded) }
+        }
+    }
+
+    fun internalAddLog(platform: String, message: String) {
+        measure.logger.log(
+            LogLevel.Debug,
+            "[$platform] $message",
+        )
+    }
+
+    fun trackHttpEvent(
+        url: String,
+        method: String,
+        startTime: Long,
+        endTime: Long,
+        statusCode: Int?,
+        error: Throwable?,
+        requestHeaders: MutableMap<String, String>?,
+        responseHeaders: MutableMap<String, String>?,
+        requestBody: String?,
+        responseBody: String?,
+        client: String,
+    ) {
+        measure.userTriggeredEventCollector.trackHttp(
+            url,
+            method,
+            startTime,
+            endTime,
+            client,
+            statusCode,
+            error?.javaClass?.name,
+            error?.message,
+            requestHeaders,
+            responseHeaders,
+            requestBody,
+            responseBody,
+        )
+    }
+
+    private fun registerCollectors() {
+        measure.userTriggeredEventCollector.register()
+        measure.activityLifecycleCollector.register()
+        measure.appLifecycleCollector.register()
+        measure.cpuUsageCollector.register()
+        measure.memoryUsageCollector.register()
+        measure.componentCallbacksCollector.register()
+        measure.gestureCollector.register()
+        measure.networkChangesCollector.register()
+        measure.httpEventCollector.register()
+        measure.httpUrlConnectionEventCollector.register()
+        measure.powerStateProvider.register()
+        measure.spanCollector.register()
+        measure.customEventCollector.register()
+        measure.logEventCollector.register()
+        measure.periodicSignalStoreScheduler.register()
+        // Profiling relies on WorkManager to upload its results durably, so it is enabled only when
+        // the consumer has added WorkManager to the classpath.
+        if (measure.workManagerAvailable) {
+            measure.profileCollector.register()
+        }
+    }
+
+    private fun unregisterCollectors() {
+        measure.userTriggeredEventCollector.unregister()
+        measure.activityLifecycleCollector.unregister()
+        measure.appLifecycleCollector.unregister()
+        measure.cpuUsageCollector.unregister()
+        measure.memoryUsageCollector.unregister()
+        measure.componentCallbacksCollector.unregister()
+        measure.gestureCollector.unregister()
+        measure.networkChangesCollector.unregister()
+        measure.httpEventCollector.unregister()
+        measure.httpUrlConnectionEventCollector.unregister()
+        measure.powerStateProvider.unregister()
+        measure.spanCollector.unregister()
+        measure.customEventCollector.unregister()
+        measure.logEventCollector.unregister()
+        measure.periodicSignalStoreScheduler.unregister()
+        if (measure.workManagerAvailable) {
+            measure.profileCollector.unregister()
+        }
+    }
+
+    private fun pauseCollectorsOnBackground() {
+        measure.cpuUsageCollector.unregister()
+    }
+
+    private fun resumeCollectorsOnForeground() {
+        measure.cpuUsageCollector.register()
+    }
+
+    private fun enableCrashTracking() {
+        measure.unhandledExceptionCollector.register()
+        measure.anrCollector.register()
+    }
+
+    private fun disableCrashTracking() {
+        measure.unhandledExceptionCollector.unregister()
+        measure.anrCollector.unregister()
+    }
+
+    fun getDynamicConfigPath(): String? = measure.fileStorage.getConfigPath()
+}

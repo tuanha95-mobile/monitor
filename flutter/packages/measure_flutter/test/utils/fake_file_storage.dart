@@ -1,0 +1,59 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:measure_flutter/src/storage/file_storage.dart';
+
+class FakeFileStorage implements FileStorage {
+  final Map<String, Uint8List> _storedFiles = {};
+  bool shouldFailWrite = false;
+  bool shouldReturnNullPath = false;
+  int? shouldFailWriteAfterCount;
+  int _writeCount = 0;
+
+  final Directory _tempDir =
+      Directory.systemTemp.createTempSync('fake_file_storage_');
+
+  String get _rootPath => _tempDir.path;
+
+  @override
+  Future<File?> writeFile(Uint8List data, String fileName) async {
+    _writeCount++;
+
+    if (shouldFailWrite) {
+      return null;
+    }
+
+    if (shouldFailWriteAfterCount != null &&
+        _writeCount > shouldFailWriteAfterCount!) {
+      return null;
+    }
+
+    _storedFiles[fileName] = data;
+    final file = File('$_rootPath/$fileName');
+    await file.writeAsBytes(data);
+    return file;
+  }
+
+  Uint8List? getStoredFile(String fileName) {
+    return _storedFiles[fileName];
+  }
+
+  void clearStoredFiles() {
+    _storedFiles.clear();
+  }
+
+  int get storedFileCount => _storedFiles.length;
+
+  @override
+  Future<String?> getRootPath() async {
+    if (shouldReturnNullPath) {
+      return null;
+    }
+    return _rootPath;
+  }
+
+  @override
+  Future<String?> getDynamicConfigPath() async {
+    return _rootPath;
+  }
+}
